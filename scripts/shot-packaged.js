@@ -10,15 +10,31 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawn, execFileSync } = require('node:child_process')
-const { cleanupRun } = require('./lib/process-cleanup')
+const { cleanupRun, killBrowsersUnder, browserPidsUnder } = require('./lib/process-cleanup')
 
 const projectRoot = path.join(__dirname, '..')
 const packagedExe = path.join(projectRoot, 'build', 'win-unpacked', 'AIQuad.exe')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// 本应用的浏览器档案根目录：用来精确结束"自己拉起来的"Chrome/Edge，
+// 而不是无差别 taskkill 掉用户自己开着的浏览器。
+const appProfilesRoot = path.join(process.env.APPDATA || '', 'aiquad', 'profiles')
+
+/** 收尾：杀应用进程树 + 只清本应用名下的浏览器（不碰用户自己的 Chrome） */
+function cleanup(pid) {
+  cleanupRun(pid, ['AIQuad.exe'])
+  const n = killBrowsersUnder(appProfilesRoot)
+  console.log(`收尾：结束 ${n} 个本应用名下的浏览器进程（未触碰其它 Chrome 窗口）`)
+}
+
 const waitSec = Number(process.argv[2] || 35)
 const outName = process.argv[3] || 'packaged-4panes.png'
 const outPath = path.join(projectRoot, '.tmp', outName)
+
+// AIQUAD_TEST_SCALE：用 --force-device-scale-factor 在 100% 的机器上复现缩放环境。
+// 不设就走系统真实缩放（用户路径）。
+const SCALE = process.env.AIQUAD_TEST_SCALE || ''
+const scaleArgs = SCALE ? [`--force-device-scale-factor=${SCALE}`] : []
 
 const PS = `
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -42,7 +58,7 @@ async function main() {
   // 本机 GPU 进程不可用，靠应用自身的"启动自愈"（startup-state.json）自动降级。
   const env = { ...process.env, ELECTRON_ENABLE_LOGGING: '1' }
   delete env.ELECTRON_RUN_AS_NODE
-  const child = spawn(packagedExe, ['--remote-debugging-port=9229'], {
+  const child = spawn(packagedExe, ['--remote-debugging-port=9229', ...scaleArgs], {
     cwd: path.dirname(packagedExe), env, stdio: ['ignore', 'pipe', 'pipe'],
   })
   let log = ''
@@ -71,11 +87,12 @@ async function main() {
       await cdp.connect()
       const r = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
+          const F = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--pane-footer')) || 0
           const panes = [...document.querySelectorAll('#panes .pane')].map(p => {
             const b = p.getBoundingClientRect()
-            return { id: p.dataset.paneId, x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) - 46 }
+            return { id: p.dataset.paneId, x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) - F }
           })
-          return { osOrigin: { x: screenX, y: screenY }, titleBar: !!document.querySelector('.titlebar,header'), panes }
+          return { osOrigin: { x: screenX, y: screenY }, dpr: window.devicePixelRatio, titleBar: !!document.querySelector('.titlebar,header'), panes }
         })()`,
         returnByValue: true,
       })
@@ -86,6 +103,18 @@ async function main() {
   }
   catch (e) {
     console.log('读取分格信息失败:', e.message)
+  }
+
+  // 拿不到渲染层信息 = 面板根本没在线（多半是上一轮残留进程占着单实例锁，
+  // 本次启动静默退出）。这种情况下必须**直接判失败**：
+  // 后面「找不到匹配窗口就跳过」的逻辑会让它一路空跑到"全部对齐（0px）"，
+  // 假装通过——正是这个假通过把真 bug 放过去过一次。
+  if (!rendered) {
+    console.log('\n❌ 面板渲染进程未就绪，无法比对（不是"通过"）。打包版自身输出如下：')
+    console.log(log.split('\n').filter(Boolean).slice(-40).join('\n'))
+    cleanup(child.pid)
+    await sleep(800)
+    process.exit(1)
   }
 
   const w32 = require('../dist/main/win32')
@@ -122,40 +151,74 @@ async function main() {
   catch {}
 
   console.log(`\n原生浏览器窗口 ${uniq.length} 个（可见区 == 面板客户区原点 + 分格矩形 才算对齐）：`)
+
+  // 单位必须统一：分格矩形来自渲染层 = **DIP**（CSS px），客户区原点是 **物理像素**。
+  // 应用侧算的是 `round((面板客户区原点DIP + 分格x) × s)`，所以这里要先把物理原点
+  // 折回 DIP 再加分格偏移，整体乘 dpr —— 直接把 DIP 的 p.x 加到物理原点上，
+  // 在 s≠1 的机器上会凭空差出 `原点×(s−1)`，把**已经对齐**的窗口判成失败。
+  const dpr = rendered.dpr || 1
+  console.log(`渲染层 devicePixelRatio=${dpr}（本机缩放）`)
+  const expectXY = (p) => ({
+    x: Math.round((clientOrigin.x / dpr + p.x) * dpr),
+    y: Math.round((clientOrigin.y / dpr + p.y) * dpr),
+    w: Math.round(p.w * dpr),
+    h: Math.round(p.h * dpr),
+  })
+
   let bad = 0
   for (const w of uniq) {
     const rgn = w32.windowRegionBox(w.hwnd)
-    if (!rgn || !clientOrigin || !rendered) {
+    if (!rgn || !clientOrigin) {
       console.log(`  hwnd=${w.hwnd} ${w.rect.width}×${w.rect.height}@(${w.rect.x},${w.rect.y}) 未裁剪/无法比对`)
+      bad++
       continue
     }
     const vis = { x: w.rect.x + rgn.left, y: w.rect.y + rgn.top, w: rgn.right - rgn.left, h: rgn.bottom - rgn.top }
-    const pane = rendered.panes.find((p) => clientOrigin.x + p.x === vis.x && clientOrigin.y + p.y === vis.y)
+    // 分格左上角对齐 + 尺寸一致，各容 1px（渲染层是取整后的 CSS px，缩放后会有半像素差）
+    const pane = rendered.panes
+      .map((p) => ({ p, e: expectXY(p) }))
+      .find(({ e }) => Math.abs(e.x - vis.x) <= 1 && Math.abs(e.y - vis.y) <= 1)
     if (pane) {
-      const dw = vis.w - pane.w
-      const dh = vis.h - pane.h
-      if (dw || dh) bad++
-      console.log(`  ✅ ${pane.id} 可见 ${vis.w}×${vis.h}@(${vis.x},${vis.y})  vs 分格 ${pane.w}×${pane.h}  误差 ${dw},${dh}`)
+      const dw = vis.w - pane.e.w
+      const dh = vis.h - pane.e.h
+      const off = Math.abs(dw) > 1 || Math.abs(dh) > 1
+      if (off) bad++
+      console.log(`  ${off ? '❌' : '✅'} ${pane.p.id} 可见 ${vis.w}×${vis.h}@(${vis.x},${vis.y})  vs 期望 ${pane.e.w}×${pane.e.h}@(${pane.e.x},${pane.e.y})  误差 ${dw},${dh}`)
     }
     else {
       bad++
-      console.log(`  ❌ hwnd=${w.hwnd} 可见 ${vis.w}×${vis.h}@(${vis.x},${vis.y}) 不对应任何分格`)
+      console.log(`  ❌ hwnd=${w.hwnd} 可见 ${vis.w}×${vis.h}@(${vis.x},${vis.y}) 不对应任何分格（期望 ${rendered.panes.map((p) => { const e = expectXY(p); return `${p.id}@(${e.x},${e.y})` }).join(' / ')}）`)
     }
   }
+
+  // 窗口数少于分格数同样是失败：全都没起来时会「零窗口比对零" → 假通过
+  const missing = rendered.panes.length - uniq.length
+  if (missing > 0) {
+    console.log(`\n❌ 只找到 ${uniq.length} 个原生浏览器窗口，面板有 ${rendered.panes.length} 个分格 —— 有 ${missing} 格没起来，本次不算通过`)
+    cleanup(child.pid)
+    await sleep(800)
+    process.exit(2)
+  }
   console.log(bad ? `\n⚠️ ${bad} 个窗口未对齐` : '\n全部对齐（误差 0px）')
+  const exitCode = bad ? 3 : 0
 
   // ⚠️ 收尾必须杀进程树：只 `process.kill(child.pid)` 会留下打包版的 AIQuad.exe，
   // 它占着 %APPDATA%\aiquad 的单实例锁，之后所有启动都会静默退出（连窗口都没有）。
-  cleanupRun(child.pid, ['chrome.exe', 'AIQuad.exe'])
-  await sleep(800)
-  // 收尾：关掉遗留的浏览器窗口
+  //
+  // ⚠️ 关窗口同样要限定"自己名下的进程"：`listBrowserWindows()` 返回的是
+  // 系统里**所有** Chrome_WidgetWin_1，无过滤地 postClose 会把用户自己开着的
+  // 浏览器一起关掉（连着未保存的表单）。先温和关闭自己的，再强杀残留。
+  const ours = new Set(browserPidsUnder(appProfilesRoot))
+  console.log(`收尾：本应用名下的浏览器进程 ${ours.size} 个`)
   try {
     for (const w of w32.listBrowserWindows()) {
-      if (w.rect.width > 150) w32.postClose(w.hwnd)
+      if (ours.has(w.pid) && w.rect.width > 150) w32.postClose(w.hwnd)
     }
   } catch {}
-  await sleep(600)
-  process.exit(0)
+  await sleep(800)
+  cleanup(child.pid)
+  await sleep(400)
+  process.exit(exitCode)
 }
 
 main().catch((e) => { console.error(e); process.exit(1) })

@@ -38,4 +38,49 @@ function cleanupRun(pid, images = ['chrome.exe']) {
   for (const img of images) killImage(img)
 }
 
-module.exports = { killTree, killImage, cleanupRun }
+/**
+ * 只结束**属于本应用**的浏览器进程。
+ *
+ * 不要用 `taskkill /F /IM chrome.exe`：那是无差别强杀，会把用户自己正开着的
+ * Chrome 一并干掉（标签页、未提交的表单全丢）。本应用给每个分格传了
+ * `--user-data-dir=<profilesRoot>/...`，命令行里带着这个档案根目录，
+ * 拿它当判据就能精确命中自己拉起来的那些窗口。
+ *
+ * @param {string} profilesRoot 本应用的浏览器档案根目录（userData/profiles）
+ * @returns {number} 结束掉的进程数
+ */
+function killBrowsersUnder(profilesRoot) {
+  if (!profilesRoot) return 0
+  const needle = String(profilesRoot).replace(/'/g, "''")
+  const ps = `$p = Get-CimInstance Win32_Process -Filter "Name='chrome.exe' or Name='msedge.exe'" `
+    + `| Where-Object { $_.CommandLine -like '*${needle}*' }; `
+    + `$p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; `
+    + `($p | Measure-Object).Count`
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' })
+    return Number(String(out).trim()) || 0
+  }
+  catch { return 0 }
+}
+
+/**
+ * 列出属于本应用的浏览器进程 pid（判据同 killBrowsersUnder）。
+ * 需要"先温和关闭、再强杀"时用它筛窗口：`listBrowserWindows()` 返回的是
+ * **系统里所有** Chrome_WidgetWin_1，不过滤就会把用户自己开的浏览器一起关掉。
+ * @param {string} profilesRoot 本应用的浏览器档案根目录
+ * @returns {number[]}
+ */
+function browserPidsUnder(profilesRoot) {
+  if (!profilesRoot) return []
+  const needle = String(profilesRoot).replace(/'/g, "''")
+  const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe' or Name='msedge.exe'" `
+    + `| Where-Object { $_.CommandLine -like '*${needle}*' } `
+    + `| Select-Object -ExpandProperty ProcessId`
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' })
+    return String(out).split(/\r?\n/).map((s) => Number(s.trim())).filter(Boolean)
+  }
+  catch { return [] }
+}
+
+module.exports = { killTree, killImage, cleanupRun, killBrowsersUnder, browserPidsUnder }

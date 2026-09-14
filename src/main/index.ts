@@ -60,7 +60,7 @@ function hwndOf(win: BrowserWindow) {
 function syncPanelToManager() {
   if (!manager || !panelWindow || panelWindow.isDestroyed()) return
   const b = panelWindow.getBounds()
-  manager.setPanel({ x: b.x, y: b.y }, scaleOf(panelWindow), hwndOf(panelWindow), config.get().alwaysOnTop)
+  manager.setPanel({ x: b.x, y: b.y }, scaleOf(panelWindow), hwndOf(panelWindow), true)
 }
 
 /* ---------------- 面板尺寸计算（贴屏幕左/右，占屏宽比例，全高） ---------------- */
@@ -84,33 +84,66 @@ function offscreenX(bounds: { x: number; width: number }) {
 
 let animTimer: NodeJS.Timeout | null = null
 
+/**
+ * 是否正在滑动。
+ *
+ * 滑动期间面板的 `move` 事件也会逐帧触发，如果那条路再同步一次位置，就是
+ * 一帧两次批量移动，白白加倍开销还可能互相踩；所以这段时间由 slideTo 独占。
+ */
+let animating = false
+
 function stopAnim() {
   if (animTimer) {
-    clearInterval(animTimer)
+    clearTimeout(animTimer)
     animTimer = null
   }
+  animating = false
 }
 
 function easeInOutCubic(t: number) {
   return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2
 }
 
+/**
+ * 横向滑动动画。
+ *
+ * 关键点是**每一帧都带着浏览器窗口一起走**：面板和分格里的原生浏览器窗口是两个
+ * 互不相干的顶级窗口，面板自己动、网页不动，看到的就是"面板滑进来、内容晚一拍
+ * 才出现"的断层。这里每帧把当前 x 交给实例管理器，由它用一次批量提交把面板和
+ * 所有分格窗口放到同一帧里。
+ *
+ * 帧间隔取 8ms 而不是 16ms：Windows 的定时器精度本来就在 15.6ms 上下跳，
+ * 按 16ms 排会稳定掉到 ~30fps；给密一点，实际落到 60fps 附近更稳。
+ */
 function slideTo(fromX: number, toX: number, bounds: { y: number; width: number; height: number }, duration: number, onDone?: () => void) {
   stopAnim()
+  animating = true
+  // 滑动期间冻结几何校准，否则内衬重测带来的几像素抖动会一路干扰动画（见 setSliding）
+  manager?.setSliding(true)
   const started = Date.now()
-  animTimer = setInterval(() => {
+  const step = () => {
     if (!panelWindow || panelWindow.isDestroyed()) {
       stopAnim()
+      animating = false
+      manager?.setSliding(false)
       return
     }
     const t = Math.min(1, (Date.now() - started) / duration)
     const x = Math.round(fromX + (toX - fromX) * easeInOutCubic(t))
     panelWindow.setBounds({ x, y: bounds.y, width: bounds.width, height: bounds.height })
+    // 面板的新位置立刻交给浏览器窗口，同帧移动
+    manager?.setPanelPosition(x, bounds.y)
     if (t >= 1) {
       stopAnim()
+      animating = false
+      // 先解除冻结（会补一次完整校准），再交给收尾逻辑
+      manager?.setSliding(false)
       onDone?.()
+      return
     }
-  }, 16)
+    animTimer = setTimeout(step, 8)
+  }
+  step()
 }
 
 /* ---------------- 面板窗口 ---------------- */
@@ -131,9 +164,36 @@ function createPanelWindow() {
     maximizable: false,
     fullscreenable: false,
     autoHideMenuBar: true,
-    alwaysOnTop: cfg.alwaysOnTop,
-    backgroundColor: '#15181f',
-    title: 'AI 助手',
+    /**
+     * 面板必须**始终**置顶，且**不透明部分靠渲染层的 alpha**。
+     *
+     * 为什么（2026-09-14，Win11 那一台的真实事故）：
+     * Win11 上 Chromium 的窗口带 `WS_EX_NOREDIRECTIONBITMAP`，内容由 DirectComposition
+     * 交换链直接合成，**DWM 合成时会忽略 GDI 的 `SetWindowRgn` 区域**——
+     * 于是"把浏览器自带的标题栏/工具栏从可视区裁掉"这件事只在命中测试上生效
+     * （点是点得到的），画面上却照旧显示，浏览器那 96px 高的浅色标题栏整条压在面板顶栏上，
+     * 顶栏和下拉菜单都成了"看得见位置、点得着、但读不出内容"的白块。
+     *
+     * 结论：不能再指望"裁浏览器窗口"这条视觉路径。改成
+     *   ① 面板整窗 `transparent`——分格处渲染层输出 alpha=0，这是**合成器通道**，
+     *      不受 GDI 区域限制，浏览器窗口从透明处自然透出；
+     *   ② 面板**置顶**——顶栏/悬浮胶囊/下拉菜单都画在面板上，压住浏览器窗口，天然可见；
+     *   ③ 面板窗口再叠一层 `SetWindowRgn` 把分格挖掉——**只为了输入穿透**
+     *      （视觉上失效没关系，命中测试用的就是它）。
+     * 视觉靠 alpha、输入靠区域，两条路各自绕开对方的短处。
+     */
+    transparent: true,
+    hasShadow: false,
+    alwaysOnTop: true,
+    backgroundColor: '#00000000',
+    title: 'AIQuad',
+    /**
+     * 面板是常驻托盘的工具窗口，不该在任务栏占一个按钮。
+     * Windows 上 `skipTaskbar` 会带 `WS_EX_TOOLWINDOW`，任务栏和 Alt+Tab 里都不会出现，
+     * 只在右下角托盘留图标 —— 就是"呼出时无痕"的观感。
+     * 浏览器实例窗口早就是这么做的，面板漏了。
+     */
+    skipTaskbar: true,
     icon: appIcon(),
     show: false,
     webPreferences: {
@@ -143,30 +203,47 @@ function createPanelWindow() {
     },
   })
   Menu.setApplicationMenu(null)
+  /**
+   * 面板要真的"无痕"，还得自己补一步。
+   *
+   * Electron 的 `skipTaskbar: true` 只把窗口从**任务栏**摘掉（内部走
+   * `ITaskbarList::DeleteTab`），**Alt+Tab 里仍然挂着**。要连 Alt+Tab 一起消失，
+   * 只能把窗口标成 `WS_EX_TOOLWINDOW`。
+   * 时机很关键：该样式在窗口**可见时改动不生效**，而这里刚 new 出来还是
+   * `show:false` 的隐藏态，正好是唯一能改的窗口期——所以放在加载页面之前。
+   */
+  const panelHwnd = hwndOf(panelWindow)
+  if (panelHwnd) w32.makeToolWindow(panelHwnd)
   panelWindow.loadFile(rendererFile('main.html'))
 
   panelWindow.on('resize', () => {
     syncPanelToManager()
     panelWindow?.webContents.send('request-rects')
   })
-  // 实例窗口是独立顶级窗口（不是子窗口），面板移动时必须主动同步它们的位置
+  /**
+   * 实例窗口是独立顶级窗口（不是子窗口），面板移动时必须主动同步它们的位置。
+   *
+   * 拖动顶栏时这条就是逐帧跟随；滑动动画期间则跳过——那段时间位置由 slideTo
+   * 每帧直接推送，两条路并行只会重复劳动。
+   */
   let moveTimer: NodeJS.Timeout | null = null
   const onMove = () => {
-    // 立即同步，避免实例窗口滞后于面板
+    if (animating) return
     if (manager && panelWindow && !panelWindow.isDestroyed()) {
       const nb = panelWindow.getBounds()
+      // 只重定位不重算区域：平移不改变窗口内坐标，一帧一次全量重算会直接拖垮动画
       manager.setPanelPosition(nb.x, nb.y)
     }
     if (moveTimer) clearTimeout(moveTimer)
     moveTimer = setTimeout(() => {
       moveTimer = null
+      // 落位后再校准一次（缩放/置顶等状态），不请求 rects——位置变化不影响窗口内几何
       syncPanelToManager()
-      panelWindow?.webContents.send('request-rects')
     }, 220)
   }
   panelWindow.on('move', onMove)
   panelWindow.on('moved', onMove)
-  // 面板被激活后，把实例窗口重新提到面板之上（两者同为置顶层级）
+  // 面板被激活后把层级理一遍：置顶带里的次序会被系统重排，浏览器窗口可能压到面板上
   panelWindow.on('focus', () => manager?.raiseAll())
   panelWindow.on('closed', () => {
     panelWindow = null
@@ -190,22 +267,71 @@ function showPanel() {
 
   // 先把窗口放到屏幕外，再滑入，避免出现"闪一下"
   win.setBounds({ x: offX, y: b.y, width: b.width, height: b.height })
+  /**
+   * 每次显示前都要补一次 WS_EX_TOOLWINDOW。
+   *
+   * `transparent: true` 的窗口会被 Electron 重新写一遍扩展样式（它要补上
+   * WS_EX_LAYERED 来承载 alpha），顺手把创建时加的 WS_EX_TOOLWINDOW 冲掉了——
+   * 于是一开透明，面板就又回到任务栏和 Alt+Tab 里，"无痕"当场失效（实测
+   * exstyle 从 0x188 变成 0x80088，少了 0x100）。
+   * 这个样式只有窗口**隐藏时**改得动，所以必须赶在 show() 之前。
+   */
+  if (!win.isVisible()) {
+    const h = hwndOf(win)
+    if (h) w32.makeToolWindow(h)
+  }
   win.show()
-  win.setAlwaysOnTop(config.get().alwaysOnTop)
+  // 显示这一刻 Electron 才把 WS_EX_LAYERED 补上，顺手冲掉了 TOOLWINDOW，
+  // 所以可见之后还要再补一次（这次带 refresh，让系统重新套用样式）
+  {
+    const h = hwndOf(win)
+    if (h) w32.makeToolWindow(h, true)
+  }
+  // 面板必须置顶：它是宿主，顶栏与悬浮胶囊都画在它上面来压住浏览器窗口
+  win.setAlwaysOnTop(true)
+  /**
+   * 面板刚出现的这一帧先按**指针当前位置**定好穿透状态。
+   *
+   * 之后的每一次修正都靠渲染层的 mousemove，而主进程收不到鼠标移动；万一呼出面板时
+   * 指针恰好就停在某一格上，不先算这一下，用户的第一次点击会被面板吃掉（网页点不动）。
+   */
+  win.setIgnoreMouseEvents(!!manager?.cursorOverPane(), { forward: true })
 
-  // 滑入期间隐藏实例窗口：它们是独立顶级窗口，无法与动画逐帧同步，
-  // 否则会看到浏览器页面跑到面板外面
-  manager?.setSuppressed(true)
+  /**
+   * 滑入期间实例窗口**保持显示**，跟着面板一起滑进来。
+   *
+   * 以前这里是先 `setSuppressed(true)` 把浏览器窗口全藏起来、等动画结束再亮出来，
+   * 因为当时它们是独立顶级窗口、跟不动动画，露着就会看到页面脱在面板外面。
+   * 现在位置由 `slideTo` 每帧批量推送（见 link 到 setPanelPosition 的说明），
+   * 网页和面板严丝合缝，藏起来反而成了"面板先滑进来、内容晚一拍才蹦出来"的断层。
+   */
   syncPanelToManager()
+  manager?.setSuppressed(false)
   win.webContents.send('request-rects')
 
-  slideTo(offX, b.x, b, 190, () => {
-    syncPanelToManager()
-    // 落位后再显示实例内容，避免工具栏/位置在动画末帧闪现
+  slideTo(offX, b.x, b, 240, () => {
+    /**
+     * 这里**不要**再 syncPanelToManager()。
+     *
+     * 它会走一遍完整落位（含重测浏览器内衬），而位置在动画里已经逐帧对齐到最终值了，
+     * 再校准一次就是"动画结束、网页又自己挪几像素"。记账（面板原点）在动画期间
+     * 每帧都由 setPanelPosition 更新，本来就是最新的。区域由 setSliding(false) 补。
+     */
     setTimeout(() => {
-      manager?.setSuppressed(false)
       win.focus()
       win.webContents.send('panel-shown')
+      /**
+       * 落位之后再把面板从任务栏摘掉。
+       *
+       * `transparent: true` 的窗口，Electron 是在 `show()` 之后才把窗口切成
+       * layered（补 WS_EX_LAYERED）的，这一下会把创建时加的 WS_EX_TOOLWINDOW
+       * 一并冲掉。实测此时再想补回那个样式位已经补不上了——窗口可见时直接
+       * SetWindowLongPtr 改 GWL_EXSTYLE 会被 Chromium 原样退回（先藏后改也没用），
+       * 所以只能退而求其次走 Electron 自己的 `setSkipTaskbar`，至少任务栏上不留按钮。
+       *
+       * 已知取舍：这种情况下面板会短暂出现在 Alt+Tab 列表里。
+       */
+      win.setSkipTaskbar(true)
       setTimeout(() => manager?.focusAll(), 80)
     }, 40)
   })
@@ -215,18 +341,25 @@ function hidePanel() {
   if (!panelWindow || panelWindow.isDestroyed() || !panelWindow.isVisible()) return
   const b = panelWindow.getBounds()
   const offX = offscreenX(b)
-  // 关键：先把所有原生浏览器窗口隐藏，再收起面板。
-  // 它们是独立顶级窗口，不会随面板隐藏，否则会在收起的瞬间停在停靠位闪一下。
-  manager?.setSuppressed(true)
-  slideTo(b.x, offX, b, 170, () => {
+  /**
+   * 收起时同样让浏览器窗口跟着一起滑出去，滑完再一起隐藏。
+   *
+   * 浏览器窗口是独立顶级窗口，`win.hide()` 带不走它们——面板滑走了网页还停在
+   * 停靠位，就是"收起到一半内容还挂着"的那种脏结尾。所以位置照旧逐帧同步，
+   * 只在动画结束、面板都不在了之后才把它们藏掉。
+   */
+  slideTo(b.x, offX, b, 200, () => {
     const win = panelWindow
     if (!win || win.isDestroyed()) return
+    manager?.setSuppressed(true)
     win.hide()
     // 等隐藏真正生效后再回到停靠位，避免在可见状态下改变位置造成闪烁
     setTimeout(() => {
       if (!panelWindow || panelWindow.isDestroyed()) return
       const target = targetBounds()
       panelWindow.setBounds({ x: target.x, y: target.y, width: target.width, height: target.height })
+      // 面板位置已回到停靠位，让实例的记账跟着回到原位（此刻它们都是隐藏的）
+      syncPanelToManager()
     }, 180)
   })
 }
@@ -241,21 +374,33 @@ function applyPanelBounds() {
   if (!panelWindow || panelWindow.isDestroyed()) return
   const cfg = config.get()
   const b = targetBounds()
-  panelWindow.setAlwaysOnTop(cfg.alwaysOnTop)
-  manager?.setTopMost(cfg.alwaysOnTop)
+  // 恒为 true：面板要压住浏览器窗口，否则顶栏与悬浮胶囊被浏览器标题栏盖掉
+  panelWindow.setAlwaysOnTop(true)
+  manager?.setTopMost(true)
   if (!panelWindow.isVisible()) {
     panelWindow.setBounds(b)
     syncPanelToManager()
     return
   }
   const cur = panelWindow.getBounds()
-  // 宽度变化会改变分格尺寸，滑动期间先隐藏实例避免不同步
-  manager?.setSuppressed(true)
-  slideTo(cur.x, b.x, b, 170, () => {
+  /**
+   * 宽度变了就别滑了，直接落位。
+   *
+   * 滑动动画每帧推给浏览器窗口的几何，是按**上一次渲染层上报的分格矩形**算的；
+   * 宽度一改，那些矩形立刻作废，得等渲染层重新量完才准。动画期间拿旧矩形铺新宽度，
+   * 网页会一路错位地滑过去，落地才跳正——比不做动画更难看。
+   * 位置变化（贴左/贴右）不涉及这个问题，照旧走动画。
+   */
+  if (cur.width !== b.width) {
+    panelWindow.setBounds(b)
+    syncPanelToManager()
+    panelWindow.webContents.send('request-rects')
+    return
+  }
+  slideTo(cur.x, b.x, b, 200, () => {
     panelWindow?.setBounds(b)
     syncPanelToManager()
     panelWindow?.webContents.send('request-rects')
-    setTimeout(() => manager?.setSuppressed(false), 60)
   })
 }
 
@@ -269,9 +414,11 @@ function openSettings() {
   settingsWindow = new BrowserWindow({
     width: 920,
     height: 720,
-    title: 'AI 助手 · 设置',
+    title: 'AIQuad · 设置',
     backgroundColor: '#15181f',
     autoHideMenuBar: true,
+    // 面板是置顶的，设置窗口不跟着置顶就会被面板整个挡住
+    alwaysOnTop: true,
     icon: appIcon(),
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
@@ -545,7 +692,7 @@ async function bootstrap() {
 
 function createTray() {
   tray = new Tray(path.join(__dirname, '..', '..', 'src', 'renderer', 'tray.png'))
-  tray.setToolTip('AI 助手')
+  tray.setToolTip('AIQuad')
   const menu = Menu.buildFromTemplate([
     { label: '呼出面板', click: () => showPanel() },
     { label: '收起面板', click: () => hidePanel() },
@@ -630,6 +777,23 @@ function setupIpc() {
     manager?.setRects(rects)
   })
 
+  /**
+   * 面板"按需鼠标穿透"。
+   *
+   * 渲染层每次判断出指针压在分格（网页区）上时就把它打进来，主进程据此让面板
+   * 忽略鼠标，点击于是落到那一格下面的浏览器窗口；压到顶栏/悬浮胶囊/下拉菜单上时反向打回来。
+   *
+   * 为什么不用 SetWindowRgn 挖洞（0.4.5 踩过，务必别改回去）：
+   * 给**面板**这个 Electron 窗口设 GDI 区域，在**屏幕缩放 ≠ 100%** 时会直接把主进程打崩
+   * （退出码 0xC0000409，Chromium 内部 CHECK 失败）。100% 时物理像素与 DIP 恰好相等，
+   * 侥幸不崩；实测同一份代码 1.0 稳、1.1 与 1.25 一启动就闪退。
+   * `setIgnoreMouseEvents` 是 Electron 自己的机制，不碰 GDI 区域，各缩放档位都稳。
+   */
+  ipcMain.on('mouse-passthrough', (_e, through: boolean) => {
+    if (!panelWindow || panelWindow.isDestroyed()) return
+    panelWindow.setIgnoreMouseEvents(!!through, { forward: true })
+  })
+
   ipcMain.handle('pane-occlude', (_e, paneId: string, on: boolean, hole?: { x: number; y: number; width: number; height: number } | null) => {
     manager?.occlude(paneId, on, hole)
   })
@@ -663,6 +827,30 @@ function setupIpc() {
   ipcMain.handle('open-settings', () => openSettings())
   ipcMain.handle('panel-toggle', () => togglePanel())
   ipcMain.handle('panel-hide', () => hidePanel())
+  /**
+   * 顶栏拖动。
+   *
+   * 原来顶栏用的是 CSS `-webkit-app-region: drag`（无边框窗口的"可拖拽区"）。
+   * 那套东西最终由系统按**标题栏**语义处理：Win11 上系统会把这一条按自己的
+   * 标题栏配色重新画一遍（浅色模式就是一条 #F1F1F1 的白带），把面板自己画的
+   * 深色顶栏盖掉——于是顶栏变成白底、白字看不见，但按钮还能点。
+   * Win10 上不复现，所以只在那台机器上炸。改成自己算位移挪窗口，就不会再有
+   * 任何系统标题栏参与。
+   */
+  let panelDragBase: { x: number, y: number } | null = null
+  ipcMain.handle('panel-drag-start', () => {
+    if (!panelWindow || panelWindow.isDestroyed()) { panelDragBase = null; return }
+    const b = panelWindow.getBounds()
+    panelDragBase = { x: b.x, y: b.y }
+  })
+  ipcMain.handle('panel-drag-move', (_e, dx: number, dy: number) => {
+    if (!panelWindow || panelWindow.isDestroyed() || !panelDragBase) return
+    panelWindow.setBounds({
+      x: Math.round(panelDragBase.x + dx),
+      y: Math.round(panelDragBase.y + dy),
+    })
+  })
+  ipcMain.handle('panel-drag-end', () => { panelDragBase = null })
   ipcMain.handle('sync-instances', async () => {
     await syncInstances()
   })
@@ -670,10 +858,11 @@ function setupIpc() {
   ipcMain.handle('open-path', (_e, p: string) => shell.openPath(p))
   ipcMain.handle('open-external', (_e, url: string) => shell.openExternal(url))
 
-  ipcMain.handle('set-always-on-top', (_e, value: boolean) => {
-    config.update({ alwaysOnTop: value })
-    panelWindow?.setAlwaysOnTop(value)
-    manager?.setTopMost(value)
+  ipcMain.handle('set-always-on-top', (_e, _value: boolean) => {
+    // 面板必须始终置顶（它要把顶栏/悬浮胶囊画在浏览器窗口之上），这里不再提供关闭
+    config.update({ alwaysOnTop: true })
+    panelWindow?.setAlwaysOnTop(true)
+    manager?.setTopMost(true)
     manager?.raiseAll()
     broadcastConfig()
   })

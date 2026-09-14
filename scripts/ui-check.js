@@ -4,7 +4,7 @@
  * 验证点（对应 bug 1 / 2）：
  *   - 顶栏图标按钮组是否齐全（单格 / 上下两格 / 四格 / 设置 / 置顶 / 收起）
  *   - 每个分格底部居中的 AI 切换器是否存在、是否真的水平居中、是否落在预留条内
- *   - 三种布局（1 / 2 / 4）下分格矩形是否正确，且分格高度与"内容区"高度差 = 46（底部条）
+ *   - 三种布局（1 / 2 / 4）下分格矩形是否正确，且分格高度与"内容区"高度差 = --pane-footer（底部条）
  *   - 逐布局截图，人工可复核
  */
 const fs = require('node:fs')
@@ -21,6 +21,8 @@ const REPORT = `(() => {
   const out = {
     layout: wrap ? wrap.className : null,
     viewport: { w: innerWidth, h: innerHeight },
+    // 底部页脚高度：唯一来源是 styles.css 的 --pane-footer，不写死数字
+    paneFooter: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--pane-footer')) || 0,
     headerButtons: [...document.querySelectorAll('.header-actions .icon-btn')].map((b) => ({
       key: b.id || ('layout-' + (b.dataset.layout || '?')),
       title: b.title,
@@ -56,7 +58,15 @@ async function main() {
   // 沙箱环境常注入 ELECTRON_RUN_AS_NODE，会让 Electron 退化成纯 Node
   delete env.ELECTRON_RUN_AS_NODE
 
-  const child = spawn(electronExe, ['--remote-debugging-port=9222', projectRoot], {
+  // 允许把 userData 指到别处。本机若已经开着 AIQuad（打包版或另一个开发实例），
+  // 它会占着 %APPDATA%\aiquad 的单实例锁，让这里的启动立刻 app.quit()
+  // ——表现为"没有窗口、日志干净、退出码 0"，极难联想到是锁被占了。
+  const extraArgs = []
+  if (process.env.AIQUAD_USER_DATA_DIR) {
+    extraArgs.push(`--user-data-dir=${process.env.AIQUAD_USER_DATA_DIR}`)
+  }
+
+  const child = spawn(electronExe, ['--remote-debugging-port=9222', ...extraArgs, projectRoot], {
     cwd: projectRoot,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -74,6 +84,12 @@ async function main() {
   if (!target) {
     console.log('❌ 未找到面板渲染进程（可能应用启动失败）')
     console.log(log.slice(-3000))
+    console.log(
+      '\n提示：若本机已经开着 AIQuad（打包版或另一个开发实例），它会占着 %APPDATA%\\aiquad 的\n' +
+      '单实例锁，本脚本启动的实例会在 requestSingleInstanceLock() 处立刻 app.quit()\n' +
+      '——表现为「没有窗口、日志干净、退出码 0」。\n' +
+      '绕开办法：设置环境变量 AIQUAD_USER_DATA_DIR 指向一个独立目录，两边互不干扰。'
+    )
     try { process.kill(child.pid) } catch {}
     process.exit(1)
   }
@@ -103,14 +119,15 @@ async function main() {
     console.log(`  分格数 ${r.panes.length}  视口 ${r.viewport.w}×${r.viewport.h}`)
     for (const p of r.panes) {
       const okCenter = p.selector && Math.abs(p.selector.centerOffset) <= 1
-      const okBottom = p.selector && p.selector.bottomGap >= 6 && p.selector.bottomGap <= 20
-      // 内容区 = 分格高度 - 46（底部留给切换器）
-      const okContent = p.contentRect && (p.rect.h - p.contentRect.h) === 46
+      const okBottom = p.selector && p.selector.bottomGap >= 0 && p.selector.bottomGap <= 8
+      // 内容区 = 分格高度 − 页脚（页脚值从页面读，别写死）
+      const footer = r.paneFooter
+      const okContent = p.contentRect && (p.rect.h - p.contentRect.h) === footer
       const ok = !!p.selector && okCenter && okBottom && okContent
       if (!ok) allOk = false
       console.log(`  ${ok ? '✅' : '❌'} ${p.id} 分格 ${p.rect.w}×${p.rect.h} @(${p.rect.x},${p.rect.y})`)
       console.log(`      切换器 ${p.selector ? `${p.selector.w}×${p.selector.h} 居中偏差 ${p.selector.centerOffset}px 距底 ${p.selector.bottomGap}px 文案「${p.selector.label}」` : '缺失 ❌'}`)
-      console.log(`      内容区高 ${p.contentRect ? p.contentRect.h : '?'}（分格 ${p.rect.h} − 46 = ${p.rect.h - 46}）`)
+      console.log(`      内容区高 ${p.contentRect ? p.contentRect.h : '?'}（分格 ${p.rect.h} − 页脚 ${footer} = ${p.rect.h - footer}）`)
     }
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, 15000)
     fs.writeFileSync(path.join(outDir, `ui-layout-${layout}.png`), Buffer.from(shot.data, 'base64'))

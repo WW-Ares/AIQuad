@@ -15,7 +15,12 @@ release/
 docs/*.png
 !docs/screenshot-*.png
 
+# 诊断工具包的产出（含对端机器的环境信息与整屏截图，只留在本地判读）
+scripts/diag-out-*/
+scripts/diag-out-*.zip
+
 # 杂项
 *.log
+__pycache__/
 .DS_Store
 Thumbs.db

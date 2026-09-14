@@ -41,6 +41,9 @@ const GetClassNameW = user32.func('GetClassNameW', INT, [HWND, 'char16 *', INT])
 const GetWindowTextW = user32.func('GetWindowTextW', INT, [HWND, 'char16 *', INT])
 const GetParent = user32.func('GetParent', HANDLE, [HWND])
 const PostMessageW = user32.func('PostMessageW', BOOL, [HWND, UINT, 'uint64', 'int64'])
+// Z 序查询（判断面板之上有没有自己的浏览器窗口，见 instance-manager 的 enforceZOrder）
+const GetWindow = user32.func('GetWindow', HWND, [HWND, UINT])
+const GetTopWindow = user32.func('GetTopWindow', HWND, [HWND])
 
 /** WM_CLOSE：请求窗口正常关闭（浏览器会走完整的退出流程，档案才不会被写脏） */
 export const WM_CLOSE = 0x0010
@@ -131,13 +134,25 @@ export function getParent(hwnd: number | bigint): number {
 
 /**
  * 把浏览器窗口标记成工具窗口：不进任务栏、不出现在 Alt+Tab。
- * 注意：WS_EX_TOOLWINDOW 在窗口可见时改动不会立即生效，需先隐藏再设置。
+ *
+ * 注意：WS_EX_TOOLWINDOW 在窗口可见时改动**不会自动重算窗口的显示属性**，
+ * 老办法是先隐藏再设置。但 Electron 的 transparent 窗口是在 `show()` 那一刻
+ * 才补上 WS_EX_LAYERED 的，会把先前加的 TOOLWINDOW 一起冲掉——所以有些场合
+ * 只能在窗口已经可见之后再补，此时必须带 `refresh` 让系统重新套用一次样式。
  */
-export function makeToolWindow(hwnd: number | bigint) {
+export function makeToolWindow(hwnd: number | bigint, refresh = false) {
   try {
     let ex = Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
     ex = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, BigInt(ex))
+    if (refresh) {
+      SetWindowPos(
+        hwnd,
+        0,
+        0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+      )
+    }
   }
   catch (e) {
     console.warn('[win32] makeToolWindow failed', e)
@@ -171,13 +186,68 @@ export function getWindowLong(hwnd: number | bigint, index: number): number {
   }
 }
 
-/** 设置窗口的属主（对顶级窗口即 owner）。属主窗口关闭时属主关系自动解除。 */
+/**
+ * 设置窗口的属主（对顶级窗口即 owner）。属主窗口关闭时属主关系自动解除。
+ *
+ * ⚠️ 读回来的坑：实测在本应用里对**原生浏览器窗口**调用 `GetParent()`
+ *    得到的是 0，即使窗口确实被本应用接管（位置/区域/置顶都生效）。
+ *    所以**不要用 GetParent 判断"这个窗口是不是我们的"**——
+ *    自检脚本请改用 `windowRegionBox() != null`（只有我们设过 SetWindowRgn）。
+ *    确实需要读属主时用 `GetWindow(hwnd, GW_OWNER)`。
+ */
 export function setOwner(hwnd: number | bigint, owner: number | bigint) {
   try {
     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, BigInt(owner))
   }
   catch (e) {
     console.warn('[win32] setOwner failed', e)
+  }
+}
+
+/* ---------------- Z 序 ---------------- */
+
+/** GetWindow 的 uCmd 取值 */
+export const GW_HWNDFIRST = 0
+export const GW_HWNDLAST = 1
+export const GW_HWNDNEXT = 2
+export const GW_HWNDPREV = 3
+
+/**
+ * 取 Z 序里紧邻的窗口。`GW_HWNDNEXT` 往屏幕里侧走一格（更靠下层）。
+ * 用途：判断"面板之上还有没有自己的浏览器窗口"，好决定要不要重排。
+ */
+export function getWindow(hwnd: number | bigint, cmd: number): number {
+  try {
+    return Number(GetWindow(hwnd, cmd)) || 0
+  }
+  catch {
+    return 0
+  }
+}
+
+/** Z 序最顶层的窗口（含置顶带） */
+export function getTopWindow(): number {
+  try {
+    return Number(GetTopWindow(0)) || 0
+  }
+  catch {
+    return 0
+  }
+}
+
+/**
+ * 只改 Z 序：把 `hwnd` 插到 `insertAfter` 的**下一层**。
+ *
+ * 置顶带里的相对次序不会自己保持——用户一激活某个浏览器窗口，系统就把它提到
+ * 带顶，面板立刻被压下去（顶栏又被浏览器标题栏盖住，白条复发）。所以每轮都要
+ * 主动把浏览器窗口按回面板下方。
+ */
+export function placeBelow(hwnd: number | bigint, insertAfter: number | bigint): boolean {
+  try {
+    return !!SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+  }
+  catch {
+    return false
   }
 }
 

@@ -74,9 +74,10 @@ async function main() {
       await cdp.connect()
       const r = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
+          const F = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--pane-footer')) || 0
           const panes = [...document.querySelectorAll('#panes .pane')].map(p => {
             const b = p.getBoundingClientRect()
-            return { id: p.dataset.paneId, x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) - 46 }
+            return { id: p.dataset.paneId, x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) - F }
           })
           return { osOrigin: { x: screenX, y: screenY }, panes }
         })()`,

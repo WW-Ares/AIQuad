@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
+import { screen } from 'electron'
 import type { AiService, AppConfig } from './types'
 import type { BrowserInfo } from './browser-detect'
 import { CdpSession, listPageTargets } from './cdp'
@@ -43,6 +44,11 @@ export interface ManagedInstance {
    * 页面其余部分保持可见——比整窗隐藏观感好得多。
    */
   hole?: { x: number; y: number; width: number; height: number } | null
+  /**
+   * 最近一次成功施加的可见区外接矩形（窗口内坐标）。
+   * 用于"区域看门狗"判断区域有没有被外部（浏览器自己）改掉。
+   */
+  regionBox?: { left: number, top: number, right: number, bottom: number } | null
   /** 当前是否已处于显示状态，避免反复 ShowWindow 造成闪烁 */
   shown?: boolean
 }
@@ -120,10 +126,14 @@ export class InstanceManager {
   /** 面板窗口的屏幕矩形与缩放（物理像素），实例位置由它换算 */
   private panel = { x: 0, y: 0, scale: 1, hwnd: 0, topMost: true }
   private rects = new Map<string, { x: number, y: number, width: number, height: number }>()
+  /** 每格"悬浮 AI 切换器"的矩形（分格内容区坐标），随分格矩形一起从渲染层上报 */
+  private anchors = new Map<string, { x: number, y: number, width: number, height: number }>()
   /** 被 UI 浮层临时遮挡的格子（下拉展开时需隐藏原生浏览器窗口） */
   private occluded = new Set<string>()
   /** 面板整体收起时为 true：所有实例窗口强制隐藏，避免收起瞬间闪出 */
   private suppressed = false
+  /** 面板正在滑动时为 true：冻结几何校准（见 setSliding） */
+  private sliding = false
   /** 共享会话的浏览器（所有分格共用） */
   private shared: SharedBrowser | null = null
   /** 已被某个分格占用的浏览器窗口，窗口差分时用来排除 */
@@ -134,6 +144,14 @@ export class InstanceManager {
    * 并弹对话框；排队启动可以彻底避免。
    */
   private chain: Promise<unknown> = Promise.resolve()
+  /** 区域看门狗定时器（见 watchRegions） */
+  private regionTimer: NodeJS.Timeout | null = null
+  /** 已经就"区域被外部改掉"告警过的格子，避免每轮都刷日志 */
+  private regionDriftLogged = new Set<string>()
+  /** 每个格子在"刚显示出来"前后的补施定时器（见 settleRegion） */
+  private settleTimers = new Map<string, NodeJS.Timeout[]>()
+  /** 层级看门狗定时器（见 watchZOrder） */
+  private zTimer: NodeJS.Timeout | null = null
 
   constructor(
     private opts: {
@@ -166,25 +184,81 @@ export class InstanceManager {
 
   /** 绑定面板窗口：记录其屏幕位置、缩放与置顶状态，实例据此定位 */
   setPanel(bounds: { x: number, y: number }, scale: number, hwnd: number, topMost: boolean) {
+    const s = scale || 1
+    /**
+     * 只在缩放值变化时打一行日志。
+     *
+     * 为什么值得留：所有"浏览器窗口跑到面板外面"的事故，根子都是
+     * 面板原点（DIP）与分格偏移（DIP）混用/漏乘缩放。有这行日志，
+     * 直接就能算出期望的物理坐标，不必再靠截图反推（上次排查就是这样熬过来的）。
+     */
+    if (s !== this.panel.scale) {
+      console.log(`[panel] 屏幕缩放 ${s}｜面板原点 DIP(${bounds.x},${bounds.y}) → 物理(${Math.round(bounds.x * s)},${Math.round(bounds.y * s)})`)
+    }
     this.panel.x = bounds.x
     this.panel.y = bounds.y
-    this.panel.scale = scale || 1
+    this.panel.scale = s
     this.panel.hwnd = hwnd
     this.panel.topMost = topMost
+    // 面板一绑定就把区域看门狗挂上：浏览器会偷偷改掉我们的可见区（见 watchRegions）
+    this.watchRegions()
+    // 层级看门狗：置顶带里的次序会被系统重排，得盯着（见 enforceZOrder）
+    this.watchZOrder()
     for (const inst of this.instances.values()) {
       if (inst.hwnd && w32.isWindow(inst.hwnd)) {
-        w32.setOwner(inst.hwnd, hwnd)
+        /**
+         * ⚠️ 这里**不能**再 `setOwner(inst.hwnd, panelHwnd)`。
+         *
+         * owner 关系是硬性的：被拥有的窗口永远画在拥有者之上。面板现在必须反过来压在
+         * 浏览器窗口之上（顶栏、悬浮胶囊、下拉菜单都画在面板上，靠面板那层 alpha 让
+         * 分格透出网页），owner 一挂上就永远实现不了——点开网页的瞬间面板就会被盖掉。
+         *
+         * 去掉 owner 的代价：面板隐藏时浏览器窗口不再自动跟着隐藏。这条已经由
+         * setSuppressed() 显式兜住了（面板收起会把每一格都 setShown(false)）。
+         */
         w32.setTopMost(inst.hwnd, topMost)
       }
     }
     this.applyRects()
+    this.enforceZOrder()
   }
 
-  /** 面板位置变化时同步实例位置 */
+  /**
+   * 面板位置变化（拖动 / 滑动动画逐帧）时同步实例位置。
+   *
+   * 这里只重定位、**不重算区域**：窗口的可视区用的是窗口内坐标，整体平移不会
+   * 改变它。而 `applyRects()` 会连着做 SetWindowRgn + 排 4 个补偿定时器，
+   * 一帧一次的话动画必然掉帧（见 relocateAll）。
+   */
   setPanelPosition(x: number, y: number) {
     this.panel.x = x
     this.panel.y = y
-    this.applyRects()
+    this.relocateAll()
+  }
+
+  /**
+   * 轻量重定位：把所有已显示的实例窗口按当前面板原点挪过去。
+   *
+   * 拖动顶栏和滑动动画都是"面板整体平移"，每帧只做这一件事：位置。**不重算区域**
+   * （可视区用的是窗口内坐标，平移不改变它）、**不排 settle 定时器**、**不重测内衬**
+   * ——那三样才是原来动画掉帧的主因，它们全都只在几何真正变化时才需要。
+   *
+   * 为什么不用 `BeginDeferWindowPos` 批量提交（理论上能让这些窗口和面板落在同一批）：
+   * 实测 `DeferWindowPos` 不接受 `SWP_NOSENDCHANGING`（带上传入直接返回 NULL，
+   * 整批失败），而那个标志是防 Chrome 把窄分格钳到 516px 的关键。
+   * 换个角度想也没必要——这些同步调用都在同一个 tick 里完成，DWM 下一次合成时
+   * 拿到的是全部窗口的新位置，呈现出来就是同帧的。
+   */
+  relocateAll() {
+    for (const inst of this.instances.values()) {
+      const hwnd = inst.hwnd
+      if (!hwnd || !w32.isWindow(hwnd)) continue
+      // 用 desiredVisible 而不是 shown：面板刚呼出时窗口还藏着的，也得先挪到位再亮
+      if (!inst.desiredVisible) continue
+      const g = this.geometry(inst)
+      if (!g) continue
+      w32.moveWindowNoClamp(hwnd, g.x, g.y, g.w, g.h, false)
+    }
   }
 
   /**
@@ -196,9 +270,47 @@ export class InstanceManager {
     this.suppressed = on
     if (on) {
       for (const inst of this.instances.values()) this.setShown(inst, false)
+      return
     }
-    else {
-      this.applyRects()
+    /**
+     * 恢复显示走"先挪后亮"的轻量路径。
+     *
+     * 顺序不能反：这些窗口此刻还停在**收起前的位置**（被 suppressed 挡着，位置没更新过），
+     * 先亮出来就会在停靠位闪一下，再被拽到出发位。所以先按新面板原点把它们挪过去，
+     * 全部挪完再显示。
+     *
+     * 也不走 applyRects：那会连带重测内衬、重排 settle 定时器，正好堵在动画起跑线上。
+     * 唯一必须走完整定位的是"从没施加过区域"的窗口（新启动就被收起打断的），
+     * 少了这一步它的标题栏不会被裁掉。
+     */
+    this.relocateAll()
+    for (const inst of this.instances.values()) {
+      if (!inst.desiredVisible) continue
+      if (inst.regionBox) this.setShown(inst, true)
+      else this.positionWindow(inst, true)
+    }
+  }
+
+  /**
+   * 面板滑动动画的起止通知。
+   *
+   * 结束时**只补区域、不重定位**：位置在动画里已经逐帧对齐过了，这时再来一次完整
+   * 校准（内含重测内衬）只会把窗口再推几像素——用户看到的就是"动画跑完、网页莫名
+   * 挪一下"。区域另说：渲染层在动画期间上报的矩形可能带新的挖洞（下拉菜单、
+   * 悬浮切换器），那部分必须落到窗口上，所以要补。
+   */
+  setSliding(on: boolean) {
+    if (this.sliding === on) return
+    this.sliding = on
+    if (!on) this.applyRegionsOnly()
+  }
+
+  /** 只重设"可见区"，不动窗口位置 */
+  private applyRegionsOnly() {
+    for (const inst of this.instances.values()) {
+      if (!inst.hwnd || !w32.isWindow(inst.hwnd) || !inst.shown) continue
+      const g = this.geometry(inst)
+      if (g) this.applyRegion(inst, g)
     }
   }
 
@@ -328,7 +440,8 @@ export class InstanceManager {
 
       // 窗口此刻是隐藏的：改扩展样式（任务栏/Alt+Tab 隐藏）必须在隐藏状态下才生效
       w32.makeToolWindow(win.hwnd)
-      w32.setOwner(win.hwnd, this.panel.hwnd)
+      // 不设 owner（理由见 setPanel 的长注释）；置顶状态与面板保持一致，
+      // 否则面板浮在别的程序之上、网页却被别的程序盖住，只剩一圈黑边。
       w32.setTopMost(win.hwnd, this.panel.topMost)
 
       // 调试端口：共享会话下直接复用，独立档案则等浏览器写出来
@@ -657,9 +770,15 @@ export class InstanceManager {
 
   /* ---------------- 几何 ---------------- */
 
-  setRects(rects: Array<{ paneId: string, x: number, y: number, width: number, height: number }>) {
+  setRects(rects: Array<{ paneId: string, x: number, y: number, width: number, height: number, anchor?: { x: number, y: number, width: number, height: number } | null }>) {
     this.rects.clear()
-    for (const r of rects) this.rects.set(r.paneId, { x: r.x, y: r.y, width: r.width, height: r.height })
+    this.anchors.clear()
+    for (const r of rects) {
+      this.rects.set(r.paneId, { x: r.x, y: r.y, width: r.width, height: r.height })
+      // 悬浮切换器（"灵动岛"）那一块要一直从浏览器窗口里挖掉。
+      // 存在 map 里而不是实例上：实例可能后于矩形上报才创建。
+      if (r.anchor) this.anchors.set(r.paneId, r.anchor)
+    }
     this.applyRects()
   }
 
@@ -693,6 +812,16 @@ export class InstanceManager {
   }
 
   private applyRects() {
+    /**
+     * 滑动期间冻结几何校准。
+     *
+     * `applyRect` 每次都重测浏览器内衬（枚举 Chrome 的子窗口找内容区），量出来的
+     * 结果会有几像素的浮动——平时这是好事（用户开了书签栏能自动跟上），但滑动
+     * 动画正跑着的时候，一次重测就是一次"网页突然挪了 8px、宽度变了 16px"的抖动。
+     * 渲染层在这期间上报的矩形照常收下（下一帧跟随就用新值），只是不做那套重定位。
+     * 动画结束后 setSliding(false) 会补一次完整校准。
+     */
+    if (this.sliding) return
     for (const inst of this.instances.values()) this.applyRect(inst.paneId)
   }
 
@@ -744,9 +873,20 @@ export class InstanceManager {
     const pw = Math.max(1, Math.round(r.width * s))
     const ph = Math.max(1, Math.round(r.height * s))
 
+    /**
+     * ⚠️ 单位：`panel.x/y` 来自 `win.getBounds()`，是 **DIP**（设备无关像素）；
+     *    `r.x/y` 来自渲染层 `getBoundingClientRect()`，也按 DIP 计；
+     *    而 `SetWindowPos` 要的是**物理像素**，`ins`（窗口内衬）也是物理像素。
+     *    所以必须把「面板原点 + 分格偏移」**整体**乘 s 再减内衬。
+     *
+     * 踩过的坑：早期只把 `r.x * s` 乘了 scale，面板原点却按 DIP 加，
+     * 于是这块偏移只在 s == 1 时成立。100% 缩放的机器上一切正常，
+     * 一到 110% / 125% / 150% 的机器，浏览器窗口就整体左移 panel.x*(s-1) 像素
+     * （实测 2560×1440 @110%：偏了约 170px，用户看到「网页跑到面板外面去了」）。
+     */
     return {
-      x: Math.round(this.panel.x + r.x * s - ins.left),
-      y: Math.round(this.panel.y + r.y * s - ins.top),
+      x: Math.round((this.panel.x + r.x) * s - ins.left),
+      y: Math.round((this.panel.y + r.y) * s - ins.top),
       w: Math.max(1, pw + ins.left + ins.right),
       h: Math.max(1, ph + ins.top + ins.bottom),
       region: { x: ins.left, y: ins.top, width: pw, height: ph },
@@ -771,18 +911,115 @@ export class InstanceManager {
 
     // 同步移动+改尺寸：跨进程 SetWindowPos 带 ASYNC 会被 Chrome 丢弃（见 win32 注释）
     w32.moveWindowNoClamp(hwnd, g!.x, g!.y, g!.w, g!.h, false)
-    // 可视区域 = 内容区 −（可选的）下拉浮层矩形
-    const rects = [g!.region]
-    if (inst.hole) {
+    this.applyRegion(inst, g!)
+    this.setShown(inst, true)
+    this.settleRegion(inst)
+  }
+
+  /**
+   * 刚显示出来那一下是区域最容易被顶掉的时候。
+   *
+   * Chrome 往往在窗口**首次可见**时才给自己的窗口设区域（移动/改尺寸也会触发它
+   * 重画自绘边框），正好把刚设好的"裁掉标题栏"切掉。看门狗 500ms 一轮虽能兜住，
+   * 但首屏那半秒用户看得见——就是那条盖住顶栏的白带。所以再补几次重施：
+   * 时间点取 40/120/320/800ms，够覆盖 Chrome 设区域的那几个时机，又不长期开销。
+   */
+  private settleRegion(inst: ManagedInstance) {
+    const hwnd = inst.hwnd
+    if (!hwnd) return
+    const old = this.settleTimers.get(inst.paneId)
+    if (old) for (const t of old) clearTimeout(t)
+    const timers: NodeJS.Timeout[] = []
+    for (const ms of [40, 120, 320, 800]) {
+      const t = setTimeout(() => {
+        if (!w32.isWindow(hwnd) || !inst.shown) return
+        const g = this.geometry(inst)
+        if (g) this.applyRegion(inst, g)
+      }, ms)
+      ;(t as { unref?: () => void }).unref?.()
+      timers.push(t)
+    }
+    this.settleTimers.set(inst.paneId, timers)
+  }
+
+  /**
+   * 施加"可见区"：内容区 −（常驻的悬浮切换器）−（展开中的下拉菜单）。
+   *
+   * ⚠️ 单位：`hole`/`anchor` 来自渲染层 `getBoundingClientRect()`，是 **DIP**；
+   *    `region` 是窗口内坐标的**物理像素**。和 geometry() 是同一类坑——
+   *    不乘 s 的话，110%/125% 的机器上洞只挖开了 1/s，
+   *    下拉菜单/切换器的右下角会被原生浏览器窗口盖住。
+   */
+  private applyRegion(inst: ManagedInstance, g: NonNullable<ReturnType<InstanceManager['geometry']>>) {
+    const hs = g.s
+    const rects = [g.region]
+    const push = (h: { x: number, y: number, width: number, height: number } | null | undefined) => {
+      if (!h || h.width < 2 || h.height < 2) return
       rects.push({
-        x: g!.region.x + inst.hole.x,
-        y: g!.region.y + inst.hole.y,
-        width: inst.hole.width,
-        height: inst.hole.height,
+        x: g.region.x + Math.round(h.x * hs),
+        y: g.region.y + Math.round(h.y * hs),
+        width: Math.max(1, Math.round(h.width * hs)),
+        height: Math.max(1, Math.round(h.height * hs)),
       })
     }
-    w32.setWindowRegionRects(hwnd, rects, g!.radius)
-    this.setShown(inst, true)
+    // 常驻：悬浮在网页上的 AI 切换器（底部不再预留条带，它靠挖洞才看得见）
+    push(this.anchors.get(inst.paneId))
+    // 临时：展开中的下拉菜单
+    push(inst.hole)
+
+    w32.setWindowRegionRects(inst.hwnd!, rects, g.radius)
+    // 记账：内容区外接矩形。圆角与内部挖洞都不改变外接矩形，看门狗据此判断是否被改掉。
+    inst.regionBox = {
+      left: g.region.x,
+      top: g.region.y,
+      right: g.region.x + g.region.width,
+      bottom: g.region.y + g.region.height,
+    }
+  }
+
+  /**
+   * 区域看门狗：浏览器**自己也会**给窗口设区域，会把我们用来
+   * "裁掉标题栏 + 挖洞"的区域顶掉。
+   *
+   * 踩过的现场（2026-09-14，用户机器）：Win11 上顶部控制栏被一块浅灰盖住，
+   * 完全看不清按钮——那就是 Chrome 自己的窗口标题栏没被裁掉，直接压在面板上。
+   * 本机是 Win10，Chrome 不给窗口设区域，所以怎么都复现不出来。
+   *
+   * 结论：定位完不能"设一次就完事"。定期回读可见区外接矩形，
+   * 一旦和期望不符就重新施加。正常情况零开销（只读不写），也不会闪。
+   */
+  private watchRegions() {
+    if (this.regionTimer) return
+    this.regionTimer = setInterval(() => {
+      for (const inst of this.instances.values()) {
+        const hwnd = inst.hwnd
+        if (!hwnd || !inst.shown || !inst.regionBox || !w32.isWindow(hwnd)) continue
+        const box = w32.windowRegionBox(hwnd)
+        const w = inst.regionBox
+        const same = !!box
+          && Math.abs(box.left - w.left) <= 2 && Math.abs(box.top - w.top) <= 2
+          && Math.abs(box.right - w.right) <= 2 && Math.abs(box.bottom - w.bottom) <= 2
+        if (same) continue
+        if (!this.regionDriftLogged.has(inst.paneId)) {
+          this.regionDriftLogged.add(inst.paneId)
+          const got = box ? `${box.left},${box.top},${box.right},${box.bottom}` : '无区域'
+          console.warn(`[panel] ${inst.paneId} 的窗口可见区被外部改动（实测 ${got}｜期望 ${w.left},${w.top},${w.right},${w.bottom}）→ 已重新施加`)
+        }
+        const g = this.geometry(inst)
+        if (g) this.applyRegion(inst, g)
+      }
+    }, 500)
+    // 不要因为这个保活定时器把进程钉住
+    ;(this.regionTimer as { unref?: () => void }).unref?.()
+  }
+
+  stopRegionWatch() {
+    if (this.regionTimer) {
+      clearInterval(this.regionTimer)
+      this.regionTimer = null
+    }
+    for (const timers of this.settleTimers.values()) for (const t of timers) clearTimeout(t)
+    this.settleTimers.clear()
   }
 
   private setShown(inst: ManagedInstance, visible: boolean) {
@@ -791,24 +1028,107 @@ export class InstanceManager {
     if (inst.shown === visible) return
     w32.showWindow(hwnd, visible ? w32.SW_SHOW : w32.SW_HIDE)
     inst.shown = visible
-    if (visible) w32.raiseWindow(hwnd, this.panel.topMost)
-  }
-
-  /** 面板重新激活后，把实例窗口重新提到面板之上（两者同为置顶层级时顺序会变） */
-  raiseAll() {
-    for (const inst of this.instances.values()) {
-      if (inst.hwnd && inst.shown && w32.isWindow(inst.hwnd)) {
-        w32.raiseWindow(inst.hwnd, this.panel.topMost)
-      }
+    // 新显示出来的窗口要提到面板正下方（同为置顶带，次序由我们维护）
+    if (visible) {
+      w32.raiseWindow(hwnd, this.panel.topMost)
+      this.enforceZOrder()
     }
   }
 
-  /** 面板置顶状态变化 */
+  /**
+   * 面板重新激活后把层级理一遍。
+   *
+   * 置顶带内的次序会被系统重排（用户点网页 → 那个浏览器窗口被提到带顶 →
+   * 面板被压下去 → 顶栏又被浏览器标题栏盖住），所以每次面板被激活都要把
+   * 浏览器窗口按回面板下方。
+   */
+  raiseAll() {
+    this.enforceZOrder()
+  }
+
+  /**
+   * 层级看门狗。
+   *
+   * 面板和浏览器窗口现在**同一个置顶带**（这样别的程序既盖不住面板、也盖不住
+   * 网页，不会出现"面板浮着、网页被盖住只剩黑边"的分裂观感）。但同一带里，
+   * 系统会依照激活顺序重排次序：任何一次点击网页、切分格、切站点，都可能把某个
+   * 浏览器窗口顶到带顶，那一瞬间它就会盖住面板顶栏。
+   *
+   * 修法不是"事后补救"，而是持续维持——每 200ms 检查一次面板上面有没有自己的
+   * 浏览器窗口，有就按回去。纯查询的开销可以忽略，只有真的错了才动 Z 序，
+   * 所以不会打断用户操作、也不会闪。
+   *
+   * 间隔取 200ms：这个值就是"点了网页之后顶栏被浏览器标题栏盖住"的最长历时。
+   * 再短收益不大（人眼在那几十毫秒里看不出差别），再长就开始能被察觉了。
+   */
+  private watchZOrder() {
+    if (this.zTimer) return
+    const t = setInterval(() => this.enforceZOrder(), 200)
+    ;(t as { unref?: () => void }).unref?.()
+    this.zTimer = t
+  }
+
+  /** 把落在面板之上的实例窗口按回面板下方 */
+  private enforceZOrder() {
+    const ph = this.panel.hwnd
+    if (!ph || !w32.isWindow(ph)) return
+    const mine = new Set<number>()
+    for (const inst of this.instances.values()) {
+      if (inst.hwnd && inst.shown && w32.isWindow(inst.hwnd)) mine.add(inst.hwnd)
+    }
+    if (!mine.size) return
+
+    // 从 Z 序最顶层往下走，遇到面板之前碰到自己的窗口，就说明它跑到面板上面了
+    const above: number[] = []
+    let h = w32.getTopWindow()
+    let guard = 0
+    while (h && h !== ph && guard++ < 5000) {
+      if (mine.has(h)) above.push(h)
+      h = w32.getWindow(h, w32.GW_HWNDNEXT)
+    }
+    if (!above.length) return
+    // 从最靠下的开始按，最后按的离面板最近，最终次序与插入顺序一致
+    for (let i = above.length - 1; i >= 0; i--) w32.placeBelow(above[i], ph)
+  }
+
+  /**
+   * 鼠标是否落在某个**已就位**的分格上（坐标取 DIP 屏幕坐标系）。
+   *
+   * 用途只有一个：面板显示的那一瞬间，主进程要靠它决定面板的初始鼠标穿透状态。
+   * 之后再靠渲染层的 mousemove 逐帧修正——主进程收不到鼠标移动，只能算这一下。
+   */
+  cursorOverPane(): boolean {
+    let pt: { x: number, y: number }
+    try {
+      pt = screen.getCursorScreenPoint()
+    }
+    catch {
+      return false
+    }
+    const px = this.panel.x
+    const py = this.panel.y
+    for (const inst of this.instances.values()) {
+      if (!inst.shown) continue
+      const r = this.rects.get(inst.paneId)
+      if (!r) continue
+      if (pt.x >= px + r.x && pt.x < px + r.x + r.width && pt.y >= py + r.y && pt.y < py + r.y + r.height) return true
+    }
+    return false
+  }
+
+  /**
+   * 面板置顶状态变化。
+   *
+   * 浏览器窗口跟着一起走，两者始终同一层级——这是"整体一块"的观感来源：
+   * 置顶时任何程序都盖不住面板也盖不住网页；不置顶时两者一起让开。
+   * 只让面板置顶会让两者分裂，用户看到的就是"黑边浮在最上面、网页被别的程序盖住"。
+   */
   setTopMost(on: boolean) {
     this.panel.topMost = on
     for (const inst of this.instances.values()) {
       if (inst.hwnd && w32.isWindow(inst.hwnd)) w32.setTopMost(inst.hwnd, on)
     }
+    this.enforceZOrder()
   }
 
   /* ---------------- 交互 ---------------- */

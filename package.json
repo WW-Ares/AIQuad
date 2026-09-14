@@ -1,6 +1,6 @@
 {
   "name": "aiquad",
-  "version": "0.4.2",
+  "version": "0.4.6",
   "description": "AIQuad - 用真实 Chrome/Edge 驱动的多 AI 并排对话面板，1/2/4 分格同开、登录态跨格共享",
   "main": "dist/main/index.js",
   "author": "WW-Ares and AI collaborators",
@@ -43,6 +43,11 @@
     "directories": {
       "output": "build"
     },
+    "electronLanguages": [
+      "zh-CN",
+      "zh-TW",
+      "en-US"
+    ],
     "win": {
       "target": "nsis",
       "icon": "src/renderer/icon.ico",
@@ -57,6 +62,7 @@
       "dist/**/*",
       "src/renderer/**/*",
       "package.json"
-    ]
+    ],
+    "electronDist": "node_modules/electron/dist"
   }
 }

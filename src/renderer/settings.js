@@ -174,7 +174,8 @@ function fill() {
   setRadio('position', cfg.position)
   $('ratio').value = ratioPercent()
   $('ratio-val').textContent = `${ratioPercent()}%`
-  $('opt-ontop').checked = !!cfg.alwaysOnTop
+  // 面板必须置顶才能压住浏览器窗口（顶栏、悬浮胶囊都画在面板上），恒为 true
+  $('opt-ontop').checked = true
   $('opt-autostart').checked = !!cfg.autoStart
   $('opt-hibernate').checked = !!cfg.hibernateBackground
 
@@ -325,7 +326,8 @@ function collect() {
   for (const f of SC_FIELDS) cfg.shortcuts[f.key] = scGet(f.id)
   cfg.position = getRadio('position') || 'right'
   cfg.windowWidthRatio = Number($('ratio').value || 30) / 100
-  cfg.alwaysOnTop = $('opt-ontop').checked
+  // 恒为 true：面板压不住浏览器窗口的话顶栏就会被浏览器的标题栏盖掉
+  cfg.alwaysOnTop = true
   cfg.autoStart = $('opt-autostart').checked
   cfg.hibernateBackground = $('opt-hibernate').checked
   return cfg

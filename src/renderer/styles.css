@@ -12,11 +12,19 @@
   --err: #ef5f5f;
   --radius: 8px;
   --radius-pane: 6px;
-  --pad: 12px;
-  --gap: 10px;
-  --header-h: 34px;
-  /* 与 app.js 的 PANE_FOOTER 保持一致：每格底部留给 AI 切换器的高度 */
-  --pane-footer: 46px;
+  /* 面板四周与分格之间的留白：尽量小，把面积让给网页 */
+  --pad: 6px;
+  --gap: 5px;
+  --header-h: 30px;
+  /* 每格底部"留给 AI 切换器"的条带高度：0 = 不再预留。
+     切换器改成悬浮在网页上的胶囊（"灵动岛"），靠把这一小块从原生浏览器
+     窗口里挖掉来露出自己，页面因此能一直铺到底。 */
+  --pane-footer: 0px;
+  /* 悬浮胶囊的落位：离分格下沿 10px，高 24px；下拉菜单要从胶囊**上方**起，
+     所以它的 bottom 用 calc 由这两个数算出来，避免各写一个数以后互相压住。 */
+  --island-bottom: 10px;
+  --island-height: 24px;
+  --island-gap: 6px;
 }
 
 * { box-sizing: border-box; }
@@ -25,7 +33,9 @@ html, body {
   margin: 0;
   padding: 0;
   height: 100%;
-  background: var(--panel-bg);
+  /* 面板窗口是 transparent 的：分格处必须输出 alpha=0，浏览器窗口才透得出来。
+     这是合成器通道，不受 Win11 忽略 GDI 区域的影响（见 index.ts 里的说明）。 */
+  background: transparent;
   color: var(--text);
   font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
   font-size: 13px;
@@ -41,10 +51,14 @@ html, body {
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 5px;
   padding: var(--pad);
   position: relative;
-  background: var(--panel-bg);
+  /* 同样要透明：它一有底色，分格处的 alpha 就被填满了，浏览器窗口会整个被挡掉。
+     面板四周那圈留白（padding）不能是透明的，否则会漏出底下的浏览器标题栏/桌面，
+     用 inset 阴影补上——阴影不占布局，不会动到任何几何量。 */
+  background: transparent;
+  box-shadow: inset 0 0 0 var(--pad) var(--panel-bg);
 }
 
 /* ---------------- 顶栏 ---------------- */
@@ -55,60 +69,67 @@ html, body {
   display: flex;
   align-items: center;
   z-index: 3;
-  -webkit-app-region: drag;
+  /* 显式写死不透明底色，别指望父层的 background 透上来：这一条是拖动热区，
+     一旦被系统按标题栏重画，只有自己画满的像素才保得住。 */
+  background: var(--panel-bg);
+  /* 曾经这里用 -webkit-app-region: drag。它会被系统当成标题栏处理，Win11 会
+     按系统配色把这条重画成浅色，把顶栏变成一条读不出字的白带。拖动改由
+     app.js 自己实现（顶栏上按下 → 算位移挪窗口），这里不再声明。 */
 }
 
 .banner {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   color: #fff;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 700;
   cursor: pointer;
-  -webkit-app-region: no-drag;
   padding: 2px 6px 2px 2px;
   border-radius: 6px;
   transition: background .2s ease;
 }
 .banner:hover { background: var(--hover); }
-.banner .robot {
-  width: 24px;
-  height: 24px;
+.banner .brand {
+  width: 20px;
+  height: 20px;
   display: block;
-  flex: 0 0 24px;
+  flex: 0 0 20px;
+  /* 图标是透明底的圆角气泡，压在深色顶栏上直接放就行 */
+  object-fit: contain;
 }
 
 .header-actions {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 4px;
-  -webkit-app-region: no-drag;
+  gap: 3px;
 }
 
 .icon-btn {
-  width: 32px;
-  height: 28px;
+  width: 30px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  background: transparent;
-  color: var(--text-dim);
+  background: rgba(255, 255, 255, .06);
+  /* 图标颜色用正文色而不是 --text-dim：顶栏底色若因任何原因没画上，
+     浅灰描边在浅底上会彻底看不见，正文色至少还留得住轮廓。 */
+  color: var(--text);
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 5px;
   cursor: pointer;
   transition: background .15s ease, color .15s ease, border-color .15s ease;
 }
-.icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn:hover { background: var(--hover); color: #fff; }
 .icon-btn.active {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
 }
-.icon-btn svg { width: 17px; height: 17px; display: block; }
-.icon-btn.sep { margin-left: 6px; }
+.icon-btn svg { width: 16px; height: 16px; display: block; }
+.icon-btn.sep { margin-left: 5px; }
 
 /* ---------------- 网格 ---------------- */
 
@@ -131,11 +152,19 @@ html, body {
   min-height: 0;
   border-radius: var(--radius-pane);
   overflow: hidden;
-  /* 背景留空：内容区会被原生浏览器窗口盖住，只有底部留给 AI 切换器的那条会露出来，
-     用面板底色可以无缝衔接 */
-  background: transparent;
+  /* 浏览器窗口没就位时这一格得自己有个不透明底色，否则面板是透明的，
+     会直接漏出桌面。就位后由 .pane.ready 改成透明，让网页透出来。 */
+  background: var(--pane-empty);
+  /* 分格之间的间隙同样要不透明。用外阴影向外扩，不动布局、不改任何几何量
+     （gap 5px，两侧各 3px 正好盖满）。 */
+  box-shadow: 0 0 0 3px var(--panel-bg);
   z-index: 1;
 }
+
+/* 浏览器窗口已铺满这一格：整格透明，网页从合成器的 alpha 通道透出来 */
+.pane.ready { background: transparent; }
+/* 占位文字是画在面板上的，面板现在压着浏览器窗口，不藏起来就会盖住网页 */
+.pane.ready .pane-placeholder { display: none; }
 
 /* 浏览器窗口就位前显示的占位内容（只占内容区，不覆盖底部切换器） */
 .pane-placeholder {
@@ -170,11 +199,13 @@ html, body {
 }
 .pane.menu-open .pane-scrim { display: block; }
 
-/* ---------------- AI 选择器（底部居中胶囊） ---------------- */
+/* ---------------- AI 选择器（悬浮在网页上的胶囊，位置仍是底部居中） ---------------- */
 
 .ai-selector {
   position: absolute;
-  bottom: 10px;
+  /* 底部不再预留条带，胶囊靠"挖洞"浮在网页之上。留 10px 是为了让洞口
+     离分格下沿有一点距离，网页在胶囊下面还能露出一条，观感才像悬浮。 */
+  bottom: var(--island-bottom);
   left: 50%;
   transform: translateX(-50%);
   z-index: 6;
@@ -183,29 +214,31 @@ html, body {
 .ai-select {
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-width: 132px;
-  max-width: 190px;
-  height: 34px;
-  padding: 0 10px;
-  background: rgba(28, 31, 39, .88);
-  border: 1px solid rgba(255, 255, 255, .12);
+  gap: 5px;
+  min-width: 0;
+  max-width: 168px;
+  height: 24px;
+  padding: 0 9px;
+  /* 不写半透明：它现在浮在网页上，底色一旦因为合成问题掉成透明，
+     白底页面就会把胶囊整个吃掉（只剩不可见的浅色文字）。 */
+  background: #2a2f3a;
+  border: 1px solid rgba(255, 255, 255, .13);
   border-radius: 999px;
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
   cursor: pointer;
-  opacity: .82;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
-  transition: opacity .3s ease, border-color .2s ease, background .2s ease;
-  -webkit-app-region: no-drag;
+  opacity: 1;
+  /* 现在它悬浮在网页之上，需要一圈阴影把自己从页面里"托"起来 */
+  box-shadow: 0 3px 12px rgba(0, 0, 0, .45);
+  transition: background .3s ease, border-color .2s ease;
 }
-.ai-select:hover { opacity: 1; border-color: rgba(255, 255, 255, .28); }
-.ai-select.open { opacity: 1; border-color: var(--accent); }
+.ai-select:hover { border-color: rgba(255, 255, 255, .3); }
+.ai-select.open { border-color: var(--accent); }
 .ai-select .caret {
-  margin-left: auto;
-  width: 12px;
-  height: 12px;
-  flex: 0 0 12px;
+  margin-left: 4px;
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
   opacity: .7;
   transition: transform .2s ease;
 }
@@ -218,9 +251,9 @@ html, body {
 }
 
 .ai-logo {
-  width: 22px;
-  height: 22px;
-  flex: 0 0 22px;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
   border-radius: 50%;
   object-fit: contain;
   background: rgba(255, 255, 255, .08);
@@ -229,7 +262,7 @@ html, body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 700;
   color: #fff;
   background: var(--accent);
@@ -240,16 +273,18 @@ html, body {
 
 .ai-menu {
   position: absolute;
-  bottom: 50px;
+  /* 从悬浮胶囊的正上方展开（胶囊底 10px + 高 24px + 间隙 6px），
+     这样菜单底沿和胶囊顶沿之间总留得下几像素，不会压住胶囊。 */
+  bottom: calc(var(--island-bottom) + var(--island-height) + var(--island-gap));
   left: 50%;
   transform: translateX(-50%);
-  width: 190px;
+  width: 172px;
   max-height: 320px;
   overflow-y: auto;
-  padding: 6px;
+  padding: 5px;
   background: #23262e;
   border: 1px solid rgba(255, 255, 255, .12);
-  border-radius: 10px;
+  border-radius: 9px;
   box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
   display: none;
   z-index: 7;
@@ -266,25 +301,26 @@ html, body {
 .ai-menu::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .3); }
 
 .ai-menu .group-title {
-  padding: 6px 8px 4px;
+  padding: 5px 7px 3px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 10.5px;
   letter-spacing: .5px;
 }
 
 .ai-option {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 8px;
-  border-radius: 6px;
+  gap: 7px;
+  padding: 6px 7px;
+  border-radius: 5px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12.5px;
 }
 .ai-option:hover { background: var(--hover); }
 .ai-option.selected { background: rgba(79, 140, 255, .18); color: #cfe0ff; }
 .ai-option .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-option .tick { margin-left: auto; color: var(--accent); font-size: 12px; }
+.ai-option .ai-logo { width: 15px; height: 15px; flex: 0 0 15px; }
 
 /* ---------------- 加载进度条 ---------------- */
 
@@ -442,4 +478,3 @@ kbd {
 .sc-status.ok { color: var(--ok); }
 .sc-status.warn { color: var(--warn); }
 .sc-status.err { color: var(--err); }
-
