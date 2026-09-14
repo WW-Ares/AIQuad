@@ -6,8 +6,11 @@ import { ConfigStore } from './config'
 import { detectBrowsers, pickBrowser, type BrowserInfo } from './browser-detect'
 import { InstanceManager } from './instance-manager'
 import { getSystemProxy, profilesRoot, testProxy } from './proxy'
+import { clearProfileCache, clearProfileCacheSync, humanSize, scanProfileCache, type CacheCleanResult, type CacheStat } from './cache-cleaner'
+import { updater } from './updater'
 import * as w32 from './win32'
 import type { AppConfig, LayoutId, PaneRect } from './types'
+import { AUTO_CLEAN_THRESHOLD_BYTES } from './types'
 
 let config: ConfigStore
 let manager: InstanceManager | null = null
@@ -100,8 +103,40 @@ function stopAnim() {
   animating = false
 }
 
+/**
+ * 收起动画结束后、把面板挪回停靠位的那个延迟任务。
+ *
+ * 它是在**动画结束之后**才排的，那时 `animTimer` 已经清空，`stopAnim()` 管不到它。
+ * 如果你在收起后 180ms 内又呼出面板，这个任务会照旧触发，把正在滑入的面板
+ * 瞬移回停靠位——呼出动画跑到一半被拽回去。所以 `showPanel()` 里必须能取消它。
+ */
+let hideSettleTimer: NodeJS.Timeout | null = null
+
+function cancelHideSettle() {
+  if (hideSettleTimer) {
+    clearTimeout(hideSettleTimer)
+    hideSettleTimer = null
+  }
+}
+
 function easeInOutCubic(t: number) {
   return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2
+}
+
+/**
+ * 按指针当前位置刷新面板的鼠标穿透状态。
+ *
+ * 指针停在分格（网页）上就穿透，让点击落到下面的浏览器窗口；
+ * 停在顶栏 / 中缝 / 悬浮胶囊上就不穿透，让面板自己收下点击。
+ */
+function applyPassthrough(win: BrowserWindow) {
+  if (!win || win.isDestroyed()) return
+  try {
+    win.setIgnoreMouseEvents(!!manager?.cursorOverPane(), { forward: true })
+  }
+  catch {
+    // 窗口正在销毁时 setIgnoreMouseEvents 会抛，忽略即可
+  }
 }
 
 /**
@@ -200,6 +235,21 @@ function createPanelWindow() {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      /**
+       * 关掉后台节流。这是"收纳后再呼出偶尔卡住"的根治（2026-09-15）。
+       *
+       * 面板 `hide()` 之后页面进入 hidden 态，Chromium 会对它做 intensive
+       * throttling：`setTimeout` 被对齐到 1 分钟一次，`requestAnimationFrame`
+       * **完全停止**。渲染层里 `reportRects` 的延迟上报（120ms 那个 timer）和
+       * 依赖 rAF 的重绘就都停摆了。于是呼出来的时候，主进程拿到的还是收起前的
+       * 分格矩形，落位和 UI 停在旧状态，看起来就是"卡住"；
+       * 而"切一下 AI 再切回来"会强制触发一次上报 + 重绘，卡死状态被打破——
+       * 症状完全对得上。
+       *
+       * 关掉之后面板即使隐藏也照常跑 timer 和 rAF，呼出即可用。
+       * 代价是收起期间渲染层仍会执行（面板 UI 是纯本地 DOM，开销可忽略）。
+       */
+      backgroundThrottling: false,
     },
   })
   Menu.setApplicationMenu(null)
@@ -260,6 +310,8 @@ function createPanelWindow() {
 }
 
 function showPanel() {
+  // 可能是收起后 180ms 内又呼出：先取消那个"把面板挪回停靠位"的延迟任务
+  cancelHideSettle()
   if (!panelWindow) createPanelWindow()
   const win = panelWindow!
   const b = targetBounds()
@@ -294,8 +346,13 @@ function showPanel() {
    *
    * 之后的每一次修正都靠渲染层的 mousemove，而主进程收不到鼠标移动；万一呼出面板时
    * 指针恰好就停在某一格上，不先算这一下，用户的第一次点击会被面板吃掉（网页点不动）。
+   *
+   * 注意 `cursorOverPane()` 内部是实时取 `screen.getCursorScreenPoint()` 的，
+   * 但它依赖渲染层**上报过的**分格矩形；此刻矩形可能是空的（窗口刚建 / 页面还没量完），
+   * 算出来会是不穿透——面板吃掉所有点击，直到渲染层发来第一次 mousemove 才纠正。
+   * 所以动画结束后还要用刷新过的矩形再算一次（见 slideTo 的 onDone）。
    */
-  win.setIgnoreMouseEvents(!!manager?.cursorOverPane(), { forward: true })
+  applyPassthrough(win)
 
   /**
    * 滑入期间实例窗口**保持显示**，跟着面板一起滑进来。
@@ -319,6 +376,8 @@ function showPanel() {
      */
     setTimeout(() => {
       win.focus()
+      // 落位完成后矩形已刷新，用最新值再定一次穿透（show 前那次可能矩形还没上报）
+      applyPassthrough(win)
       win.webContents.send('panel-shown')
       /**
        * 落位之后再把面板从任务栏摘掉。
@@ -354,7 +413,9 @@ function hidePanel() {
     manager?.setSuppressed(true)
     win.hide()
     // 等隐藏真正生效后再回到停靠位，避免在可见状态下改变位置造成闪烁
-    setTimeout(() => {
+    cancelHideSettle()
+    hideSettleTimer = setTimeout(() => {
+      hideSettleTimer = null
       if (!panelWindow || panelWindow.isDestroyed()) return
       const target = targetBounds()
       panelWindow.setBounds({ x: target.x, y: target.y, width: target.width, height: target.height })
@@ -693,22 +754,45 @@ async function bootstrap() {
 function createTray() {
   tray = new Tray(path.join(__dirname, '..', '..', 'src', 'renderer', 'tray.png'))
   tray.setToolTip('AIQuad')
-  const menu = Menu.buildFromTemplate([
-    { label: '呼出面板', click: () => showPanel() },
-    { label: '收起面板', click: () => hidePanel() },
-    { label: '设置', click: () => openSettings() },
-    { type: 'separator' },
-    {
-      label: '退出',
-      click: () => {
-        isQuitting = true
-        app.quit()
+  /**
+   * 更新那一项的文字是动态的（检查中 / 下载 37% / 点此安装），
+   * 所以菜单每次打开前重建一次，而不是建好就不管。
+   */
+  const rebuild = () => {
+    if (!tray || tray.isDestroyed()) return
+    const menu = Menu.buildFromTemplate([
+      { label: '呼出面板', click: () => showPanel() },
+      { label: '收起面板', click: () => hidePanel() },
+      { label: '设置', click: () => openSettings() },
+      { type: 'separator' },
+      {
+        label: updater.menuLabel(),
+        click: () => {
+          // 已经下载完就装，否则触发一次（手动）检查
+          if (!updater.installIfReady()) updater.check(true)
+        },
       },
-    },
-  ])
-  tray.setContextMenu(menu)
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          isQuitting = true
+          app.quit()
+        },
+      },
+    ])
+    tray.setContextMenu(menu)
+  }
+  rebuild()
   tray.on('click', () => togglePanel())
+  trayRebuild = rebuild
+  // 状态阶段变了就重挂菜单；下载进度的百分比变化太密，不跟着刷
+  updater.onChange((_s, prevStatus) => {
+    if (prevStatus !== _s.status) rebuild()
+  })
 }
+
+let trayRebuild: (() => void) | null = null
 
 /* ---------------- IPC ---------------- */
 
@@ -720,7 +804,25 @@ function setupIpc() {
     profiles: profilesRoot(app.getPath('userData')),
     browser: browserInfo ?? null,
     browsers: await detectBrowsers(),
+    // 给设置页算"面板宽度预览像素"用：宽度比例乘的就是这块宽度
+    screenWidth: screen.getPrimaryDisplay().workArea.width,
+    electron: process.versions.electron || '-',
+    node: process.versions.node || '-',
+    chrome: process.versions.chrome || '-',
   }))
+
+  ipcMain.handle('get-cache-stats', async (): Promise<CacheStat & { cacheText: string; totalText: string }> => {
+    const stat = await scanProfileCache(profilesRoot(app.getPath('userData')))
+    return { ...stat, cacheText: humanSize(stat.cacheBytes), totalText: humanSize(stat.totalBytes) }
+  })
+
+  ipcMain.handle('clear-cache', async (): Promise<CacheCleanResult & { removedText: string }> => {
+    const r = await clearProfileCache(profilesRoot(app.getPath('userData')))
+    if (r.removedBytes || r.skipped.length) {
+      console.log(`[cache] 手动清理：释放 ${humanSize(r.removedBytes)}，${r.skipped.length} 项被占用`)
+    }
+    return { ...r, removedText: humanSize(r.removedBytes) }
+  })
 
   ipcMain.handle('save-config', async (_e, patch: Partial<AppConfig>) => {
     const before = config.get()
@@ -825,6 +927,12 @@ function setupIpc() {
   })
 
   ipcMain.handle('open-settings', () => openSettings())
+  ipcMain.handle('check-update', () => {
+    // 已在后台下好就直接问要不要装，否则手动查一次（手动查会给"已是最新"的反馈）
+    if (!updater.installIfReady()) updater.check(true)
+    return updater.state()
+  })
+  ipcMain.handle('get-update-state', () => updater.state())
   ipcMain.handle('panel-toggle', () => togglePanel())
   ipcMain.handle('panel-hide', () => hidePanel())
   /**
@@ -943,7 +1051,34 @@ else {
 app.whenReady().then(async () => {
   setupIpc()
   await bootstrap()
+  // 放最后：它自己会延时 6 秒再查，不跟启动抢资源
+  updater.init()
+  // 缓存自动清理推迟到界面稳定之后：扫描是全盘 stat，放在启动关键路径上会拖慢首帧
+  setTimeout(runAutoCacheCleanup, 3000)
 })
+
+/**
+ * 启动时按阈值清一次缓存。
+ *
+ * 只清 Cache / Code Cache / 着色器缓存这些浏览器随时能重新生成的东西，
+ * Cookies 与 Local Storage 不动 —— 否则每次启动都要重新登录 AI 站，那就本末倒置了。
+ */
+function runAutoCacheCleanup() {
+  if (config?.get().cacheCleanup !== 'auto') return
+  void (async () => {
+    try {
+      const root = profilesRoot(app.getPath('userData'))
+      // cap 设成阈值：数到 500MB 就收，不用把整个档案树走完
+      const stat = await scanProfileCache(root, AUTO_CLEAN_THRESHOLD_BYTES)
+      if (stat.cacheBytes < AUTO_CLEAN_THRESHOLD_BYTES) return
+      const r = await clearProfileCache(root)
+      console.log(`[cache] 缓存 ${humanSize(stat.cacheBytes)} 超过阈值，自动清理释放 ${humanSize(r.removedBytes)}，${r.skipped.length} 项被占用`)
+    }
+    catch (e) {
+      console.warn('[cache] 自动清理失败', e)
+    }
+  })()
+}
 
 app.on('before-quit', () => {
   isQuitting = true
@@ -953,6 +1088,17 @@ app.on('will-quit', () => {
   stopAnim()
   globalShortcut.unregisterAll()
   manager?.killAll()
+  // 浏览器进程刚被杀掉，此刻缓存文件才腾得出手来删。
+  // "退出时清理"选的就是这条时机，删不干净的（极少数被系统占着的）下次启动还会补一刀。
+  if (config?.get().cacheCleanup === 'exit') {
+    try {
+      const r = clearProfileCacheSync(profilesRoot(app.getPath('userData')))
+      console.log(`[cache] 退出清理：释放 ${humanSize(r.removedBytes)}`)
+    }
+    catch (e) {
+      console.warn('[cache] 退出清理失败', e)
+    }
+  }
 })
 
 app.on('window-all-closed', () => {

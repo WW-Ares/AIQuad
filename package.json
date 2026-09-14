@@ -1,6 +1,6 @@
 {
   "name": "aiquad",
-  "version": "0.4.6",
+  "version": "0.4.8",
   "description": "AIQuad - 用真实 Chrome/Edge 驱动的多 AI 并排对话面板，1/2/4 分格同开、登录态跨格共享",
   "main": "dist/main/index.js",
   "author": "WW-Ares and AI collaborators",
@@ -28,14 +28,18 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dist": "npm run clean && npm run build && electron-builder"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "koffi": "latest"
+    "electron-updater": "~6.8.9",
+    "koffi": "~3.2.1"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "electron": "latest",
-    "electron-builder": "latest",
-    "typescript": "latest"
+    "@types/node": "~26.5.1",
+    "electron": "~44.3.0",
+    "electron-builder": "~26.15.3",
+    "typescript": "~7.0.2"
   },
   "build": {
     "appId": "com.aiquad.app",
@@ -49,7 +53,10 @@
       "en-US"
     ],
     "win": {
-      "target": "nsis",
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "src/renderer/icon.ico",
       "artifactName": "AIQuad-Setup-${version}.${ext}"
     },
@@ -57,6 +64,14 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true
+    },
+    "portable": {
+      "artifactName": "AIQuad-Portable-${version}.${ext}"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "WW-Ares",
+      "repo": "AIQuad"
     },
     "files": [
       "dist/**/*",

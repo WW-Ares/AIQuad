@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AIQuad 面板外观方案对比</title>
+<style>
+  :root {
+    --panel-bg: #15181f;
+    --pane-bg: #22262f;
+    --pane-empty: #1b1f27;
+    --hover: #2c313c;
+    --line: #2e333e;
+    --text: #eef1f6;
+    --text-dim: #98a1b3;
+    --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: #0d1017;
+    color: #e8ecf3;
+    font: 14px/1.6 "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  }
+
+  /* ---------------- 页头 ---------------- */
+  .head {
+    padding: 26px 32px 18px;
+    border-bottom: 1px solid #1d2330;
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,16,23,.94);
+    backdrop-filter: blur(8px);
+  }
+  .head h1 { margin: 0 0 6px; font-size: 17px; font-weight: 600; letter-spacing: .2px; }
+  .head p { margin: 0; color: #7d8798; font-size: 12.5px; }
+  .head code { background: #1a1f2b; padding: 1px 5px; border-radius: 4px; color: #9fb4d8; font-size: 12px; }
+  .tabs { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+  .tab {
+    padding: 7px 15px; border-radius: 7px; cursor: pointer; font-size: 13px;
+    background: #171c26; border: 1px solid #232b3a; color: #aab4c6;
+    transition: all .15s ease;
+  }
+  .tab:hover { background: #1d2431; color: #e8ecf3; }
+  .tab.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .tab small { display: block; font-size: 11px; opacity: .72; font-weight: 400; margin-top: 1px; }
+
+  /* ---------------- 舞台 ---------------- */
+  .stage {
+    padding: 40px 32px 60px;
+    min-height: calc(100vh - 200px);
+    display: flex; gap: 40px; align-items: flex-start; justify-content: center;
+    flex-wrap: wrap;
+    /* 模拟一块浅色壁纸——白条问题的关键在于"面板哪里是透的，
+       透出来的就是桌面"，所以背景必须是个能被看出来的浅色。 */
+    background:
+      radial-gradient(1100px 700px at 78% 8%, #cdd8ea 0%, #b9c6dc 42%, #96a6c0 100%);
+  }
+  .stage.dark { background: radial-gradient(1100px 700px at 78% 8%, #3a4256 0%, #262c3a 45%, #171b24 100%); }
+  .stage.warn { background: linear-gradient(120deg, #ffd9e0 0%, #d8e4ff 50%, #ffe9c9 100%); }
+
+  /* ---------------- 面板本尊（576×1040，与 1920 屏下 30% 宽 + 全高一致） ---------------- */
+  .panel {
+    width: 576px; height: 1040px;
+    position: relative;
+    transform-origin: top left;
+    flex: 0 0 auto;
+    border-radius: 0;
+    /* 面板外壳：分格处必须完全透明（alpha=0），所以底色只能靠 inset 阴影画边框 */
+    background: transparent;
+  }
+  .col { display: flex; flex-direction: column; gap: 12px; }
+  .col > .cap {
+    position: sticky; top: 128px;
+    font-size: 12px; color: #64708a; letter-spacing: .3px;
+    background: rgba(13,16,23,.8); padding: 6px 10px; border-radius: 6px;
+    border: 1px solid #1d2330; align-self: flex-start;
+  }
+  .wrap { position: relative; }
+  .badge {
+    position: absolute; left: -1px; top: -1px; transform: translateY(-100%);
+    background: #1d2431; border: 1px solid #2b3446; color: #cbd5e6;
+    font-size: 12px; font-weight: 600; padding: 5px 11px; border-radius: 7px 7px 0 0;
+    border-bottom: none; letter-spacing: .3px;
+  }
+  .badge.rec { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .badge.now { background: #3a2530; border-color: #5a3040; color: #ffb3c4; }
+
+  /* ---------------- 顶栏 ---------------- */
+  .bar {
+    display: flex; align-items: center;
+    background: var(--panel-bg);
+    z-index: 3; position: relative;
+  }
+  .brand { display: flex; align-items: center; gap: 6px; color: #fff; font-weight: 700; font-size: 14px; }
+  .brand .mk {
+    width: 20px; height: 20px; border-radius: 50%;
+    background: radial-gradient(circle at 32% 28%, #6fb7ff, #2f6df0 62%, #1b46b8);
+    position: relative; flex: 0 0 20px;
+  }
+  .brand .mk::after {
+    content: ''; position: absolute; inset: 4px 5px;
+    border-radius: 50% 50% 50% 6px / 50% 50% 6px 50%;
+    background: #fff; opacity: .92;
+    transform: rotate(-24deg);
+  }
+  .acts { margin-left: auto; display: flex; align-items: center; gap: 3px; }
+  .ic {
+    display: inline-flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.06); color: var(--text);
+    border: 1px solid transparent; border-radius: 5px; cursor: pointer;
+    padding: 0; transition: background .15s ease, color .15s ease;
+  }
+  .ic svg { display: block; }
+  .ic:hover { background: var(--hover); color: #fff; }
+  .ic.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ic.ghost { background: transparent; }
+  .ic.ghost:hover { background: var(--hover); }
+
+  /* ---------------- 分格与"网页" ---------------- */
+  .grid { flex: 1; display: grid; min-height: 0; }
+  .pane { position: relative; overflow: hidden; }
+  /* 模拟原生浏览器窗口：它是独立的直角矩形，画在面板之上 */
+  .page {
+    position: absolute; inset: 0;
+    background: #f9f8f7; color: #191919;
+    display: flex; flex-direction: column;
+  }
+  .page .top { display: flex; align-items: center; gap: 10px; padding: 14px 18px 0; }
+  .page .mk2 { width: 26px; height: 26px; border-radius: 50%; border: 2.5px solid #191919; }
+  .page .spacer { flex: 1; }
+  .page .pill { padding: 6px 15px; border-radius: 999px; font-size: 13px; font-weight: 500; }
+  .page .pill.g { background: #fff; border: 1px solid #dcdcdc; }
+  .page .pill.d { background: #191919; color: #fff; }
+  .page .mid { flex: 1; display: flex; align-items: center; justify-content: center; }
+  .page .mid b { font-size: 30px; font-weight: 600; letter-spacing: -.3px; }
+  .page .foot { padding: 0 14px 12px; }
+  .page .box {
+    border: 1px solid #e2e2e2; border-radius: 14px; background: #fff;
+    padding: 12px 14px; box-shadow: 0 2px 10px rgba(0,0,0,.05);
+  }
+  .page .box .ph { color: #8b8b8b; font-size: 13.5px; }
+  .page .box .row { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+  .page .box .row .plus { font-size: 19px; color: #555; }
+  .page .box .row .rt { margin-left: auto; display: flex; align-items: center; gap: 12px; color: #6b6b6b; font-size: 13px; }
+  .page .box .row .send {
+    width: 30px; height: 30px; border-radius: 50%; background: #b9d4f5;
+    display: flex; align-items: center; justify-content: center; color: #fff;
+  }
+  .page .legal { text-align: center; font-size: 11px; color: #6f6f6f; margin-top: 8px; }
+
+  /* 悬浮胶囊 */
+  .island {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 5px;
+    background: #2a2f3a; border: 1px solid rgba(255,255,255,.13);
+    border-radius: 999px; color: var(--text); font-size: 12px; font-weight: 500;
+    box-shadow: 0 3px 12px rgba(0,0,0,.45);
+    z-index: 6;
+  }
+  .island .lg { width: 16px; height: 16px; border-radius: 50%; background: #191919; flex: 0 0 16px; }
+  .island svg { opacity: .7; }
+
+  /* ---------------- 各方案微调 ---------------- */
+  /* 现状：原样复刻，含那条 2px 缝 */
+  .s-now .bar { height: 30px; padding: 0 6px; }
+  .s-now .ic { width: 30px; height: 24px; }
+  .s-now .ic svg { width: 16px; height: 16px; }
+  .s-now .grid { padding: 0 6px 6px; gap: 5px; }
+  .s-now .pane { border-radius: 6px; box-shadow: 0 0 0 3px var(--panel-bg); }
+  .s-now .island { bottom: 10px; height: 24px; padding: 0 9px; }
+  /* 那条缝：顶栏下沿留 2px 什么都不画，直接透出桌面 */
+  .s-now .bar { margin-bottom: 5px; }
+
+  /* A · 精修（推荐） */
+  .s-a .bar {
+    height: 36px; padding: 0 8px;
+    border-bottom: 1px solid rgba(255,255,255,.07);
+    /* 这一条 box-shadow 就是"补缝"：向下扩 6px，把顶栏与分格之间的空隙画满 */
+    box-shadow: 0 6px 0 var(--panel-bg);
+  }
+  .s-a .brand { font-size: 13.5px; font-weight: 600; letter-spacing: .2px; }
+  .s-a .brand .mk { width: 18px; height: 18px; flex: 0 0 18px; }
+  .s-a .ic { width: 28px; height: 26px; border-radius: 6px; }
+  .s-a .ic svg { width: 15px; height: 15px; }
+  .s-a .acts { gap: 4px; }
+  .s-a .ic.sep { margin-left: 7px; }
+  .s-a .grid { padding: 0 6px 6px; gap: 6px; }
+  .s-a .pane { border-radius: 8px; box-shadow: 0 0 0 3px var(--panel-bg); }
+  .s-a .page { border-radius: 8px; }
+  .s-a .island { bottom: 12px; height: 26px; padding: 0 11px; font-size: 12.5px; }
+  .s-a .island .lg { width: 17px; height: 17px; flex: 0 0 17px; }
+
+  /* B · 玻璃 */
+  .s-b .bar {
+    height: 40px; padding: 0 10px;
+    background: linear-gradient(180deg, #232936 0%, #1a1f29 58%, #15181f 100%);
+    border-bottom: 1px solid rgba(255,255,255,.09);
+    box-shadow: 0 6px 0 var(--panel-bg), inset 0 1px 0 rgba(255,255,255,.07);
+  }
+  .s-b .brand { font-weight: 600; letter-spacing: .3px; }
+  .s-b .ic { width: 30px; height: 28px; background: transparent; border-radius: 7px; }
+  .s-b .ic:hover { background: rgba(255,255,255,.09); }
+  .s-b .ic.on { background: linear-gradient(180deg, #5c95ff, #3d78f5); box-shadow: 0 2px 8px rgba(79,140,255,.45); }
+  .s-b .actwrap { display: flex; align-items: center; gap: 2px; background: rgba(0,0,0,.22); padding: 2px; border-radius: 9px; }
+  .s-b .grid { padding: 0 8px 8px; gap: 8px; }
+  .s-b .pane { border-radius: 10px; box-shadow: 0 0 0 4px var(--panel-bg); }
+  .s-b .page { border-radius: 10px; }
+  .s-b .bar { margin-bottom: 8px; }
+  .s-b .island {
+    bottom: 14px; height: 28px; padding: 0 12px; font-size: 12.5px;
+    background: #262b36; border-color: rgba(255,255,255,.16);
+    box-shadow: 0 6px 18px rgba(0,0,0,.55);
+  }
+
+  /* C · 极简（无边框感）—— 已落地，数值就是 src/renderer/styles.css 里的现值 */
+  .s-c .bar {
+    height: 26px; padding: 0 4px;
+    box-shadow: 0 4px 0 var(--panel-bg);
+  }
+  .s-c .brand { font-size: 13px; font-weight: 600; color: #cdd6e4; }
+  .s-c .brand .mk { width: 16px; height: 16px; flex: 0 0 16px; }
+  .s-c .ic { width: 26px; height: 24px; background: transparent; color: var(--text-dim); border-radius: 5px; }
+  .s-c .ic:hover { background: rgba(255,255,255,.07); color: #fff; }
+  .s-c .ic.on { background: transparent; color: var(--accent); }
+  .s-c .grid { padding: 0 4px 4px; gap: 4px; }
+  .s-c .pane { border-radius: 5px; box-shadow: 0 0 0 2px var(--panel-bg); overflow: visible; }
+  /* 网页向上出血 8px：越过分格上沿，压在顶栏底下（顶栏 z-index 更高，会盖住它）。
+     真实实现是给第一行分格加负 margin-top，这里用负 inset 表达同一个结果。 */
+  .s-c .page { border-radius: 5px; inset: -8px 0 0 0; }
+  .s-c .island { bottom: 8px; height: 22px; padding: 0 8px; font-size: 11.5px; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+  .s-c .island .lg { width: 14px; height: 14px; flex: 0 0 14px; }
+
+  /* ---------------- 细节放大镜 ---------------- */
+  .zoompanel { width: 576px; }
+  .zoombox {
+    position: relative; overflow: hidden;
+    width: 576px; height: 96px;
+    border: 1px solid #2b3446; border-radius: 8px;
+    /* 放大 3 倍后只看顶栏下沿那一段（原图 y = 20~52） */
+    background: linear-gradient(105deg, #cdd8ea 0%, #b9c6dc 55%, #96a6c0 100%);
+  }
+  .zoombox .inner { position: absolute; left: 0; top: -60px; transform: scale(3); transform-origin: top left; width: 192px; }
+  .zoombox .panel { width: 192px; }
+  .markline {
+    position: absolute; left: 0; right: 0; height: 0;
+    border-top: 1px dashed #ff5c7a;
+  }
+  .marklbl {
+    position: absolute; font-size: 11px; background: #ff5c7a; color: #fff;
+    padding: 2px 7px; border-radius: 5px; white-space: nowrap; font-weight: 600;
+  }
+  .oklbl { background: #35c07f; }
+  .note { font-size: 12.5px; color: #93a0b5; margin-top: 8px; }
+  .note b { color: #e8ecf3; }
+  .k { color: #9fb4d8; font-family: Consolas, monospace; font-size: 12px; }
+
+  .legend { max-width: 900px; margin: 0 auto; padding: 0 32px 60px; }
+  .legend h2 { font-size: 14px; margin: 26px 0 10px; color: #cfd8e6; font-weight: 600; }
+  .legend ul { margin: 0; padding-left: 20px; color: #909db3; font-size: 13px; }
+  .legend li { margin: 5px 0; }
+  .legend .k { color: #a8bde0; }
+</style>
+</head>
+<body>
+
+<div class="head">
+  <h1>AIQuad 面板外观方案</h1>
+  <p>
+    按真实尺寸渲染（576 × 1040，即 1920 屏下 30% 宽 + 全高）。背景特意用浅色壁纸，
+    因为「白条」的本质是<code>面板哪里是透的，就透出后面的桌面</code>——深色桌面上看不出来。
+  </p>
+  <div class="tabs" id="tabs">
+    <button class="tab on" data-view="now">现状 <small>复刻当前 0.4.7</small></button>
+    <button class="tab" data-view="zoom">问题放大 <small>那条缝到底是什么</small></button>
+    <button class="tab" data-view="a">方案 A · 精修 <small>改动最小</small></button>
+    <button class="tab" data-view="b">方案 B · 玻璃 <small>层次最强</small></button>
+    <button class="tab" data-view="c">方案 C · 极简 <small>最让面积给网页</small></button>
+    <button class="tab" data-view="all">四个并排 <small>一次看完</small></button>
+  </div>
+</div>
+
+<div class="stage" id="stage">
+  <div id="viewNow" class="col">
+    <span class="cap">现状 · 576×1040</span>
+    <div class="wrap">
+      <div class="badge now">现状（0.4.7）</div>
+      <div id="pNow"></div>
+    </div>
+  </div>
+
+  <div id="viewZoom" class="col" style="display:none;max-width:640px">
+    <span class="cap">顶栏下沿 · 放大 3 倍</span>
+    <div class="zoompanel">
+      <div class="wrap" style="margin-bottom:26px">
+        <div class="badge now">现状：这里有一条 2px 的缝</div>
+        <div class="zoombox" style="margin-top:0">
+          <div class="inner" id="zNow"></div>
+          <div class="markline" style="top:48px"></div>
+          <div class="marklbl" style="top:30px;right:8px">← 这 2px 什么都没画</div>
+        </div>
+      </div>
+      <div class="note">
+        采样自真实截图 <span class="k">.tmp/out-047-100.png</span>：<br>
+        <span class="k">y=6~35</span> 顶栏 <b>#15181f</b>（不透明）<br>
+        <span class="k">y=36~37</span> <b style="color:#ff8fa6">#d4d4d9</b> ← 桌面壁纸，不是面板画的<br>
+        <span class="k">y=38~40</span> <b>#15181f</b>（分格的外阴影，向上扩 3px）<br>
+        <span class="k">y=41~</span> 网页 <b>#f9f8f7</b>
+      </div>
+
+      <div class="wrap" style="margin-top:34px">
+        <div class="badge rec">方案 A：同一位置</div>
+        <div class="zoombox">
+          <div class="inner" id="zA"></div>
+          <div class="marklbl oklbl" style="top:30px;right:8px">✓ 深色一直连到网页</div>
+        </div>
+      </div>
+      <div class="note">
+        顶栏加一条 <span class="k">box-shadow: 0 6px 0 var(--panel-bg)</span>，把这 6px 的空隙直接画满。
+        不占布局、不动任何几何量，所以落位与分格矩形完全不受影响。
+      </div>
+
+      <div class="wrap" style="margin-top:34px">
+        <div class="badge">顺便说：分格之间为什么没有这个问题</div>
+        <div class="zoombox" style="height:120px">
+          <div class="inner" id="zGap"></div>
+        </div>
+      </div>
+      <div class="note">
+        分格之间的 5px 缝是<b>两条外阴影叠出来的</b>（每格向外扩 3px，3+3 &gt; 5 正好盖满），
+        所以中缝是深色的。顶栏下面没有对应的那一条——这就是唯一的漏点。
+      </div>
+    </div>
+  </div>
+
+  <div id="viewA" class="col" style="display:none">
+    <span class="cap">方案 A · 精修</span>
+    <div class="wrap"><div class="badge rec">A · 精修（推荐）</div><div id="pA"></div></div>
+  </div>
+  <div id="viewB" class="col" style="display:none">
+    <span class="cap">方案 B · 玻璃</span>
+    <div class="wrap"><div class="badge">B · 玻璃</div><div id="pB"></div></div>
+  </div>
+  <div id="viewC" class="col" style="display:none">
+    <span class="cap">方案 C · 极简</span>
+    <div class="wrap"><div class="badge">C · 极简</div><div id="pC"></div></div>
+  </div>
+
+  <div id="viewAll" style="display:none;gap:26px;align-items:flex-start;flex-wrap:wrap;justify-content:center">
+  </div>
+</div>
+
+<div class="legend">
+  <h2>三个方案分别在改什么</h2>
+  <ul id="legendList"></ul>
+</div>
+
+<script>
+/* ---------- 图标（与 main.html 里的路径一致，只改尺寸） ---------- */
+const ICONS = {
+  one: '<rect x="4" y="4.5" width="16" height="15" rx="2.5"/>',
+  two: '<rect x="4" y="4.5" width="16" height="15" rx="2.5"/><path d="M4 12h16" stroke-linecap="round"/>',
+  four: '<rect x="4" y="4.5" width="16" height="15" rx="2.5"/><path d="M12 4.5v15M4 12h16" stroke-linecap="round"/>',
+  gear: '<circle cx="12" cy="12" r="3.1"/><path d="M12 2.8v2.4M12 18.8v2.4M4.5 12H2.1M21.9 12h-2.4M6.7 6.7 5 5M19 19l-1.7-1.7M6.7 17.3 5 19M19 5l-1.7 1.7" stroke-linecap="round"/>',
+  hide: '<path d="M14.5 5.5 7.5 12l7 6.5"/>',
+};
+
+function icon(name, size) {
+  const s = size || 16;
+  return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    stroke-width="1.7" stroke-linejoin="round">${ICONS[name]}</svg>`;
+}
+
+function caret(size) {
+  const s = size || 10;
+  return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`;
+}
+
+/* ---------- 面板结构 ---------- */
+function panelHTML(skin, opts) {
+  const o = opts || {};
+  const wrapCls = o.wrapActs ? 'actwrap' : '';
+  return `
+  <div class="panel ${skin}">
+    <header class="bar">
+      <div class="brand"><i class="mk"></i>AIQuad</div>
+      <div class="acts">
+        <div class="${wrapCls}" style="${o.wrapActs ? 'display:flex' : 'display:contents'}">
+          <button class="ic on">${icon('one')}</button>
+          <button class="ic">${icon('two')}</button>
+          <button class="ic">${icon('four')}</button>
+        </div>
+        <button class="ic sep">${icon('gear')}</button>
+        <button class="ic">${icon('hide')}</button>
+      </div>
+    </header>
+    <main class="grid">
+      <section class="pane">
+        <div class="page">
+          <div class="top">
+            <div class="mk2"></div>
+            <div class="spacer"></div>
+            <div class="pill g">登录</div>
+            <div class="pill d">注册</div>
+          </div>
+          <div class="mid"><b>我们应该探索什么？</b></div>
+          <div class="foot">
+            <div class="box">
+              <div class="ph">切换到构建模式以创建应用</div>
+              <div class="row">
+                <span class="plus">＋</span>
+                <span class="rt">Fast ${caret(11)}</span>
+                <span class="send">↑</span>
+              </div>
+            </div>
+            <div class="legal">通过给 Grok 发消息，即表示你同意 条款 和 隐私政策。</div>
+          </div>
+        </div>
+        <div class="island"><i class="lg"></i>Grok ${caret(10)}</div>
+      </section>
+    </main>
+  </div>`;
+}
+
+const SKINS = {
+  now: { cls: 's-now', opts: {} },
+  a: { cls: 's-a', opts: {} },
+  b: { cls: 's-b', opts: { wrapActs: true } },
+  c: { cls: 's-c', opts: {} },
+};
+
+function mount(id, key, scale) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const s = SKINS[key];
+  el.innerHTML = panelHTML(s.cls, s.opts);
+  const p = el.querySelector('.panel');
+  if (scale && scale !== 1) {
+    p.style.transform = `scale(${scale})`;
+    p.style.height = '1040px';
+    // 缩放后容器高度要跟着缩，否则下面留一大片空白
+    el.style.height = (1040 * scale) + 'px';
+    el.style.overflow = 'visible';
+    p.style.marginBottom = '0';
+  }
+  return el;
+}
+
+/* 细节放大镜：只渲染顶栏 + 一点点，用 3 倍放大 */
+function mountZoom(id, key) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const s = SKINS[key];
+  el.innerHTML = panelHTML(s.cls, s.opts);
+  const p = el.querySelector('.panel');
+  p.style.width = '192px';
+  p.style.height = '160px';
+  const grid = p.querySelector('.grid');
+  grid.style.minHeight = '120px';
+}
+
+/* ---------- 视图切换 ---------- */
+const SCALE = 0.62;
+
+function build() {
+  mount('pNow', 'now', SCALE);
+  mount('pA', 'a', SCALE);
+  mount('pB', 'b', SCALE);
+  mount('pC', 'c', SCALE);
+
+  mountZoom('zNow', 'now');
+  mountZoom('zA', 'a');
+  mountZoom('zGap', 'a');
+
+  const all = document.getElementById('viewAll');
+  all.innerHTML = [
+    ['现状', 'now', 'badge now'],
+    ['方案 A · 精修', 'a', 'badge rec'],
+    ['方案 B · 玻璃', 'b', 'badge'],
+    ['方案 C · 极简', 'c', 'badge'],
+  ].map(([label, key, cls], i) => `
+    <div class="col">
+      <span class="cap">${label}</span>
+      <div class="wrap"><div class="${cls}">${label}</div><div id="all${i}"></div></div>
+    </div>`).join('');
+  ['now', 'a', 'b', 'c'].forEach((k, i) => mount('all' + i, k, 0.52));
+}
+
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab');
+  if (!btn) return;
+  for (const b of document.querySelectorAll('.tab')) b.classList.toggle('on', b === btn);
+  const v = btn.dataset.view;
+  const map = { now: 'viewNow', zoom: 'viewZoom', a: 'viewA', b: 'viewB', c: 'viewC', all: 'viewAll' };
+  for (const [k, id] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    el.style.display = (k === v) ? (k === 'viewAll' ? 'flex' : (k === 'viewZoom' ? 'block' : 'flex')) : 'none';
+  }
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+/* ---------- 说明文字 ---------- */
+const LEGEND = [
+  ['<b>三个方案共有的第一件事：把那条缝补上。</b>这是 bug，不是审美。'
+    + '顶栏 30px 画到 y=35 就结束了，紧接着的 5px 空隙里，分格的外阴影只往上盖了 3px（y=38~40），'
+    + '剩下 y=36~37 两像素<b>什么都没画</b>。面板在那儿是 alpha=0，于是透出后面的桌面：'
+    + '<b>桌面上有什么就透出什么</b>——浅色壁纸是白条，深色壁纸是黑条，全屏 IDE 就是 IDE 的颜色。'
+    + '这跟显示几次无关，是布局本身漏了 2px。'],
+  ['<b>方案 A · 精修</b>：改动最小，只动 CSS。<br>'
+    + '① 顶栏 <span class="k">30px → 36px</span>，按钮 <span class="k">30×24 → 28×26</span>，图标 16px；'
+    + '② 顶栏加 <span class="k">1px</span> 底部分隔线 <span class="k">rgba(255,255,255,.07)</span>；'
+    + '③ 补缝：顶栏 <span class="k">box-shadow: 0 6px 0 var(--panel-bg)</span>；'
+    + '④ 分格圆角 <span class="k">6px → 8px</span>，缝与留白统一成 <span class="k">6px</span>；'
+    + '⑤ 悬浮胶囊 <span class="k">24px → 26px</span>，离底 <span class="k">10px → 12px</span>，字号 12.5px。'],
+  ['<b>方案 B · 玻璃</b>：顶栏用三段渐变 + 内侧高光，右侧四个按钮收进一个托盘里'
+    + '（<span class="k">rgba(0,0,0,.22)</span> 底 + 9px 圆角），活动态改成渐变蓝并带一圈辉光。'
+    + '留白加到 <span class="k">8px</span>，分格圆角 <span class="k">10px</span>，缝 <span class="k">8px</span>。'
+    + '层次最强，但顶栏变高到 40px，网页面积少一点点。'],
+  ['<b>方案 C · 极简（已落地）</b>：顶栏压到 <span class="k">26px</span>（比原来的 30px 还矮），'
+    + '按钮 <span class="k">24×22</span>、去掉底色只用图标，活动态仅用蓝色描边表示；'
+    + '留白 <span class="k">4px</span>、缝 <span class="k">4px</span>，分格圆角 <span class="k">5px</span>，'
+    + '悬浮胶囊 <span class="k">22px</span>、离底 <span class="k">8px</span>。<br>'
+    + '补缝不再只靠顶栏阴影：<b>第一行网页向上出血 8px</b>，越过分格上沿压在顶栏底下，'
+    + '那条缝从物理上消失。实测采样列 <span class="k">y=0~33</span> 全是面板底色 '
+    + '<span class="k">#15181f</span>，<span class="k">y=34</span> 起就是网页，中间没有任何桌面像素。'
+    + '面积几乎全给了网页，代价是拖动手感差一点（顶栏矮了）、也少了视觉层次。'],
+  ['<b>与浏览器圆角的关系</b>：分格圆角要靠 <span class="k">setWindowRegionRects(hwnd, rects, radius)</span> '
+    + '作用在<b>外部浏览器窗口</b>上才看得出来（面板自己画在下面，会被直角网页盖住）。'
+    + '这段代码已经在跑（<span class="k">PANE_RADIUS * scale</span>），所以 A/B/C 的圆角改动只需要'
+    + '把 <span class="k">PANE_RADIUS</span> 与 CSS 的 <span class="k">--radius-pane</span> 同步调大即可。'],
+  ['<b>我的建议</b>：选 <b>方案 A</b>。它把能明确称为「问题」的都修了（缝、圆角被直角网页盖住、顶栏偏挤），'
+    + '改动几乎全在 <span class="k">styles.css</span>，不动任何几何计算，风险最低；'
+    + '唯一需要同步的是圆角数值——<span class="k">--radius-pane</span> 与 '
+    + '<span class="k">instance-manager.ts</span> 里的 <span class="k">PANE_RADIUS</span> 要一起改。'
+    + '方案 B 好看，但要把 <span class="k">--pad</span> 从 6 加到 8，网页面积实打实少一圈，'
+    + '而「玻璃感」在纯深色顶栏上的实际提升有限。'],
+];
+document.getElementById('legendList').innerHTML = LEGEND.map(([t]) => `<li>${t}</li>`).join('');
+
+build();
+</script>
+</body>
+</html>

@@ -3,7 +3,18 @@ import path from 'node:path'
 import type { AiService, AppConfig } from './types'
 import { normalizeAccelerator } from './accelerator'
 
-const CONFIG_VERSION = 3
+const CONFIG_VERSION = 4
+
+/**
+ * 早期版本给"分格切换"预设了 Ctrl+Alt+1/2/4，实际会和其它软件抢键，
+ * 而顶栏本来就有 1/2/4 的按钮，所以从 v0.4.8 起这三个默认为空（= 不注册）。
+ * 迁移时只清掉**没被改过**的那几个，用户自己设的组合照旧保留。
+ */
+const LEGACY_LAYOUT_SHORTCUTS: Record<string, string> = {
+  layout1: 'Ctrl+Alt+1',
+  layout2: 'Ctrl+Alt+2',
+  layout4: 'Ctrl+Alt+4',
+}
 
 /**
  * 内置 AI 清单。按「国外（us）在前、国内（cn）在后」分组。
@@ -43,9 +54,10 @@ export function defaultConfig(): AppConfig {
     },
     shortcuts: {
       toggleFloat: 'Alt+Space',
-      layout1: 'Ctrl+Alt+1',
-      layout2: 'Ctrl+Alt+2',
-      layout4: 'Ctrl+Alt+4',
+      // 分格切换默认不绑键：顶栏有按钮，绑了反而容易和别的软件冲突
+      layout1: '',
+      layout2: '',
+      layout4: '',
     },
     position: 'right',
     windowWidthRatio: 0.3,
@@ -56,12 +68,17 @@ export function defaultConfig(): AppConfig {
     autoStart: false,
     browserPreference: 'auto',
     customBrowserPath: '',
+    // 默认自动：缓存超过 500MB 就在下次启动时清一遍。
+    // 只清 Cache / Code Cache 这类可再生的东西，不动登录态。
+    cacheCleanup: 'auto',
   }
 }
 
 export class ConfigStore {
   private file: string
   private data: AppConfig
+  /** 磁盘上那份配置的版本号，用来判断要不要跑迁移（见 normalize） */
+  private loadedVersion = CONFIG_VERSION
 
   constructor(userDataDir: string) {
     this.file = path.join(userDataDir, 'config.json')
@@ -78,12 +95,15 @@ export class ConfigStore {
       if (fs.existsSync(this.file)) {
         const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'))
         this.data = this.merge(this.data, raw)
+        this.loadedVersion = Number((this.data as any)?.version) || 0
       }
     }
     catch (e) {
       console.warn('[config] load failed, using defaults', e)
     }
     this.normalize()
+    // 迁移过就把新版本号写回去，免得每次启动都重跑一遍迁移
+    if (this.loadedVersion !== CONFIG_VERSION) this.save()
   }
 
   /**
@@ -117,6 +137,13 @@ export class ConfigStore {
     else if (!['1', '2', '4'].includes(layout)) this.data.layout = '1'
     // 清理旧版本遗留的第三格快捷键
     delete (this.data.shortcuts as any).layout3
+    // v0.4.8 起分格切换不再默认绑键。只还原"从没改过"的那几个，
+    // 用户自己抓过的组合（值不等于旧默认值）保持原样。
+    if (this.loadedVersion < 4) {
+      for (const [k, legacy] of Object.entries(LEGACY_LAYOUT_SHORTCUTS)) {
+        if ((this.data.shortcuts as any)[k] === legacy) (this.data.shortcuts as any)[k] = ''
+      }
+    }
     // 快捷键统一成规范写法（Ctrl+Alt+K / Alt+Space …），手改过 config.json 也能正常工作。
     // 不合法的一律**原样保留**：让设置页能显示"这个组合有问题"，而不是悄悄换成默认值。
     for (const k of ['toggleFloat', 'layout1', 'layout2', 'layout4']) {
@@ -129,6 +156,14 @@ export class ConfigStore {
     if (this.data.windowMode !== 'app' && this.data.windowMode !== 'standard') this.data.windowMode = 'standard'
     // 登录态共享默认开启：旧配置没有这个字段时按开启处理（这是 v0.4 的主行为）
     this.data.sharedSession = this.data.sharedSession !== false
+
+    // 用户可以删掉全部 AI（早期版本允许），那样每个分格都取不到 AI、整块面板变空。
+    // 兜底恢复内置清单，宁可"删不掉最后一个"也不能让面板没法用。
+    if (!Array.isArray(this.data.aiList) || this.data.aiList.length === 0) {
+      this.data.aiList = DEFAULT_AI.map((a) => ({ ...a }))
+    }
+    if (!['off', 'auto', 'exit'].includes(this.data.cacheCleanup)) this.data.cacheCleanup = 'auto'
+
     const ratio = Number(this.data.windowWidthRatio)
     if (!Number.isFinite(ratio) || ratio < 0.15 || ratio > 0.9) this.data.windowWidthRatio = 0.3
 

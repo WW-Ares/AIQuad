@@ -11,19 +11,37 @@
   --warn: #e8b04b;
   --err: #ef5f5f;
   --radius: 8px;
-  --radius-pane: 6px;
+  --radius-pane: 5px;
   /* 面板四周与分格之间的留白：尽量小，把面积让给网页 */
-  --pad: 6px;
-  --gap: 5px;
-  --header-h: 30px;
+  --pad: 4px;
+  --gap: 4px;
+  /**
+   * 顶栏高度。这里按"把像素让给网页"来取：26px 是能同时满足三个条件的下限——
+   * 图标按钮 22px（再矮就不好点了）、按钮上下各留 2px 不至于贴边、
+   * 拖动整块面板的热区还得够宽（26px 用指针拖拽没问题）。
+   */
+  --header-h: 26px;
+  /**
+   * 贴着顶栏的那一排，网页向上多铺这一段（侵入顶栏底下，被顶栏压住看不见）。
+   *
+   * 存在的唯一理由是**填缝**：顶栏与第一个分格之间有 --gap 的空隙，分格的外阴影
+   * 只向外扩 2px（刚好盖满分格之间的 4px，因为两侧各出一边的 2+2），到了顶栏
+   * 下方就只剩单侧的一条，剩下的那一截面板画不到、也就不得不透出后面的桌面
+   * ——浅色桌面上就是那条白线。把网页顶边抬到顶栏里面去，这条缝就从物理上消失了。
+   *
+   * 取值只要 > --gap 即可，多出来的部分整段压在顶栏下面；留 4px 余量是给
+   * Math.round 在 110%/125% 缩放下的舍入误差。别往下调，也别再往上调太多：
+   * 这段是被遮住的，调大等于白吃掉网页面积（网页内容不会跟着上移）。
+   */
+  --bleed-top: 8px;
   /* 每格底部"留给 AI 切换器"的条带高度：0 = 不再预留。
      切换器改成悬浮在网页上的胶囊（"灵动岛"），靠把这一小块从原生浏览器
      窗口里挖掉来露出自己，页面因此能一直铺到底。 */
   --pane-footer: 0px;
   /* 悬浮胶囊的落位：离分格下沿 10px，高 24px；下拉菜单要从胶囊**上方**起，
      所以它的 bottom 用 calc 由这两个数算出来，避免各写一个数以后互相压住。 */
-  --island-bottom: 10px;
-  --island-height: 24px;
+  --island-bottom: 8px;
+  --island-height: 22px;
   --island-gap: 6px;
 }
 
@@ -51,7 +69,7 @@ html, body {
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: var(--gap);
   padding: var(--pad);
   position: relative;
   /* 同样要透明：它一有底色，分格处的 alpha 就被填满了，浏览器窗口会整个被挡掉。
@@ -72,6 +90,13 @@ html, body {
   /* 显式写死不透明底色，别指望父层的 background 透上来：这一条是拖动热区，
      一旦被系统按标题栏重画，只有自己画满的像素才保得住。 */
   background: var(--panel-bg);
+  /**
+   * 向下补一条 --gap 宽的不透明尾巴，正好压住顶栏与第一个分格之间的空隙。
+   * 阴影不占布局，所以不动任何几何量。第一行网页虽然已经上抬 --bleed-top 顶到这里，
+   * 但浏览器窗口就位之前（以及非整数缩放换算有 1px 出入时）还得靠这一条兜底，
+   * 不能让那条缝漏出桌面。
+   */
+  box-shadow: 0 var(--gap) 0 var(--panel-bg);
   /* 曾经这里用 -webkit-app-region: drag。它会被系统当成标题栏处理，Win11 会
      按系统配色把这条重画成浅色，把顶栏变成一条读不出字的白带。拖动改由
      app.js 自己实现（顶栏上按下 → 算位移挪窗口），这里不再声明。 */
@@ -81,9 +106,10 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
-  color: #fff;
-  font-size: 14px;
-  font-weight: 700;
+  /* 品牌区不再抢注意力：正文级的字重和亮度，把视线让给分格里的网页 */
+  color: #cdd6e4;
+  font-size: 13px;
+  font-weight: 600;
   cursor: pointer;
   padding: 2px 6px 2px 2px;
   border-radius: 6px;
@@ -91,10 +117,10 @@ html, body {
 }
 .banner:hover { background: var(--hover); }
 .banner .brand {
-  width: 20px;
-  height: 20px;
+  width: 16px;
+  height: 16px;
   display: block;
-  flex: 0 0 20px;
+  flex: 0 0 16px;
   /* 图标是透明底的圆角气泡，压在深色顶栏上直接放就行 */
   object-fit: contain;
 }
@@ -106,29 +132,36 @@ html, body {
   gap: 3px;
 }
 
+/**
+ * 极简风的图标按钮：平时不画底色，只有悬停和开启这两个状态才出现反馈。
+ *
+ * ⚠️ 悬停底色用半透明白而不是 --hover：顶栏底色若因任何原因没画上，
+ *    semi-transparent white 在浅底上还留得住，纯色会糊成一片。
+ * ⚠️ 开启态用图标颜色而不是实心蓝底：实心底在 34px 高的窄顶栏里块面太大，
+ *    一排三四个就把顶栏压成了按钮条；改成蓝字既认得出，又不抢画面。
+ */
 .icon-btn {
-  width: 30px;
-  height: 24px;
+  width: 24px;
+  height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  background: rgba(255, 255, 255, .06);
-  /* 图标颜色用正文色而不是 --text-dim：顶栏底色若因任何原因没画上，
-     浅灰描边在浅底上会彻底看不见，正文色至少还留得住轮廓。 */
-  color: var(--text);
+  background: transparent;
+  color: var(--text-dim);
   border: 1px solid transparent;
   border-radius: 5px;
   cursor: pointer;
   transition: background .15s ease, color .15s ease, border-color .15s ease;
 }
-.icon-btn:hover { background: var(--hover); color: #fff; }
+.icon-btn:hover { background: rgba(255, 255, 255, .07); color: #fff; }
+.icon-btn:active { transform: translateY(1px); }
 .icon-btn.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
 }
-.icon-btn svg { width: 16px; height: 16px; display: block; }
+.icon-btn svg { width: 14px; height: 14px; display: block; }
 .icon-btn.sep { margin-left: 5px; }
 
 /* ---------------- 网格 ---------------- */
@@ -144,6 +177,27 @@ html, body {
 #panes.size-2 { grid-template-rows: repeat(2, 1fr); }
 #panes.size-4 { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); }
 
+/**
+ * 顶栏那一排的网页向上出血。
+ *
+ * grid item 默认 align-self: stretch，给一个负的 margin-top，边框盒的上沿就会往上推、
+ * 下沿不动、高度自动多出同样一段。这一点很重要：`.ai-selector` 是贴底边定位的，
+ * 胶囊和下拉菜单的坐标都相对分格左上角算，底边必须纹丝不动。
+ *
+ * `getBoundingClientRect()` 报的就是推上去之后的新矩形，主进程一行都不用改，
+ * DIP → 物理像素的换算本来就走这一路。
+ *
+ * 多出来的那一截压在 34px 高的顶栏底下看不见，换来的是顶栏与网页之间不再有任何缝。
+ *
+ * ⚠️ 只给**第一行**，不能四边都扩：相邻两个分格是各自独立的浏览器窗口，它们之间的
+ *    Z 序由系统按激活重排（见 instance-manager 的看门狗），一旦重叠谁压谁不确定。
+ *    顶栏不一样，它被看门狗固定在最上面，稳。
+ */
+#panes > .pane:first-child,
+#panes.size-4 > .pane:nth-child(2) {
+  margin-top: calc(-1 * var(--bleed-top));
+}
+
 /* ---------------- 分格 ---------------- */
 
 .pane {
@@ -156,8 +210,10 @@ html, body {
      会直接漏出桌面。就位后由 .pane.ready 改成透明，让网页透出来。 */
   background: var(--pane-empty);
   /* 分格之间的间隙同样要不透明。用外阴影向外扩，不动布局、不改任何几何量
-     （gap 5px，两侧各 3px 正好盖满）。 */
-  box-shadow: 0 0 0 3px var(--panel-bg);
+     （--gap 4px，两侧各 2px 正好盖满）。
+     ⚠️ 这条只对"两侧都有邻居"的缝成立：顶栏下方只有分格出的这一边，
+     剩下一截靠顶栏的 box-shadow 补，详见 --bleed-top 的说明。 */
+  box-shadow: 0 0 0 2px var(--panel-bg);
   z-index: 1;
 }
 
@@ -217,15 +273,15 @@ html, body {
   gap: 5px;
   min-width: 0;
   max-width: 168px;
-  height: 24px;
-  padding: 0 9px;
+  height: 22px;
+  padding: 0 8px;
   /* 不写半透明：它现在浮在网页上，底色一旦因为合成问题掉成透明，
      白底页面就会把胶囊整个吃掉（只剩不可见的浅色文字）。 */
   background: #2a2f3a;
   border: 1px solid rgba(255, 255, 255, .13);
   border-radius: 999px;
   color: var(--text);
-  font-size: 12px;
+  font-size: 11.5px;
   cursor: pointer;
   opacity: 1;
   /* 现在它悬浮在网页之上，需要一圈阴影把自己从页面里"托"起来 */
@@ -251,9 +307,9 @@ html, body {
 }
 
 .ai-logo {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
   border-radius: 50%;
   object-fit: contain;
   background: rgba(255, 255, 255, .08);
@@ -452,6 +508,47 @@ kbd {
 .result { font-size: 12px; margin-left: 6px; }
 .result.ok { color: var(--ok); }
 .result.err { color: var(--err); }
+
+/* 面板宽度预设：一组紧挨着的分段按钮，选中的那个跟主色走 */
+.seg { display: inline-flex; gap: 0; }
+.seg button {
+  border-radius: 0;
+  margin-left: -1px;
+  padding: 4px 12px;
+  color: var(--text-dim);
+}
+.seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.seg button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(79, 140, 255, .14);
+  position: relative;
+  z-index: 1;
+}
+
+/* 隐藏的 AI：还在配置里，只是不出现在选择器 —— 用压暗而不是删掉来区分 */
+.settings tr.ai-hidden td { opacity: .48; }
+.settings tr.ai-hidden input,
+.settings tr.ai-hidden select { text-decoration: line-through; text-decoration-thickness: 1px; }
+/* 操作栏两个按钮：挤在一起容易点错，中间留一点空隙 */
+.settings td.ops { white-space: nowrap; }
+.settings td.ops button { padding: 3px 9px; }
+.settings td.ops button + button { margin-left: 6px; }
+
+/* 关于页：外链一行排开，颜色提示可点 */
+.link-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 4px; }
+.link-row a {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(79, 140, 255, .35);
+}
+.link-row a:hover { border-bottom-color: var(--accent); }
+
+/* 缓存统计的明细：一份档案一行，别糊成一团 */
+#cache-detail { margin-top: 6px; }
+#cache-detail br { line-height: 1.8; }
 
 /* 快捷键抓取控件 */
 .sc-input {

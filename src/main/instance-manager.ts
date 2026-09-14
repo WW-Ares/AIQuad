@@ -62,8 +62,11 @@ interface SharedBrowser {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** 面板分格圆角（CSS 像素），与界面上的 --radius-pane 保持一致 */
-const PANE_RADIUS = 10
+/**
+ * 面板分格圆角（CSS 像素），必须与 styles.css 的 --radius-pane 同值。
+ * 两个数一起改，否则网页的直角会把面板画的圆角从里面顶掉，看起来像没改。
+ */
+const PANE_RADIUS = 5
 /**
  * 实测不到网页内容区时的兜底内衬。
  * 数值来自 Chrome 150 / 100% DPI / 标准窗口的实测（见 win32.chromeContentInsets）。

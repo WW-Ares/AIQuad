@@ -218,11 +218,18 @@ function renderMenu(paneId) {
     { key: 'us', title: '国外 AI' },
     { key: 'cn', title: '国内 AI' },
   ]
+  /**
+   * 隐藏的 AI 不出现在选择器里（设置页里手动收起来的那些）。
+   * 注意只过滤**候选**列表：已经开着的格子若正好绑着一个被隐藏的 AI，
+   * 它照常显示、照常能用——"隐藏"不等于"禁用"，收起的同时不能把人家的格子弄坏。
+   */
+  let shown = 0
   for (const g of groups) {
-    const list = state.config.aiList.filter((a) => (a.category || 'cn') === g.key)
+    const list = state.config.aiList.filter((a) => (a.category || 'cn') === g.key && !a.hidden)
     if (!list.length) continue
     menu.appendChild(el('div', 'group-title', g.title))
     for (const ai of list) {
+      shown += 1
       const row = el('div', `ai-option${ai.id === pane?.aiId ? ' selected' : ''}`)
       row.appendChild(buildLogo(ai, 20))
       row.appendChild(el('span', 'name', ai.name))
@@ -235,6 +242,10 @@ function renderMenu(paneId) {
       })
       menu.appendChild(row)
     }
+  }
+  if (!shown) {
+    menu.appendChild(el('div', 'group-title', '所有 AI 都隐藏了'))
+    menu.appendChild(el('div', 'ai-option muted', '到设置 → AI 服务里把需要的显示回来'))
   }
 }
 

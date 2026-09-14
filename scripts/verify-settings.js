@@ -24,7 +24,9 @@ const { cleanupRun } = require('./lib/process-cleanup')
 const ROOT = path.join(__dirname, '..')
 const CONFIG = path.join(process.env.APPDATA || '', 'aiquad', 'config.json')
 const ELECTRON = path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe')
-const PORT = 9231
+// 端口必须可配：写死时若上一个实例还没退干净，新实例绑不上端口，
+// 脚本就会连到半死的那个目标上，报出"设置窗口没起来"这种假故障。
+const PORT = Number(process.env.AIQUAD_TEST_PORT || 9231)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -45,6 +47,32 @@ function check(ok, label, detail = '') {
 function referencedIds() {
   const js = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'settings.js'), 'utf8')
   return [...new Set([...js.matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1]))]
+}
+
+/**
+ * 轮询磁盘上的 config.json 直到满足条件。
+ *
+ * 为什么不能简单睡几百毫秒：保存链路里带着 `await syncInstances()`，
+ * 而前面的用例刚翻过"登录态共享"，那会先把浏览器实例全杀掉再重启，
+ * 几百毫秒根本排不上队。盯着真实落盘的结果才靠谱。
+ */
+/**
+ * 上限给到 20 秒：前面翻过"登录态共享"会先杀掉浏览器实例再重启，
+ * 后一次 save-config 会排在这条重启链后面，几秒钟不一定轮得上。
+ * 宁可多等一会儿也不要误报"功能坏了"。
+ */
+async function waitConfig(predicate, ms = 20000, step = 200) {
+  const t0 = Date.now()
+  let last = null
+  while (Date.now() - t0 < ms) {
+    try {
+      last = JSON.parse(fs.readFileSync(CONFIG, 'utf8'))
+      if (predicate(last)) return { ok: true, cfg: last, waited: Date.now() - t0 }
+    }
+    catch {}
+    await sleep(step)
+  }
+  return { ok: false, cfg: last, waited: Date.now() - t0 }
 }
 
 async function cdpTargets() {
@@ -109,8 +137,8 @@ async function main() {
 
     cdp = new CdpSession(setTarget.webSocketDebuggerUrl)
     await cdp.connect()
-    const evaluate = async (expression) => {
-      const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })
+    const evaluate = async (expression, timeoutMs = 30000) => {
+      const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, timeoutMs)
       if (r?.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || '页面内异常')
       return r?.result?.value
     }
@@ -148,15 +176,99 @@ async function main() {
       'config.json 里 windowWidthRatio 真的变了',
       `磁盘值=${after.windowWidthRatio} 期望=${targetPct / 100}`)
 
-    /* ---------- 4. 登录态共享开关 ---------- */
-    console.log('\n[登录态共享开关]')
-    const flipped = !(after.sharedSession !== false)
-    await evaluate(`(() => { const c = document.getElementById('opt-shared'); c.checked = ${flipped}; save(false); return c.checked })()`)
-    await sleep(900)
-    const after2 = JSON.parse(fs.readFileSync(CONFIG, 'utf8'))
-    check(after2.sharedSession === flipped, 'sharedSession 写入成功', `磁盘值=${after2.sharedSession} 期望=${flipped}`)
+    /* ---------- 4. 面板宽度预设 / AI 隐藏 / 缓存统计 / 代理测试 ---------- */
 
-    /* ---------- 5. 主进程有没有崩 ---------- */
+    console.log('\n[面板宽度预设]')
+    // 这里**只做 DOM**，不在 evaluate 里 await 任何 IPC。
+    // 刚刚那次 save 会连带 syncInstances，IPC 一旦排队，awaitPromise 会一直悬着，
+    // CDP 侧超时表现为 "CDP closed" —— 看起来像进程崩了，其实没有。
+    // 配置有没有写进去交给下面的 waitConfig 盯磁盘，那才是准的。
+    const preset = await evaluate(`(async () => {
+      const btn = document.querySelector('#ratio-presets button[data-ratio="40"]')
+      if (!btn) return { err: 'HTML 里找不到预设按钮' }
+      btn.click()
+      // 只等一帧：界面必须**立刻**反映点击，不能等 IPC 回来
+      await new Promise((r) => setTimeout(r, 60))
+      return {
+        label: document.getElementById('ratio-val').textContent,
+        px: document.getElementById('ratio-px').textContent,
+        active: btn.classList.contains('active'),
+      }
+    })()`)
+    check(preset?.label === '40%', '点预设后界面立刻显示 40%', `label=${preset?.label}`)
+    check(/约 \d+ px/.test(preset?.px || ''), '给出实际像素估算', preset?.px)
+    check(preset?.active === true, '预设按钮立刻呈选中态')
+    const presetDisk = await waitConfig((c) => Math.round((c.windowWidthRatio || 0) * 100) === 40)
+    check(presetDisk.ok, '预设写进 config.json', `耗时 ${presetDisk.waited}ms，磁盘值=${presetDisk.cfg?.windowWidthRatio}`)
+
+    console.log('\n[AI 隐藏 / 显示]')
+    await evaluate(`(() => {
+      document.querySelector('#ai-rows tr td.ops button')?.click()
+      return true
+    })()`)
+    const hiddenDisk = await waitConfig((c) => c.aiList?.some((a) => a.hidden))
+    check(hiddenDisk.ok, '点"隐藏"后配置里出现 hidden 项', `耗时 ${hiddenDisk.waited}ms`)
+    check(hiddenDisk.cfg?.aiList?.filter((a) => a.hidden).length === 1, '只隐藏了这一个')
+    const btnText = await evaluate(`document.querySelector('#ai-rows tr td.ops button')?.textContent`)
+    check(btnText === '显示', '按钮文案翻成"显示"', `实际=${btnText}`)
+    const dimmed = await evaluate(`document.querySelector('#ai-rows tr')?.className`)
+    check(dimmed === 'ai-hidden', '隐藏的行被压暗标记', `class=${dimmed}`)
+
+    // 再点一次还原。轮询到这里才准，因为这一趟也要压过实例重启
+    await evaluate(`(() => { document.querySelector('#ai-rows tr td.ops button')?.click(); return true })()`)
+    const restoreDisk = await waitConfig((c) => !c.aiList?.some((a) => a.hidden))
+    check(restoreDisk.ok, '再点一次恢复可见', `耗时 ${restoreDisk.waited}ms`)
+    check(restoreDisk.cfg?.aiList?.length === hiddenDisk.cfg?.aiList?.length, '隐藏/显示都不丢条目')
+
+    console.log('\n[缓存统计]')
+    const cache = await evaluate(`(async () => {
+      await loadCacheStats()
+      const s = await window.aiquad.getCacheStats()
+      return {
+        text: document.getElementById('cache-stat').textContent,
+        detail: document.getElementById('cache-detail').textContent.slice(0, 80),
+        profiles: s.profileCount,
+        cacheBytes: s.cacheBytes,
+        totalBytes: s.totalBytes,
+        mode: document.getElementById('cache-mode').value,
+      }
+    })()`)
+    check(typeof cache?.cacheBytes === 'number' && cache.cacheBytes >= 0, '拿到缓存体积', `可清理 ${cache?.cacheBytes}`)
+    check(cache?.profiles >= 1, '扫到至少一份浏览器档案', `共 ${cache?.profiles} 份，合计 ${cache?.totalBytes}`)
+    check(/可清理缓存/.test(cache?.text || ''), '界面显示可读的体积文案', cache?.text)
+    check(!!cache?.detail, '显示分档案明细', cache?.detail)
+    check(!!cache?.mode, '自动清理下拉有值', cache?.mode)
+
+    console.log('\n[代理连通性测试不会卡住]')
+    const pt = await evaluate(`(async () => {
+      document.getElementById('proxy-mode').value = 'custom'
+      document.getElementById('proxy-host').value = '127.0.0.1'
+      document.getElementById('proxy-port').value = '65531'
+      document.getElementById('proxy-test-url').value = 'https://www.google.com'
+      const t0 = Date.now()
+      document.getElementById('btn-test-proxy').click()
+      const el = document.getElementById('proxy-result')
+      let waited = 0
+      while (waited < 14000 && /测试中/.test(el.textContent)) {
+        await new Promise((r) => setTimeout(r, 200)); waited = Date.now() - t0
+      }
+      return { waited, text: el.textContent, cls: el.className, disabled: document.getElementById('btn-test-proxy').disabled }
+    })()`)
+    check(!/测试中/.test(pt?.text || ''), '测试一定有结论（不再停在"测试中…"）', `${pt?.waited}ms 后="${pt?.text}"`)
+    check(/失败|出错/.test(pt?.text || '') && pt?.cls === 'result err', '端口不通时给出失败原因', pt?.text)
+    check(pt?.disabled === false, '测试结束后按钮恢复可用')
+
+    /* ---------- 5. 登录态共享开关 ----------
+     *
+     * 放最后：改它会先把浏览器实例全杀掉再重启，后面的存盘请求统统要排队，
+     * 插在别的用例前面会让它们集体超时，看着像一堆功能坏了。
+     */
+    console.log('\n[登录态共享开关]')
+    const flipped = !(origCfg.sharedSession !== false)
+    await evaluate(`(() => { const c = document.getElementById('opt-shared'); c.checked = ${flipped}; save(false); return c.checked })()`)
+    const sharedDisk = await waitConfig((c) => (c.sharedSession !== false) === flipped)
+    check(sharedDisk.ok, 'sharedSession 写入成功', `磁盘值=${sharedDisk.cfg?.sharedSession} 期望=${flipped}`)
+
     if (/uncaught|A JavaScript error occurred/i.test(log)) {
       check(false, '主进程日志里没有未捕获异常', log.slice(-400))
     }
@@ -166,6 +278,9 @@ async function main() {
   }
   catch (e) {
     check(false, '测试执行', String(e?.message || e))
+    // 断连 / 崩溃时把主进程最后的输出打出来，否则只能看到一个没有解释的 CDP closed
+    console.log('--- 主进程日志尾部 ---')
+    console.log(log.split('\n').slice(-25).join('\n'))
   }
   finally {
     try { cdp?.close() } catch {}

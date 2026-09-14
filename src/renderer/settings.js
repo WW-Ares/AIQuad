@@ -191,6 +191,9 @@ function fill() {
   $('window-mode').value = cfg.windowMode || 'standard'
   $('browser-path').value = cfg.customBrowserPath || ''
   $('opt-shared').checked = cfg.sharedSession !== false
+  $('cache-mode').value = cfg.cacheCleanup || 'auto'
+
+  syncRatioUi(ratioPercent())
 
   if (info?.browser) {
     $('browser-info').textContent = `当前：${info.browser.name} ${info.browser.version || ''}`
@@ -201,22 +204,131 @@ function fill() {
   const sp = cfg.proxy.systemServer
   $('system-proxy').textContent = sp ? `已检测到：${sp}（类型 ${cfg.proxy.systemType || 'http'}）` : '未检测到系统代理'
 
-  $('about').innerHTML = `版本 ${info?.version || '-'}<br>用户数据：${info?.userData || '-'}<br>浏览器档案：${info?.profiles || '-'}`
+  $('about').innerHTML = [
+    `AIQuad ${info?.version || '-'} · MIT License · © 2026 WW-Ares`,
+    `用户数据：${info?.userData || '-'}`,
+    `浏览器档案：${info?.profiles || '-'}`,
+    `运行环境：Electron ${info?.electron || '-'} / Node ${info?.node || '-'} / Chromium ${info?.chrome || '-'}`,
+  ].join('<br>')
+
+  $('about-oss').innerHTML = [
+    '本项目以 MIT 协议开源，源码、打包脚本和回归脚本都公开，欢迎提 issue 与 PR。',
+    '用到的开源组件：Electron（MIT，Chromium 内核与窗口管理）、koffi（MIT，直接调用 Windows API 摆放窗口）、electron-updater（MIT，自动更新）。',
+    '隐私：纯本地运行，不做数据统计、不上传任何内容；浏览器档案与登录态都在本机的用户数据目录里。',
+    '商标：各 AI 的名称与图标归各自所有者，本项目只是在同一面板里打开它们的官网，既不代理账号也不转发对话内容。',
+  ].join('<br>')
 
   renderAiRows()
+  void loadCacheStats()
+}
+
+/* ---------------- 面板宽度预设 ---------------- */
+
+/**
+ * 预设 + 滑块共用一个来源：预设只负责把值写进滑块，剩下的流程完全一致，
+ * 免得两套写入路径各自解释一遍"百分比 vs 0~1 的比例"。
+ */
+const RATIO_PRESETS = [20, 30, 40, 50]
+
+/**
+ * 统一宽度 UI。
+ *
+ * ⚠️ 数字必须**来自传入的值**而不是回读配置：
+ * 保存要走 IPC + 可能拖着浏览器实例重启（切换共享登录态时尤其慢），
+ * 回调要等好几秒才回来。要是这里回头读 cfg，点一下预设会先按旧值刷新一遍、
+ * 隔一会儿才跳到新值，看着像"点了没反应"。
+ * 界面先按用户刚点的数落地，磁盘那边的往返结果爱什么时候回来都行。
+ */
+function syncRatioUi(pct) {
+  const value = Number.isFinite(pct) ? pct : Number($('ratio').value)
+  const ratio = $('ratio')
+  if (ratio.dataset && !ratio.dataset.dragging) ratio.value = value
+  $('ratio-val').textContent = `${value}%`
+  // 主屏工作区宽度 × 比例 = 面板实际宽度。给个数比给百分比直观
+  const sw = Number(info?.screenWidth)
+  $('ratio-px').textContent = Number.isFinite(sw) && sw > 0 ? `约 ${Math.round(sw * (value / 100))} px` : '约 – px'
+  for (const b of document.querySelectorAll('#ratio-presets button')) {
+    b.classList.toggle('active', Number(b.dataset.ratio) === value)
+  }
+}
+
+function applyRatioPreset(pct) {
+  const ratio = $('ratio')
+  if (!ratio.dataset) return
+  ratio.value = pct
+  syncRatioUi(pct)
+  void save(false)
+}
+
+/* ---------------- 更新 ---------------- */
+
+function updateLabel(s) {
+  if (!s) return ''
+  switch (s.status) {
+    case 'checking': return '正在检查更新…'
+    case 'available': return `发现新版本 ${s.version || ''}，正在后台下载…`
+    case 'downloading': {
+      const mb = s.total ? `（${(s.transferred / 1048576).toFixed(1)} / ${(s.total / 1048576).toFixed(1)} MB）` : ''
+      return `正在下载更新 ${s.percent || 0}% ${mb}`
+    }
+    case 'downloaded': return `新版本 ${s.version || ''} 已下载完成，点上面的按钮安装并重启`
+    case 'not-available': return `当前已是最新版本（${s.current}）`
+    case 'error': return `检查更新失败：${s.message || '未知错误'}`
+    default: return ''
+  }
+}
+
+function renderUpdate(s) {
+  const el = $('update-status')
+  if (el) el.textContent = updateLabel(s)
+}
+
+function bindUpdate() {
+  const btn = $('btn-update')
+  if (!btn) return
+  btn.addEventListener('click', async () => {
+    btn.disabled = true
+    try {
+      // 已下载好就直接装（会重启），否则手动查一次
+      renderUpdate(await window.aiquad.checkUpdate())
+    }
+    catch (e) {
+      renderUpdate({ status: 'error', message: String(e) })
+    }
+    finally {
+      btn.disabled = false
+    }
+  })
+  window.aiquad.on('update-status', renderUpdate)
+  window.aiquad.getUpdateState().then(renderUpdate).catch(() => {})
+}
+
+/**
+ * 按 id 取当前 cfg 里的 AI 条目。
+ *
+ * 为什么不能直接用 `renderAiRows` 里闭包捕获的那个 `ai`：`save()` 结尾会把 cfg
+ * 整个换成 IPC 回来的新对象（`cfg = res?.config ?? res`），换过之后闭包里的旧对象
+ * 就脱离 cfg 了。典型翻车路径：先拖宽度存一次，再去改 AI 名字 / 分类 / 点隐藏，
+ * 改的是孤儿对象，collect() 收不到，点保存毫无反应。
+ */
+function findAi(id) {
+  return cfg.aiList.find((a) => a.id === id)
 }
 
 function renderAiRows() {
   const tbody = $('ai-rows')
   tbody.innerHTML = ''
   for (const ai of cfg.aiList) {
+    // 隐藏项整体压暗，一眼能看出"它还在，但不在选择器里"
     const tr = document.createElement('tr')
+    if (ai.hidden) tr.className = 'ai-hidden'
 
     const tdName = document.createElement('td')
     const inName = document.createElement('input')
     inName.value = ai.name
     inName.addEventListener('change', () => {
-      ai.name = inName.value
+      const cur = findAi(ai.id)
+      if (cur) cur.name = inName.value
     })
     tdName.appendChild(inName)
 
@@ -224,7 +336,8 @@ function renderAiRows() {
     const inUrl = document.createElement('input')
     inUrl.value = ai.url
     inUrl.addEventListener('change', () => {
-      ai.url = inUrl.value
+      const cur = findAi(ai.id)
+      if (cur) cur.url = inUrl.value
     })
     tdUrl.appendChild(inUrl)
 
@@ -238,7 +351,8 @@ function renderAiRows() {
       cat.appendChild(o)
     }
     cat.addEventListener('change', () => {
-      ai.category = cat.value
+      const cur = findAi(ai.id)
+      if (cur) cur.category = cat.value
     })
     tdCat.appendChild(cat)
 
@@ -252,24 +366,46 @@ function renderAiRows() {
       sel.appendChild(o)
     }
     sel.addEventListener('change', () => {
-      ai.proxyMode = sel.value
-      if (ai.proxyMode === 'custom' && !ai.proxy) {
-        ai.proxy = { mode: 'custom', type: 'http', host: '', port: '', bypassList: '' }
+      const cur = findAi(ai.id)
+      if (!cur) return
+      cur.proxyMode = sel.value
+      if (cur.proxyMode === 'custom' && !cur.proxy) {
+        cur.proxy = { mode: 'custom', type: 'http', host: '', port: '', bypassList: '' }
       }
       renderAiRows()
     })
     tdProxy.appendChild(sel)
 
     const tdOp = document.createElement('td')
+    tdOp.className = 'ops'
+
+    const hide = document.createElement('button')
+    hide.textContent = ai.hidden ? '显示' : '隐藏'
+    hide.title = ai.hidden ? '放回分格底部的选择器' : '只从选择器里摘掉，正在用的格子不受影响'
+    hide.addEventListener('click', async () => {
+      const cur = findAi(ai.id)
+      if (!cur) return
+      cur.hidden = !cur.hidden
+      await save(false)
+      renderAiRows()
+    })
+
     const del = document.createElement('button')
     del.textContent = '删除'
     del.className = 'btn-danger'
     del.addEventListener('click', async () => {
+      const cur = findAi(ai.id)
+      const used = cfg.panes.filter((p) => p.aiId === ai.id).map((p) => p.id)
+      const warn = used.length
+        ? `\n\n它正绑定在 ${used.join(' / ')} 格，删除后这些格子会自动换一个 AI。`
+        : ''
+      if (!confirm(`确定删除「${cur?.name ?? ai.name}」？${warn}`)) return
       cfg.aiList = cfg.aiList.filter((a) => a.id !== ai.id)
       await save(false)
       renderAiRows()
     })
-    tdOp.appendChild(del)
+
+    tdOp.append(hide, del)
 
     tr.append(tdName, tdUrl, tdCat, tdProxy, tdOp)
     tbody.appendChild(tr)
@@ -326,6 +462,7 @@ function collect() {
   for (const f of SC_FIELDS) cfg.shortcuts[f.key] = scGet(f.id)
   cfg.position = getRadio('position') || 'right'
   cfg.windowWidthRatio = Number($('ratio').value || 30) / 100
+  cfg.cacheCleanup = $('cache-mode').value || 'auto'
   // 恒为 true：面板压不住浏览器窗口的话顶栏就会被浏览器的标题栏盖掉
   cfg.alwaysOnTop = true
   cfg.autoStart = $('opt-autostart').checked
@@ -405,31 +542,147 @@ async function init() {
     renderAiRows()
   })
 
-  $('btn-test-proxy').addEventListener('click', async () => {
+  const toggle = $('btn-test-proxy')
+  toggle.addEventListener('click', async (ev) => {
     const el = $('proxy-result')
-    el.textContent = '测试中…'
+    const btn = ev?.currentTarget || null
+    const url = String($('proxy-test-url').value || '').trim() || 'https://www.google.com'
+    if (btn && btn.dataset) btn.disabled = true
+    let watchdog = null
     el.className = 'result'
-    const p = collect().proxy
-    const url = cfg.aiList[0]?.url || 'https://www.google.com'
-    const r = await api.testProxy(p, url)
-    el.textContent = r.ok ? `通过（${r.ms}ms）` : `失败：${r.error || '超时'}`
-    el.className = r.ok ? 'result ok' : 'result err'
+    el.textContent = `测试中…（${url.replace(/^https?:\/\//, '')}，最多 15 秒）`
+    try {
+      const p = collect().proxy
+      /**
+       * 主进程那边有 10 秒硬超时。
+       * 这里再兜一道 15 秒：万一 IPC 本身出问题（渲染进程卡死、主进程异常重启），
+       * 界面也不会永远停在"测试中…"——之前就是这么卡的。
+       */
+      const r = await Promise.race([
+        api.testProxy(p, url),
+        new Promise((_, rej) => {
+          watchdog = setTimeout(() => rej(new Error('等待超时（15 秒）')), 15000)
+        }),
+      ])
+      const extra = [r.via, r.detail].filter(Boolean).join(' · ')
+      el.textContent = r.ok
+        ? `通过（${r.ms}ms${extra ? ` · ${extra}` : ''}）`
+        : `失败：${r.error || '未知错误'}${extra ? ` · ${extra}` : ''}`
+      el.className = r.ok ? 'result ok' : 'result err'
+    }
+    catch (e) {
+      // 走到这里说明连结果都没拿回来，一定要说出来，不能留一个永恒的"测试中…"
+      el.textContent = `测试出错：${String(e?.message || e)}`
+      el.className = 'result err'
+    }
+    finally {
+      if (watchdog) clearTimeout(watchdog)
+      if (btn && btn.dataset) btn.disabled = false
+    }
   })
 
   $('btn-open-profiles').addEventListener('click', () => api.openPath(info.profiles))
+
+  // 关于页的外链一律走系统浏览器，别在设置窗口里开自己也加载不了的页面
+  for (const a of document.querySelectorAll('[data-open]')) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      api.openExternal(a.dataset.open)
+    })
+  }
+
+  bindCache()
+  bindRatioPresets()
+
+  bindUpdate()
 
   // 位置 / 宽度比例改动后立即预览效果
   for (const r of document.querySelectorAll('input[name="position"]')) {
     r.addEventListener('change', () => save(false))
   }
-  // 滑块：拖动时只更新数字，松手（change）才真正保存，避免拖动过程中反复重启实例
+}
+
+/* ---------------- 面板宽度预设 ---------------- */
+
+function bindRatioPresets() {
+  for (const b of document.querySelectorAll('#ratio-presets button')) {
+    b.addEventListener('click', () => applyRatioPreset(Number(b.dataset.ratio || RATIO_PRESETS[1])))
+  }
+  // 滑块：拖动中只更新数字（光标还没放开，别去重启实例），松手才落定
   const ratio = document.getElementById('ratio')
   if (ratio) {
     ratio.addEventListener('input', () => {
-      $('ratio-val').textContent = `${ratio.value}%`
+      ratio.dataset.dragging = '1'
+      syncRatioUi(Number(ratio.value))
     })
-    ratio.addEventListener('change', () => save(false))
+    const settle = () => {
+      if (!ratio.dataset.dragging) return
+      delete ratio.dataset.dragging
+      void save(false)
+    }
+    ratio.addEventListener('change', settle)
+    ratio.addEventListener('pointerup', settle)
+    ratio.addEventListener('pointercancel', settle)
+    ratio.addEventListener('blur', settle)
   }
+}
+
+/* ---------------- 数据与缓存 ---------------- */
+
+function fmtBytes(bytes) {
+  const n = Number(bytes)
+  if (!Number.isFinite(n) || n < 0) return '-'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+async function loadCacheStats() {
+  try {
+    const s = await api.getCacheStats()
+    $('cache-stat').textContent = `${s.profileCount} 份档案 · 共 ${fmtBytes(s.totalBytes)} · 可清理缓存 ${fmtBytes(s.cacheBytes)}`
+    const top = (s.profiles || []).filter((p) => p.cacheBytes > 0).slice(0, 4)
+    $('cache-detail').innerHTML = top.length
+      ? top.map((p) => `${p.name}：缓存 ${fmtBytes(p.cacheBytes)}，档案合计 ${fmtBytes(p.totalBytes)}`).join('<br>')
+      : '暂时没有可清理的缓存'
+  }
+  catch (e) {
+    $('cache-stat').textContent = '统计失败'
+    $('cache-detail').textContent = String(e?.message || e)
+  }
+}
+
+function bindCache() {
+  $('cache-mode').addEventListener('change', () => save(false))
+
+  $('btn-clear-cache').addEventListener('click', async (ev) => {
+    const btn = ev?.currentTarget || null
+    const ok = confirm(
+      '清理浏览器缓存？\n\n'
+      + '只删 Cache / Code Cache / 着色器缓存这些浏览器能自动重生成的目录。\n'
+      + 'Cookies 和 Local Storage 保留，已经登录的 AI 站不会被踢下线。',
+    )
+    if (!ok) return
+    const el = $('cache-result')
+    el.className = 'result'
+    el.textContent = '清理中…'
+    if (btn && btn.dataset) btn.disabled = true
+    try {
+      const r = await api.clearCache()
+      const skipped = r.skipped?.length ? `，${r.skipped.length} 项正被浏览器占用（下次自动补上）` : ''
+      el.textContent = `已释放 ${fmtBytes(r.removedBytes)}（${r.removedItems} 项）${skipped}`
+      el.className = 'result ok'
+      await loadCacheStats()
+    }
+    catch (e) {
+      el.textContent = `清理失败：${String(e?.message || e)}`
+      el.className = 'result err'
+    }
+    finally {
+      if (btn && btn.dataset) btn.disabled = false
+    }
+  })
 }
 
 init()

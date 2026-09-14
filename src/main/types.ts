@@ -25,6 +25,11 @@ export interface AiService {
   proxyMode: 'global' | 'direct' | 'custom'
   proxy?: ProxyConfig
   builtin?: boolean
+  /**
+   * 隐藏：只把它从分格底部的 AI 选择器里摘掉，配置仍然保留。
+   * 已经开着的格子不受影响（隐藏不等于关掉），方便临时收起那些用不上的预设 AI。
+   */
+  hidden?: boolean
 }
 
 /** 1 / 2 / 4 三种分格；竖长面板按行分割，4 为 2×2 */
@@ -80,7 +85,23 @@ export interface AppConfig {
   autoStart: boolean
   browserPreference: 'chrome' | 'edge' | 'auto'
   customBrowserPath: string
+  /**
+   * 浏览器档案缓存的处理方式：
+   * - off：不管，只手动清
+   * - auto：启动时空闲期扫描一次，缓存总量超过 AUTO_CLEAN_THRESHOLD_BYTES 就自动清
+   * - exit：每次退出时清理一遍
+   */
+  cacheCleanup: CacheCleanupMode
 }
+
+/**
+ * 清理只针对浏览器**缓存**（Cache / Code Cache / 着色器缓存等），
+ * Cookies、Local Storage、IndexedDB 一律不动——那些是登录态，删了就得重新扫码。
+ */
+export type CacheCleanupMode = 'off' | 'auto' | 'exit'
+
+/** auto 模式的清理阈值，默认 500MB */
+export const AUTO_CLEAN_THRESHOLD_BYTES = 500 * 1024 * 1024
 
 export interface PaneRect {
   paneId: string
