@@ -1,0 +1,21 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+dist-electron/
+build/
+out/
+release/
+
+# 本地运行时数据（浏览器档案 / 探测产物，含登录态，不入库）
+.tmp/
+
+# 截图：只分发 docs/screenshot-*.png 这类展示图
+docs/*.png
+!docs/screenshot-*.png
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db

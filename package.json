@@ -1,0 +1,62 @@
+{
+  "name": "aiquad",
+  "version": "0.4.2",
+  "description": "AIQuad - 用真实 Chrome/Edge 驱动的多 AI 并排对话面板，1/2/4 分格同开、登录态跨格共享",
+  "main": "dist/main/index.js",
+  "author": "WW-Ares and AI collaborators",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WW-Ares/AIQuad.git"
+  },
+  "homepage": "https://github.com/WW-Ares/AIQuad#readme",
+  "bugs": {
+    "url": "https://github.com/WW-Ares/AIQuad/issues"
+  },
+  "keywords": [
+    "electron",
+    "chrome",
+    "multi-ai",
+    "split-view",
+    "windows",
+    "win32"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && electron .",
+    "dev": "electron .",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "dist": "npm run clean && npm run build && electron-builder"
+  },
+  "dependencies": {
+    "koffi": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "typescript": "latest"
+  },
+  "build": {
+    "appId": "com.aiquad.app",
+    "productName": "AIQuad",
+    "directories": {
+      "output": "build"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "src/renderer/icon.ico",
+      "artifactName": "AIQuad-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "files": [
+      "dist/**/*",
+      "src/renderer/**/*",
+      "package.json"
+    ]
+  }
+}

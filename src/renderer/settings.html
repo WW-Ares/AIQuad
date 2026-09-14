@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>设置 - AI 助手</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="settings">
+    <h2>面板与呼出</h2>
+    <div class="card">
+      <div class="row">
+        <label>呼出快捷键</label>
+        <input id="sc-toggle" class="sc-input" style="width:180px" readonly title="点击后按下组合键" />
+        <span class="muted">点击后按下组合键自动抓取；默认 <kbd>Alt+Space</kbd>。<kbd>Esc</kbd> 取消 · <kbd>Backspace</kbd> 清除（= 禁用该键）</span>
+      </div>
+      <div class="row">
+        <label>停靠位置</label>
+        <div class="radios">
+          <label class="radio"><input type="radio" name="position" value="left" /> 屏幕左侧</label>
+          <label class="radio"><input type="radio" name="position" value="right" /> 屏幕右侧</label>
+        </div>
+      </div>
+      <div class="row">
+        <label>面板宽度</label>
+        <input type="range" id="ratio" min="20" max="60" step="1" value="30" style="width:220px" />
+        <span class="muted"><b id="ratio-val">30%</b> · 占屏幕宽度比例，高度为屏幕全高</span>
+      </div>
+      <div class="row">
+        <label>分格切换</label>
+        <input id="sc-1" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
+        <input id="sc-2" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
+        <input id="sc-4" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
+        <span class="muted">依次对应 1 / 2 / 4 格（竖长面板不适合三段，故不提供 3 格）</span>
+      </div>
+      <div class="sc-status-row"><span id="sc-status" class="sc-status"></span></div>
+      <div class="row">
+        <label>窗口行为</label>
+        <div class="radios">
+          <label class="radio"><input type="checkbox" id="opt-ontop" /> 始终置顶</label>
+          <label class="radio"><input type="checkbox" id="opt-autostart" /> 开机自动启动</label>
+          <label class="radio"><input type="checkbox" id="opt-hibernate" /> 后台分格休眠以节省内存</label>
+        </div>
+      </div>
+    </div>
+
+    <h2>代理设置</h2>
+    <div class="card">
+      <div class="row">
+        <label>全局代理</label>
+        <select id="proxy-mode">
+          <option value="system">跟随系统代理</option>
+          <option value="custom">自定义代理</option>
+          <option value="none">不使用代理（直连）</option>
+        </select>
+        <select id="proxy-type">
+          <option value="http">HTTP</option>
+          <option value="https">HTTPS</option>
+          <option value="socks5">SOCKS5</option>
+        </select>
+        <input id="proxy-host" placeholder="127.0.0.1" style="width:140px" />
+        <input id="proxy-port" placeholder="端口" style="width:90px" />
+      </div>
+      <div class="row">
+        <label>绕过列表</label>
+        <input id="proxy-bypass" class="grow" placeholder="多个用分号分隔，例如 intranet.com;*.local" />
+      </div>
+      <div class="row">
+        <label>系统代理</label>
+        <span class="muted" id="system-proxy">检测中…</span>
+        <button id="btn-test-proxy">测试连通性</button>
+        <span class="result" id="proxy-result"></span>
+      </div>
+      <div class="muted">可为每个 AI 单独指定代理策略（见下方列表）：海外 AI 走代理、国内 AI 直连，既提速又省额度。
+        修改代理后，对应浏览器实例会自动重启生效。<br>
+        <b>注意</b>：开启「登录态共享」时所有分格属于同一个浏览器进程，代理是进程级设置，
+        此时只有<b>全局代理</b>生效；需要按 AI 分别走代理，请在「浏览器内核」里关闭登录态共享。</div>
+    </div>
+
+    <h2>AI 服务</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:130px">名称</th>
+            <th>网址</th>
+            <th style="width:96px">分组</th>
+            <th style="width:120px">代理策略</th>
+            <th style="width:64px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="ai-rows"></tbody>
+      </table>
+      <div class="row" style="margin-top:10px">
+        <input id="new-ai-name" placeholder="名称" style="width:130px" />
+        <input id="new-ai-url" class="grow" placeholder="https://..." />
+        <select id="new-ai-category">
+          <option value="us">国外 AI</option>
+          <option value="cn">国内 AI</option>
+        </select>
+        <select id="new-ai-proxy">
+          <option value="global">跟随全局</option>
+          <option value="direct">直连</option>
+          <option value="custom">单独代理</option>
+        </select>
+        <button id="btn-add-ai">添加</button>
+      </div>
+      <div class="muted">分组决定它在分格底部选择器里的归类（国外 / 国内）。</div>
+    </div>
+
+    <h2>浏览器内核</h2>
+    <div class="card">
+      <div class="row">
+        <label>使用浏览器</label>
+        <select id="browser-pref">
+          <option value="auto">自动（优先 Chrome）</option>
+          <option value="chrome">Google Chrome</option>
+          <option value="edge">Microsoft Edge</option>
+        </select>
+        <span class="muted" id="browser-info"></span>
+      </div>
+      <div class="row">
+        <label>窗口形态</label>
+        <select id="window-mode">
+          <option value="standard">标准浏览器窗口（推荐，登录兼容性最好）</option>
+          <option value="app">应用窗口（无工具栏，但可能被 Google 判定为内嵌浏览器）</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>登录态共享</label>
+        <div class="radios">
+          <label class="radio"><input type="checkbox" id="opt-shared" /> 所有分格共用同一份浏览器档案（推荐）</label>
+        </div>
+      </div>
+      <div class="row">
+        <label>自定义路径</label>
+        <input id="browser-path" class="grow" placeholder="留空则自动探测" />
+        <button id="btn-open-profiles">打开用户档案目录</button>
+      </div>
+      <div class="muted">
+        <b>标准浏览器窗口</b>下，浏览器会以普通窗口启动（<code>display-mode: browser</code>，与手动打开浏览器完全一致），
+        其标签栏与地址栏随后被自动裁剪到分格之外，所以外观依然是一张干净的网页。<br>
+        <b>应用窗口</b>使用 <code>--app</code> 模式，虽然天生没有工具栏，但页面能通过
+        <code>matchMedia('(display-mode: standalone)')</code> 识别出自己运行在应用窗口里，
+        Google 等站点会据此拒绝登录。<br>
+        <b>登录态共享</b>开启时，所有分格属于同一个浏览器进程、共用一份档案：
+        在任意一格登录后，其它格立即继承，不用重复登录。
+        代价是代理只能走全局设置，且做不到"一格一个账号"；需要按 AI 分别走代理或分账号登录时再关掉它。
+        浏览器升级后如果路径变化，应用会重新探测，无需手动指定。
+      </div>
+    </div>
+
+    <h2>关于</h2>
+    <div class="card">
+      <div class="muted" id="about"></div>
+    </div>
+
+    <div class="row" style="margin-bottom:30px">
+      <button id="btn-save" style="padding:6px 16px">保存并应用</button>
+      <span class="result" id="save-result"></span>
+    </div>
+  </div>
+  <script src="shortcut-capture.js"></script>
+  <script src="settings.js"></script>
+</body>
+</html>

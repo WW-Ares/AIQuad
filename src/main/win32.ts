@@ -1,0 +1,751 @@
+/**
+ * Win32 窗口操作封装（通过 koffi 直接调用 user32 / ntdll，无需编译原生模块）
+ * 用途：把真实浏览器窗口作为子窗口嵌入到 Electron 主窗口的分格里。
+ */
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const koffi = require('koffi')
+
+const user32 = koffi.load('user32.dll')
+const gdi32 = koffi.load('gdi32.dll')
+const kernel32 = koffi.load('kernel32.dll')
+const ntdll = koffi.load('ntdll.dll')
+
+const HANDLE = 'uint64'
+const HWND = 'uint64'
+const BOOL = 'int'
+const INT = 'int'
+const LONG = 'int32'
+const UINT = 'uint32'
+const INT64 = 'int64'
+
+const SetParent = user32.func('SetParent', HANDLE, [HWND, HWND])
+const SetWindowLongPtrW = user32.func('SetWindowLongPtrW', INT64, [HWND, INT, INT64])
+const GetWindowLongPtrW = user32.func('GetWindowLongPtrW', INT64, [HWND, INT])
+const SetWindowPos = user32.func('SetWindowPos', BOOL, [HWND, HWND, INT, INT, INT, INT, UINT])
+const MoveWindow = user32.func('MoveWindow', BOOL, [HWND, INT, INT, INT, INT, BOOL])
+// 注意：koffi 的结构体对象出参不会写回，这里用 Buffer（uint8 *）接收 RECT
+const GetWindowRect = user32.func('GetWindowRect', BOOL, [HWND, 'uint8 *'])
+const GetClientRect = user32.func('GetClientRect', BOOL, [HWND, 'uint8 *'])
+const ClientToScreen = user32.func('ClientToScreen', BOOL, [HWND, 'uint8 *'])
+const IsWindow = user32.func('IsWindow', BOOL, [HWND])
+const IsWindowVisible = user32.func('IsWindowVisible', BOOL, [HWND])
+const ShowWindow = user32.func('ShowWindow', BOOL, [HWND, INT])
+const GetWindowThreadProcessId = user32.func('GetWindowThreadProcessId', UINT, [HWND, 'uint32 *'])
+const SetForegroundWindow = user32.func('SetForegroundWindow', BOOL, [HWND])
+const SetFocus = user32.func('SetFocus', HANDLE, [HWND])
+const EnumWindowsProc = koffi.proto('bool EnumWindowsProc(uint64 hwnd, uint64 lparam)')
+const EnumWindowsProcPtr = koffi.pointer(EnumWindowsProc)
+const EnumWindows = user32.func('EnumWindows', BOOL, [EnumWindowsProcPtr, 'uint64'])
+const EnumChildWindows = user32.func('EnumChildWindows', BOOL, [HWND, EnumWindowsProcPtr, 'uint64'])
+const GetClassNameW = user32.func('GetClassNameW', INT, [HWND, 'char16 *', INT])
+const GetWindowTextW = user32.func('GetWindowTextW', INT, [HWND, 'char16 *', INT])
+const GetParent = user32.func('GetParent', HANDLE, [HWND])
+const PostMessageW = user32.func('PostMessageW', BOOL, [HWND, UINT, 'uint64', 'int64'])
+
+/** WM_CLOSE：请求窗口正常关闭（浏览器会走完整的退出流程，档案才不会被写脏） */
+export const WM_CLOSE = 0x0010
+
+const OpenProcess = kernel32.func('OpenProcess', HANDLE, [UINT, BOOL, 'uint32'])
+const CloseHandle = kernel32.func('CloseHandle', BOOL, [HANDLE])
+
+// 窗口区域裁剪：用来把浏览器自带的标签栏/地址栏从可视区裁掉
+const CreateRectRgn = gdi32.func('CreateRectRgn', HANDLE, [INT, INT, INT, INT])
+const CreateRoundRectRgn = gdi32.func('CreateRoundRectRgn', HANDLE, [INT, INT, INT, INT, INT, INT])
+const CombineRgn = gdi32.func('CombineRgn', INT, [HANDLE, HANDLE, HANDLE, INT])
+const SetWindowRgn = user32.func('SetWindowRgn', BOOL, [HWND, HANDLE, BOOL])
+const GetWindowRgn = user32.func('GetWindowRgn', INT, [HWND, HANDLE])
+const GetRgnBox = gdi32.func('GetRgnBox', INT, [HANDLE, 'uint8 *'])
+const DeleteObject = gdi32.func('DeleteObject', BOOL, [HANDLE])
+
+/** CombineRgn 模式 */
+export const RGN_AND = 1
+export const RGN_OR = 2
+export const RGN_XOR = 3
+export const RGN_DIFF = 4
+export const RGN_COPY = 5
+
+const NtSuspendProcess = ntdll.func('NtSuspendProcess', 'int32', [HANDLE])
+const NtResumeProcess = ntdll.func('NtResumeProcess', 'int32', [HANDLE])
+
+export const GWL_STYLE = -16
+export const GWL_EXSTYLE = -20
+export const GWLP_HWNDPARENT = -8
+
+export const WS_CHILD = 0x40000000
+export const WS_POPUP = 0x80000000
+export const WS_VISIBLE = 0x10000000
+export const WS_CAPTION = 0x00c00000
+export const WS_THICKFRAME = 0x00040000
+export const WS_MINIMIZEBOX = 0x00020000
+export const WS_MAXIMIZEBOX = 0x00010000
+export const WS_SYSMENU = 0x00080000
+export const WS_CLIPSIBLINGS = 0x04000000
+export const WS_CLIPCHILDREN = 0x02000000
+export const WS_EX_APPWINDOW = 0x00040000
+export const WS_EX_TOOLWINDOW = 0x00000080
+
+export const SWP_NOSIZE = 0x0001
+export const SWP_NOMOVE = 0x0002
+export const SWP_NOZORDER = 0x0004
+export const SWP_NOACTIVATE = 0x0010
+export const SWP_FRAMECHANGED = 0x0020
+export const SWP_SHOWWINDOW = 0x0040
+export const SWP_NOSENDCHANGING = 0x0400
+export const SWP_ASYNCWINDOWPOS = 0x4000
+
+export const HWND_TOPMOST = 0xffffffffffffffffn
+export const HWND_NOTOPMOST = 0xfffffffffffffffen
+
+export const SW_HIDE = 0
+export const SW_SHOW = 5
+export const SW_SHOWNORMAL = 1
+export const SW_MAXIMIZE = 3
+
+const PROCESS_ALL_ACCESS = 0x001f0fff
+
+export function isWindow(hwnd: number | bigint): boolean {
+  try {
+    return !!IsWindow(hwnd)
+  }
+  catch {
+    return false
+  }
+}
+
+export function isWindowVisible(hwnd: number | bigint): boolean {
+  try {
+    return !!IsWindowVisible(hwnd)
+  }
+  catch {
+    return false
+  }
+}
+
+export function setParent(child: number | bigint, parent: number | bigint): number {
+  return Number(SetParent(child, parent))
+}
+
+export function getParent(hwnd: number | bigint): number {
+  return Number(GetParent(hwnd))
+}
+
+/**
+ * 把浏览器窗口标记成工具窗口：不进任务栏、不出现在 Alt+Tab。
+ * 注意：WS_EX_TOOLWINDOW 在窗口可见时改动不会立即生效，需先隐藏再设置。
+ */
+export function makeToolWindow(hwnd: number | bigint) {
+  try {
+    let ex = Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    ex = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, BigInt(ex))
+  }
+  catch (e) {
+    console.warn('[win32] makeToolWindow failed', e)
+  }
+}
+
+/** 把浏览器窗口改成子窗口样式（仅用于嵌入验证脚本） */
+export function makeChildWindow(hwnd: number | bigint) {
+  try {
+    let style = Number(GetWindowLongPtrW(hwnd, GWL_STYLE))
+    style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
+    style |= WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN
+    SetWindowLongPtrW(hwnd, GWL_STYLE, BigInt(style))
+
+    let ex = Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    ex &= ~WS_EX_APPWINDOW
+    ex |= WS_EX_TOOLWINDOW
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, BigInt(ex))
+  }
+  catch (e) {
+    console.warn('[win32] makeChildWindow failed', e)
+  }
+}
+
+export function getWindowLong(hwnd: number | bigint, index: number): number {
+  try {
+    return Number(GetWindowLongPtrW(hwnd, index))
+  }
+  catch {
+    return 0
+  }
+}
+
+/** 设置窗口的属主（对顶级窗口即 owner）。属主窗口关闭时属主关系自动解除。 */
+export function setOwner(hwnd: number | bigint, owner: number | bigint) {
+  try {
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, BigInt(owner))
+  }
+  catch (e) {
+    console.warn('[win32] setOwner failed', e)
+  }
+}
+
+/** 置顶 / 取消置顶 */
+export function setTopMost(hwnd: number | bigint, on: boolean) {
+  try {
+    SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+  }
+  catch {}
+}
+
+/** 把窗口提到同层级窗口的最前面（不激活） */
+export function raiseWindow(hwnd: number | bigint, topMost: boolean) {
+  try {
+    SetWindowPos(hwnd, topMost ? HWND_TOPMOST : 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+  }
+  catch {}
+}
+
+/**
+ * 移动并调整窗口尺寸，但**不发送 WM_WINDOWPOSCHANGING**。
+ *
+ * 为什么必须跳过 WM_WINDOWPOSCHANGING：Chrome 标准窗口在处理这条消息时会把宽度
+ * 钳制到 516px 以上（工具栏需要），导致窄分格下浏览器窗口溢出、遮挡相邻分格与面板按钮。
+ * 跳过它即可让窗口缩到 270px 级别，同时 Chrome 仍会处理 WM_SIZE 正确重排页面。
+ *
+ * 为什么默认**同步**（不带 SWP_ASYNCWINDOWPOS）：
+ *   实测跨进程 SetWindowPos 若同时带上 ASYNC + NOSENDCHANGING，
+ *   请求会被投递到 Chrome UI 线程后**被丢弃**——窗口几何完全不变，
+ *   而随后的 SetWindowRegion 却按新几何生效，于是出现
+ *   "窗口还是 1000×760、页面 viewport 却已变成 536×1008" 的错位。
+ *   改成同步调用后几何立即生效（代价是几毫秒阻塞），校准闭环才收敛。
+ */
+export function moveWindowNoClamp(hwnd: number | bigint, x: number, y: number, w: number, h: number, async = false) {
+  try {
+    const flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | (async ? SWP_ASYNCWINDOWPOS : 0)
+    const ok = SetWindowPos(
+      hwnd,
+      0,
+      Math.round(x),
+      Math.round(y),
+      Math.max(1, Math.round(w)),
+      Math.max(1, Math.round(h)),
+      flags,
+    )
+    return !!ok
+  }
+  catch (e) {
+    console.warn('[win32] moveWindowNoClamp failed', e)
+    return false
+  }
+}
+
+export function moveWindow(hwnd: number | bigint, x: number, y: number, w: number, h: number) {
+  try {
+    // hWndInsertAfter=0(HWND_TOP)：保证子窗口绘制在宿主内容之上
+    SetWindowPos(
+      hwnd,
+      0,
+      Math.round(x),
+      Math.round(y),
+      Math.max(1, Math.round(w)),
+      Math.max(1, Math.round(h)),
+      SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+    )
+  }
+  catch (e) {
+    console.warn('[win32] moveWindow failed', e)
+  }
+}
+
+export function showWindow(hwnd: number | bigint, cmd = SW_SHOW) {
+  try {
+    ShowWindow(hwnd, cmd)
+  }
+  catch {}
+}
+
+/**
+ * 把窗口裁剪成一条圆角矩形（窗口自身坐标系，物理像素）。
+ *
+ * 用途：标准浏览器窗口自带标签栏 + 地址栏（实测约 150px 高）。
+ * 嵌入分格后若只是把窗口整体上移，这块浏览器 UI 会盖住面板顶栏，
+ * 导致顶栏按钮看不见也点不到；用窗口区域把它彻底裁掉，
+ * 被裁掉的区域既不绘制也不接收鼠标，面板 UI 恢复正常。
+ *
+ * 传 null 表示恢复完整窗口。
+ */
+export function setWindowRegion(hwnd: number | bigint, rect: { x: number; y: number; width: number; height: number } | null, radius = 0) {
+  setWindowRegionRects(hwnd, rect ? [rect] : [], radius)
+}
+
+/**
+ * 更通用的版本：可视区域 = rects[0] 减去 rects[1..n]。
+ *
+ * 用途：分格底部展开 AI 切换器时，不必把整个浏览器窗口藏起来，
+ * 只需要把下拉菜单那一小块从可视区域里**挖掉**，
+ * 页面其余部分依然可见可点，观感接近"下拉浮在网页之上"。
+ * （原生窗口无法与 Electron 内容做层叠，这是最接近原生的做法。）
+ */
+export function setWindowRegionRects(hwnd: number | bigint, rects: Array<{ x: number; y: number; width: number; height: number }>, radius = 0) {
+  try {
+    const list = (rects || []).filter((r) => r && r.width >= 1 && r.height >= 1)
+    if (!list.length) {
+      SetWindowRgn(hwnd, 0, 1)
+      return
+    }
+    const rad = Math.max(0, Math.round(radius))
+    const make = (r: { x: number; y: number; width: number; height: number }) => {
+      const x = Math.round(r.x)
+      const y = Math.round(r.y)
+      const rr = Math.round(r.x + r.width)
+      const b = Math.round(r.y + r.height)
+      return rad > 0 ? CreateRoundRectRgn(x, y, rr + 1, b + 1, rad * 2, rad * 2) : CreateRectRgn(x, y, rr, b)
+    }
+    const dest = make(list[0])
+    if (!dest) return
+    for (let i = 1; i < list.length; i++) {
+      const hole = make(list[i])
+      if (!hole) continue
+      // 原地求差集：CombineRgn 允许 hrgnDst 与 hrgnSrc1 相同
+      CombineRgn(dest, dest, hole, RGN_DIFF)
+      DeleteObject(hole)
+    }
+    // SetWindowRgn 成功后该 region 归系统所有，不能再 DeleteObject
+    const ok = SetWindowRgn(hwnd, dest, 1)
+    if (!ok) {
+      try {
+        DeleteObject(dest)
+      }
+      catch {}
+    }
+  }
+  catch (e) {
+    console.warn('[win32] setWindowRegionRects failed', e)
+  }
+}
+
+/**
+ * 判断窗口自身坐标系中的某个点是否落在窗口可视区域内。
+ *
+ * 因为"挖洞"后的区域是个复合区域，GetRgnBox 只能拿到外接矩形、看不出洞，
+ * 所以自检时必须用 PtInRegion 逐点判断。
+ */
+export function pointInWindowRegion(hwnd: number | bigint, x: number, y: number): boolean | null {
+  try {
+    const rgn = CreateRectRgn(0, 0, 0, 0)
+    if (!rgn) return null
+    const kind = GetWindowRgn(hwnd, rgn)
+    if (!kind) {
+      DeleteObject(rgn)
+      return true // 没有设置区域 = 整个窗口都可见
+    }
+    const PtInRegion = gdi32.func('PtInRegion', BOOL, [HANDLE, INT, INT])
+    const hit = !!PtInRegion(rgn, Math.round(x), Math.round(y))
+    DeleteObject(rgn)
+    return hit
+  }
+  catch {
+    return null
+  }
+}
+
+/** 读取当前窗口区域的外接矩形（用于自检） */
+export function windowRegionBox(hwnd: number | bigint) {  try {
+    const rgn = CreateRectRgn(0, 0, 0, 0)
+    if (!rgn) return null
+    const kind = GetWindowRgn(hwnd, rgn)
+    if (!kind) {
+      DeleteObject(rgn)
+      return null
+    }
+    const buf = Buffer.alloc(16)
+    // GetRgnBox 与 GetWindowRect 一样属于结构体出参，用 Buffer 接收
+    GetRgnBox(rgn, buf)
+    DeleteObject(rgn)
+    return {
+      left: buf.readInt32LE(0),
+      top: buf.readInt32LE(4),
+      right: buf.readInt32LE(8),
+      bottom: buf.readInt32LE(12),
+    }
+  }
+  catch {
+    return null
+  }
+}
+
+export function focusWindow(hwnd: number | bigint) {
+  try {
+    SetFocus(hwnd)
+    SetForegroundWindow(hwnd)
+  }
+  catch {}
+}
+
+export function getWindowRect(hwnd: number | bigint) {
+  try {
+    const buf = Buffer.alloc(16)
+    const ok = GetWindowRect(hwnd, buf)
+    if (!ok) return null
+    return {
+      left: buf.readInt32LE(0),
+      top: buf.readInt32LE(4),
+      right: buf.readInt32LE(8),
+      bottom: buf.readInt32LE(12),
+    }
+  }
+  catch {
+    return null
+  }
+}
+
+export function getClassName(hwnd: number | bigint): string {
+  try {
+    const buf = Buffer.alloc(512)
+    const n = GetClassNameW(hwnd, buf, 256)
+    if (!n) return ''
+    return buf.toString('utf16le', 0, n * 2)
+  }
+  catch {
+    return ''
+  }
+}
+
+export function windowSize(hwnd: number | bigint): { width: number; height: number } {
+  const r = getWindowRect(hwnd)
+  if (!r) return { width: 0, height: 0 }
+  return { width: r.right - r.left, height: r.bottom - r.top }
+}
+
+/**
+ * 测量窗口边框内衬：窗口矩形与客户区之间的差值。
+ * 标准浏览器窗口（带标题栏/边框）在嵌入分格时，需要用它把**客户区**对齐到分格矩形，
+ * 否则分格边缘会露出浏览器边框。
+ */
+export function windowFrameInsets(hwnd: number | bigint): {
+  left: number
+  top: number
+  right: number
+  bottom: number
+  frameWidth: number
+  frameHeight: number
+  clientWidth: number
+  clientHeight: number
+} | null {
+  try {
+    const wr = Buffer.alloc(16)
+    if (!GetWindowRect(hwnd, wr)) return null
+    const cr = Buffer.alloc(16)
+    if (!GetClientRect(hwnd, cr)) return null
+    const pt = Buffer.alloc(8)
+    pt.writeInt32LE(0, 0)
+    pt.writeInt32LE(0, 4)
+    if (!ClientToScreen(hwnd, pt)) return null
+
+    const wx = wr.readInt32LE(0)
+    const wy = wr.readInt32LE(4)
+    const ww = wr.readInt32LE(8) - wx
+    const wh = wr.readInt32LE(12) - wy
+    const cx = pt.readInt32LE(0)
+    const cy = pt.readInt32LE(4)
+    const cw = cr.readInt32LE(8) - cr.readInt32LE(0)
+    const ch = cr.readInt32LE(12) - cr.readInt32LE(4)
+
+    return {
+      left: cx - wx,
+      top: cy - wy,
+      right: wx + ww - (cx + cw),
+      bottom: wy + wh - (cy + ch),
+      frameWidth: ww,
+      frameHeight: wh,
+      clientWidth: cw,
+      clientHeight: ch,
+    }
+  }
+  catch {
+    return null
+  }
+}
+
+/** 按窗口类名查找顶层窗口（后创建的优先，返回第一个匹配） */
+export function findWindowByClass(cls: string): number {
+  let hit = 0
+  let cb: any = null
+  try {
+    const koffiLocal = koffi
+    cb = koffiLocal.register((hwnd: any) => {
+      if (hit) return false
+      if (getClassName(hwnd) === cls || getClassName(hwnd).startsWith(cls)) hit = Number(hwnd)
+      return !hit
+    }, EnumWindowsProcPtr)
+    EnumWindows(cb, 0n)
+  }
+  catch (e) {
+    console.warn('[win32] findWindowByClass failed', e)
+  }
+  finally {
+    if (cb) {
+      try {
+        koffi.unregister(cb)
+      }
+      catch {}
+    }
+  }
+  return hit
+}
+
+/**
+ * 查找浏览器主窗口。
+ *
+ * 注意：Chrome / Edge 进程里存在多个 `Chrome_WidgetWin_*` 窗口，
+ * 其中 `Chrome_WidgetWin_0` 是尺寸很大的**隐藏辅助窗口**，
+ * 只有 `Chrome_WidgetWin_1` 才是真正显示网页的主窗口。
+ * 早期按"面积最大"挑选会误选辅助窗口，导致后续 MoveWindow 全部作用在不可见窗口上。
+ */
+export function findBrowserWindowByPid(pid: number): number | null {
+  const hwnds = findWindowsByPid(pid)
+  const sized = hwnds
+    .map((h) => ({ h, cls: getClassName(h), size: windowSize(h), visible: isWindowVisible(h) }))
+    .filter((c) => c.size.width > 200 && c.size.height > 150)
+
+  // 首选：真正的主窗口类名（Chrome_WidgetWin_1）
+  const main = sized
+    .filter((c) => c.cls === 'Chrome_WidgetWin_1' && c.visible)
+    .sort((a, b) => b.size.width * b.size.height - a.size.width * a.size.height)
+  if (main.length) return main[0].h
+
+  // 次选：其它可见的顶层浏览器窗口
+  const others = sized
+    .filter((c) => c.cls.startsWith('Chrome_WidgetWin') && c.visible)
+    .sort((a, b) => b.size.width * b.size.height - a.size.width * a.size.height)
+  if (others.length) return others[0].h
+
+  // 兜底：任何可见窗口
+  const anyVisible = sized.filter((c) => c.visible).sort((a, b) => b.size.width * b.size.height - a.size.width * a.size.height)
+  return anyVisible[0]?.h ?? null
+}
+
+/** 枚举某进程的所有顶层窗口 */
+export function findWindowsByPid(pid: number): number[] {
+  const found: number[] = []
+  let cb: any = null
+  try {
+    cb = koffi.register((hwnd: any) => {
+      try {
+        const out = new Uint32Array(1)
+        GetWindowThreadProcessId(hwnd, out)
+        if (Number(out[0]) === pid) found.push(Number(hwnd))
+      }
+      catch {}
+      return true
+    }, EnumWindowsProcPtr)
+    EnumWindows(cb, 0n)
+  }
+  catch (e) {
+    console.warn('[win32] EnumWindows failed', e)
+  }
+  finally {
+    if (cb) {
+      try {
+        koffi.unregister(cb)
+      }
+      catch {}
+    }
+  }
+  return found
+}
+
+/** 进程休眠 / 唤醒（Windows 没有 SIGSTOP，用 NtSuspendProcess） */
+export function suspendProcess(pid: number): boolean {
+  try {
+    const h = Number(OpenProcess(PROCESS_ALL_ACCESS, 0, pid))
+    if (!h) return false
+    const r = NtSuspendProcess(h)
+    CloseHandle(h)
+    return r >= 0
+  }
+  catch {
+    return false
+  }
+}
+
+export function resumeProcess(pid: number): boolean {
+  try {
+    const h = Number(OpenProcess(PROCESS_ALL_ACCESS, 0, pid))
+    if (!h) return false
+    const r = NtResumeProcess(h)
+    CloseHandle(h)
+    return r >= 0
+  }
+  catch {
+    return false
+  }
+}
+
+export function getWindowText(hwnd: number | bigint): string {
+  try {
+    const buf = Buffer.alloc(2048)
+    const n = GetWindowTextW(hwnd, buf, 1024)
+    if (!n) return ''
+    return buf.toString('utf16le', 0, n * 2)
+  }
+  catch {
+    return ''
+  }
+}
+
+export function getWindowPid(hwnd: number | bigint): number {
+  try {
+    const out = new Uint32Array(1)
+    GetWindowThreadProcessId(hwnd, out)
+    return Number(out[0])
+  }
+  catch {
+    return 0
+  }
+}
+
+/** 请求窗口正常关闭（不是强杀）。浏览器接到后会正常退出并落盘档案。 */
+export function postClose(hwnd: number | bigint) {
+  try {
+    PostMessageW(hwnd, WM_CLOSE, 0n, 0n)
+  }
+  catch {}
+}
+
+/**
+ * 在窗口的所有后代里按类名找子窗口，返回**可见且面积最大**的那个。
+ *
+ * 用途：Chromium 把网页内容渲染在一个独立的子窗口 `Chrome_RenderWidgetHostHWND` 里，
+ * 它的矩形（相对主窗口）= 网页 viewport，于是不需要 CDP 就能量出
+ * "浏览器自身 UI（标题栏 + 标签栏 + 地址栏）占了多少高度"。
+ * 一个窗口里每个标签页都有一个这样的子窗口，但只有当前标签页那个是可见的。
+ */
+export function findChildByClass(parent: number | bigint, cls: string): number {
+  let best = 0
+  let bestArea = 0
+  let cb: any = null
+  try {
+    cb = koffi.register((hwnd: any) => {
+      const h = Number(hwnd)
+      if (getClassName(h) !== cls) return true
+      if (!isWindowVisible(h)) return true
+      const r = getWindowRect(h)
+      if (!r) return true
+      const area = (r.right - r.left) * (r.bottom - r.top)
+      if (area > bestArea) {
+        bestArea = area
+        best = h
+      }
+      return true
+    }, EnumWindowsProcPtr)
+    EnumChildWindows(parent, cb, 0n)
+  }
+  catch (e) {
+    console.warn('[win32] findChildByClass failed', e)
+  }
+  finally {
+    if (cb) {
+      try {
+        koffi.unregister(cb)
+      }
+      catch {}
+    }
+  }
+  return best
+}
+
+/** Chromium 网页内容窗口类名（Chrome / Edge 通用） */
+export const CHROME_RENDER_WIDGET_CLASS = 'Chrome_RenderWidgetHostHWND'
+
+/**
+ * 量出网页内容区相对窗口左上角的偏移与内衬（物理像素）。
+ *
+ * 返回 null 表示拿不到（例如目标不是 Chromium 浏览器窗口）。
+ * 实测（Chrome 150 / 100% DPI / 标准窗口）：{ left: 8, top: 87, right: 8, bottom: 8 }，
+ * 且**与窗口尺寸无关**——所以定位一次即可，不需要任何迭代校准。
+ */
+export function chromeContentInsets(hwnd: number | bigint): { left: number, top: number, right: number, bottom: number } | null {
+  try {
+    const wr = getWindowRect(hwnd)
+    if (!wr) return null
+    const child = findChildByClass(hwnd, CHROME_RENDER_WIDGET_CLASS)
+    if (!child) return null
+    const cr = getWindowRect(child)
+    if (!cr) return null
+    const ww = wr.right - wr.left
+    const wh = wr.bottom - wr.top
+    return {
+      left: cr.left - wr.left,
+      top: cr.top - wr.top,
+      right: (wr.left + ww) - cr.right,
+      bottom: (wr.top + wh) - cr.bottom,
+    }
+  }
+  catch {
+    return null
+  }
+}
+
+export interface BrowserWindowInfo {
+  hwnd: number
+  pid: number
+  title: string
+  rect: { x: number, y: number, width: number, height: number }
+}
+
+/**
+ * 列出桌面上所有"真正装着网页"的浏览器顶层窗口。
+ *
+ * 为什么不能只按类名挑：Chrome 的**对话框**（例如"无法更新 Chrome"）同样叫
+ * `Chrome_WidgetWin_1`，按类名 + 尺寸挑会挑错，把后续所有窗口操作都作用在对话框上。
+ * 可靠的判据是**它里面有没有 `Chrome_RenderWidgetHostHWND`**——
+ * 只有承载网页的窗口才有。
+ *
+ * 尺寸下限刻意放到 200×150（而不是 400×300）：
+ * 窄分格里的浏览器窗口只有 270px 宽，阈值定高了就认不出自己的窗口。
+ * 靠"必须有网页内容"这一条已经足够排除对话框与气泡。
+ */
+export function listBrowserWindows(): BrowserWindowInfo[] {
+  const out: BrowserWindowInfo[] = []
+  let cb: any = null
+  try {
+    const cands: number[] = []
+    cb = koffi.register((hwnd: any) => {
+      const h = Number(hwnd)
+      if (getClassName(h) !== 'Chrome_WidgetWin_1') return true
+      if (!isWindowVisible(h)) return true
+      const r = getWindowRect(h)
+      if (!r) return true
+      if (r.right - r.left < 200 || r.bottom - r.top < 150) return true
+      cands.push(h)
+      return true
+    }, EnumWindowsProcPtr)
+    EnumWindows(cb, 0n)
+    koffi.unregister(cb)
+    cb = null
+
+    for (const h of cands) {
+      if (!findChildByClass(h, CHROME_RENDER_WIDGET_CLASS)) continue
+      const r = getWindowRect(h)
+      if (!r) continue
+      out.push({
+        hwnd: h,
+        pid: getWindowPid(h),
+        title: getWindowText(h),
+        rect: { x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top },
+      })
+    }
+  }
+  catch (e) {
+    console.warn('[win32] listBrowserWindows failed', e)
+  }
+  finally {
+    if (cb) {
+      try {
+        koffi.unregister(cb)
+      }
+      catch {}
+    }
+  }
+  return out
+}
+
+export function parseHwnd(buf: Buffer | Uint8Array): number {
+  if (!buf) return 0
+  if (buf.length === 8) return Number(Buffer.from(buf).readBigUInt64LE(0))
+  if (buf.length === 4) return Number(Buffer.from(buf).readUInt32LE(0))
+  return Number(Buffer.from(buf).readBigUInt64LE(0))
+}
