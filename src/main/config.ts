@@ -102,8 +102,12 @@ export class ConfigStore {
       console.warn('[config] load failed, using defaults', e)
     }
     this.normalize()
-    // 迁移过就把新版本号写回去，免得每次启动都重跑一遍迁移
-    if (this.loadedVersion !== CONFIG_VERSION) this.save()
+    // 迁移过就把新版本号写回去，免得每次启动都重跑一遍迁移。
+    // version 必须显式更新：`save()` 落盘的就是 data 本身，不设的话磁盘上还写着旧版本号。
+    if (this.loadedVersion !== CONFIG_VERSION) {
+      this.data.version = CONFIG_VERSION
+      this.save()
+    }
   }
 
   /**
