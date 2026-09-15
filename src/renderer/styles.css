@@ -478,8 +478,7 @@ kbd {
  *
  * 代价有两个，改这里时别忘：
  *   1. 拖动窗口靠这一条自己承担（`-webkit-app-region: drag`）；
- *   2. 高度必须与 main/index.ts 里 `titleBarOverlay.height` 一致，
- *      否则右上角那三个系统按钮会跟这条不在一个水平线上。
+ *   2. 高度与右上角那三个系统按钮的关系，见下条 border-bottom 的说明。
  */
 .st-head {
   flex: 0 0 auto;
@@ -489,6 +488,14 @@ kbd {
   gap: 12px;
   height: 40px;
   padding: 0 14px;
+  /**
+   * ⚠️ 这条分割线能不能被看见，取决于 main/index.ts 里 `titleBarOverlay.height`：
+   * 叠加层是画在页面**之上**的不透明矩形，它的高度若不比标题栏小，底边就正好压住
+   * 这条线所在的那一行像素 —— 于是线从左到右画到右上角突然断掉（用户看到的
+   * "最小化/最大化/关闭下面没有分割线"）。2026-09-15 用纯洋红底竖向扫描实测：
+   * 标题栏底边在物理第 366 行，高度 40 的叠加层恰好盖住第 366 行。
+   * 所以那里的 height 固定取「标题栏高度 − 2」（现 38）。改标题栏高度时两处一起改。
+   */
   border-bottom: 1px solid var(--line);
   /* 显式画满：它是 sticky 之外的固定条，不能指望父层底色透上来 */
   background: var(--panel-bg);
