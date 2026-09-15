@@ -53,6 +53,12 @@
           <div class="st-card-head">
             <h2>面板与呼出</h2>
             <span>怎么叫出来、占多宽、钉在哪一层</span>
+            <!--
+              生效个数挂在这一行的**右端**，不放任何一行下面：它说的是整张卡四处快捷键
+              （呼出 + 1/2/4 格）加起来有几个真注册上了，贴着某一行会被当成那一行的附属。
+              空的时候由自身 :empty 收掉，不占位。
+            -->
+            <span id="sc-status" class="sc-status"></span>
           </div>
           <div class="st-card-body">
             <div class="st-row">
@@ -64,14 +70,6 @@
                 <input type="text" id="sc-toggle" class="sc-input" readonly placeholder="未设置" />
               </div>
             </div>
-
-            <!--
-              生效状态紧跟在它描述的那一行后面（呼出快捷键 + 分格切换是同一件事的两半，
-              状态行说的是这两处加起来有几个真的注册上了）。放在「分格切换」后面时，
-              看上去只像是在说分格那一行。
-              空的时候由 .st-statusline:has(> span:empty) 收掉，不留空行。
-            -->
-            <div class="st-statusline"><span id="sc-status" class="sc-status"></span></div>
 
             <div class="st-row">
               <span class="st-row-label">

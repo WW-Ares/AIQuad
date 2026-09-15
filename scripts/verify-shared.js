@@ -16,6 +16,7 @@ const { detectBrowsers, pickBrowser } = require('../dist/main/browser-detect')
 const { InstanceManager } = require('../dist/main/instance-manager')
 const { defaultConfig } = require('../dist/main/config')
 const w32 = require('../dist/main/win32')
+const { killBrowsersUnder } = require('./lib/process-cleanup')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const ROOT = path.join(__dirname, '..')
@@ -87,11 +88,13 @@ function inspect(paneId, expect, mgr) {
 async function main() {
   console.log('=== v0.4 共享会话 / 分格裁剪 验证 ===\n')
 
-  try {
-    const { execFileSync } = require('node:child_process')
-    execFileSync('taskkill', ['/F', '/IM', 'chrome.exe'], { stdio: 'ignore' })
-  }
-  catch {}
+  /**
+   * 起跑前清场：**只清本应用自己拉起的浏览器**（判据 = 命令行里带着本脚本的 PROFILES 目录）。
+   * ⚠️ 原来这里是无差别的 `taskkill /F /IM chrome.exe`：会连用户自己开着的 Chrome、
+   * 以及用户机器上正在运行的 AIQuad 实例里的分格窗口一起杀掉（"面板只剩框架、预览器消失"）。
+   */
+  const cleaned = killBrowsersUnder(PROFILES)
+  if (cleaned) console.log(`（清场：结束了 ${cleaned} 个本应用遗留的浏览器进程）`)
   await sleep(1500)
 
   fs.rmSync(PROFILES, { recursive: true, force: true })

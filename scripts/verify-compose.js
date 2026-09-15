@@ -276,7 +276,9 @@ async function main() {
   fs.writeFileSync(path.join(projectRoot, '.tmp', `compose-check-${SCALE}.json`), JSON.stringify(json, null, 2))
 
   try { await cdp.close() } catch {}
-  cleanupRun(child.pid, ['electron.exe', 'AIQuad.exe'])
+  // ⚠️ 只杀被测实例的进程树（原来还按名强杀 electron.exe / AIQuad.exe，
+  // 会把用户自己开着的 AIQuad 一起干掉 —— 2026-09-15 修）
+  cleanupRun(child.pid)
   process.exit(bad.length ? 3 : 0)
 }
 

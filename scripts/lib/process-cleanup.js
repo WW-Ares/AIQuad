@@ -8,6 +8,16 @@
  * 立刻 `app.quit()`：**窗口没有、日志正常、退出码 0**，排查了半小时才想到是残留进程。
  *
  * 所以收尾一律走「杀进程树 + 按映像名兜底清扫」。
+ *
+ * ⚠️ **2026-09-15 事故：兜底清扫的"默认值"误伤了用户正在用的程序。**
+ * `cleanupRun(pid)` 原先默认 `images = ['chrome.exe']`，于是**每次跑回归脚本收尾都会
+ * `taskkill /F /T /IM chrome.exe` —— 无差别强杀机器上所有 Chrome**。而 AIQuad 给每个分格
+ * 承载网页用的就是 Chrome：用户正开着 AIQuad 时，那一刀会把他面板里所有分格窗口一起杀掉，
+ * 表现是**面板只剩框架、预览器（网页）整片消失**，而且"偶尔才发生"（只在我们跑脚本时）。
+ * 更别提他自己的 Chrome 标签页、没提交的表单也一起没了。
+ * → 现在**默认不再按映像名全杀**：被测应用拉起的浏览器是它的**子进程**（`detached: false`），
+ * `killTree(pid)` 已经覆盖；真要清"用户自己开的浏览器"，得显式传 `images` 或给
+ * `AIQUAD_FORCE_KILL_BROWSERS=1`。**改动这里前先读这几行。**
  */
 const { execFileSync } = require('node:child_process')
 
@@ -29,13 +39,21 @@ function killImage(name) {
 }
 
 /**
- * 收尾：先杀被测应用进程树，再清浏览器，最后按名兜底。
+ * 收尾：杀被测应用进程树（连带它拉起的浏览器子进程），按需再精确清本应用的浏览器。
+ *
+ * ⚠️ `images` 默认**空** —— 别再改回 `['chrome.exe']`，那会强杀用户自己开着的 Chrome，
+ * 以及用户那台机器上正在运行的 AIQuad 实例里的分格窗口（见文件头的事故记录）。
+ *
  * @param {number} [pid] 被测应用主进程 pid
- * @param {string[]} [images] 额外按名清扫的映像（默认清 Chrome，避免遗留登录窗口）
+ * @param {string[]} [images] 额外按映像名**全量**清扫的映像（默认不扫）
+ * @param {string} [profilesRoot] 本应用的浏览器档案根目录；给了就只清命令行里带它的那些浏览器进程
  */
-function cleanupRun(pid, images = ['chrome.exe']) {
+function cleanupRun(pid, images = [], profilesRoot = null) {
   killTree(pid)
+  if (profilesRoot) killBrowsersUnder(profilesRoot)
   for (const img of images) killImage(img)
+  // 显式开关：确实要把整个用户机器上的浏览器清干净时用（会造成上面那个事故，慎用）
+  if (process.env.AIQUAD_FORCE_KILL_BROWSERS) killImage('chrome.exe')
 }
 
 /**

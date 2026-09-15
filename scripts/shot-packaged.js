@@ -20,9 +20,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // 而不是无差别 taskkill 掉用户自己开着的浏览器。
 const appProfilesRoot = path.join(process.env.APPDATA || '', 'aiquad', 'profiles')
 
-/** 收尾：杀应用进程树 + 只清本应用名下的浏览器（不碰用户自己的 Chrome） */
+/**
+ * 收尾：杀被测应用进程树 + 只清本应用名下的浏览器（不碰用户自己的 Chrome）。
+ *
+ * ⚠️ 原来这里传的是 `['AIQuad.exe']`（**按映像名全量强杀**）—— 那会把用户自己正开着的
+ * 那份 AIQuad 一起杀掉：面板、分格、未保存的东西全没了。被测实例由 `killTree` 连子进程
+ * 一起收走，**不需要**按名兜底。别再改回去。
+ * ⚠️ `killBrowsersUnder` 用的是真实 `%APPDATA%\aiquad\profiles`，用户开着实例时也会命中它，
+ * 所以**跑本脚本前请先退出自己开着的 AIQuad**（否则它的分格窗口会被清掉）。
+ */
 function cleanup(pid) {
-  cleanupRun(pid, ['AIQuad.exe'])
+  cleanupRun(pid)
   const n = killBrowsersUnder(appProfilesRoot)
   console.log(`收尾：结束 ${n} 个本应用名下的浏览器进程（未触碰其它 Chrome 窗口）`)
 }

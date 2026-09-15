@@ -292,7 +292,9 @@ async function main() {
   child.stderr.on('data', (d) => { log += d.toString() })
 
   const finish = (code) => {
-    try { cleanupRun(child.pid, ['electron.exe', 'AIQuad.exe']) } catch {}
+    // ⚠️ 只杀被测实例的进程树。这里原来还按名强杀了 electron.exe / **AIQuad.exe** ——
+    // 后者会把用户自己正开着的那份 AIQuad 一起干掉（2026-09-15 修）。
+    try { cleanupRun(child.pid) } catch {}
     process.exit(code)
   }
 

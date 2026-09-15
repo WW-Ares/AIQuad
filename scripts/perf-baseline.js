@@ -315,10 +315,9 @@ async function main() {
     execFileSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' })
   }
   catch {}
-  try {
-    execFileSync('taskkill', ['/F', '/IM', 'electron.exe'], { stdio: 'ignore' })
-  }
-  catch {}
+  // ⚠️ 这里原来还有一条 `taskkill /F /IM electron.exe`（按名全量强杀）—— 已删：
+  // 它会连**别的** Electron 应用一起杀掉（用户可能同时开着另一个实例或别的 Electron 项目），
+  // 而上面的 `/T` 已经把本实例的子进程收干净了。
   // 只清本应用拉起的 Chrome（命令行带 aiquad 档案目录），别把用户自己开的浏览器杀了
   for (const p of sample().chrome) {
     try {

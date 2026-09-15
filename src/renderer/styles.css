@@ -752,6 +752,25 @@ label.st-name { cursor: pointer; }
 .sc-status.warn { color: var(--warn); }
 .sc-status.err { color: var(--err); }
 
+/**
+ * 「X 个快捷键已生效」挂在**卡片标题行的右端**（`#sc-status` 是 `.st-card-head` 的最后一个子节点）。
+ *
+ * `margin-left: auto` 把它推到行尾；空的时候自身 `:empty` 收掉，不占位。
+ * ⚠️ 下面四条必须带 `.st-card-head >` 才有足够特异度：光写 `.sc-status` 是 (0,1,0)，
+ * 压不过 `.st-card-head > span` 的 (0,1,1)，颜色会被淡成卡片说明那一路。
+ * ⚠️ 别给它**加第二个类名**：`settings.js` 与 `shortcut-capture.js` 都是整条覆盖
+ * `className = 'sc-status …'`，多余的类会在每次刷新状态时被冲掉，右对齐随之失效。
+ */
+.st-card-head > .sc-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.st-card-head > .sc-status:empty { display: none; }
+.st-card-head > .sc-status.ok { color: var(--ok); }
+.st-card-head > .sc-status.warn { color: var(--warn); }
+.st-card-head > .sc-status.err { color: var(--err); }
+
 /* ---------------- 控件 ---------------- */
 
 /**
