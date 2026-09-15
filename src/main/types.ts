@@ -82,6 +82,15 @@ export interface AppConfig {
   sharedSession: boolean
   alwaysOnTop: boolean
   hibernateBackground: boolean
+  /**
+   * 是否清理"当前布局用不到"的分格。
+   *
+   * 从 4 格切回 1 格时，多出来的三个窗口只是**藏起来**：页面照跑、内存照占
+   * （4 个 AI 页面合计约 1GB，收起态一分不省）。开了这个开关，闲置够久就真正关掉它们。
+   */
+  paneCleanup: boolean
+  /** 闲置多少分钟后清理未使用的分格（配合 paneCleanup） */
+  paneCleanupDelayMin: number
   autoStart: boolean
   browserPreference: 'chrome' | 'edge' | 'auto'
   customBrowserPath: string

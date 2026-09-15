@@ -243,6 +243,29 @@ async function main() {
     check(afterEsc.acc === beforeEsc && afterEsc.recording === false,
       'Esc 取消录制并保留原值', `acc="${afterEsc.acc}"`)
 
+    // 用户报的现场：Esc 取消之后"录制中…"还一直挂在页面上。
+    // 录制控件只在 rec / bad 两种状态写状态行，idle 时也必须收掉，
+    // 否则那条提示就变成永不过期的东西（见 shortcut-capture.js 的 onState）。
+    await sleep(150)
+    const escStatus = await evaluate(`(() => {
+      const s = document.getElementById('sc-status')
+      return { text: s.textContent, cls: s.className }
+    })()`)
+    check(!/录制中/.test(escStatus.text) && !/warn/.test(escStatus.cls),
+      'Esc 之后"录制中"提示已收掉（不再永久挂在页面上）', JSON.stringify(escStatus))
+
+    // 失焦取消也是同一条路径
+    await focusField('sc-4')
+    await evaluate(`document.getElementById('sc-4').blur()`)
+    await sleep(150)
+    const blurStatus = await evaluate(`(() => {
+      const s = document.getElementById('sc-status')
+      const f = document.getElementById('sc-4')
+      return { text: s.textContent, cls: s.className, recording: !!f.classList.contains('recording') }
+    })()`)
+    check(!blurStatus.recording && !/录制中/.test(blurStatus.text),
+      '失焦之后同样收掉提示并退出录制态', JSON.stringify(blurStatus))
+
     /* ---------- 6. 裸字母被拒 ---------- */
     const beforeBare = (await readField('sc-4')).acc
     await expectRecording('sc-4')

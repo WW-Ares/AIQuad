@@ -819,3 +819,108 @@ export function parseHwnd(buf: Buffer | Uint8Array): number {
   if (buf.length === 4) return Number(Buffer.from(buf).readUInt32LE(0))
   return Number(Buffer.from(buf).readBigUInt64LE(0))
 }
+
+/* ---------------- 前台窗口变化（事件驱动） ---------------- */
+
+/**
+ * `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`：前台窗口一变就立刻回调。
+ *
+ * 为什么非它不可：点任意一个分格里的浏览器窗口，系统都会把它提到置顶带的顶端 ——
+ * 也就是**浮到面板之上**。而那个窗口是完整的 Chrome 窗口，除了网页内容还有顶上
+ * 一截标签栏 / 工具栏（平时被我们的 `SetWindowRgn` 从可视区裁掉），一旦翻到面板上面：
+ *   · 第一行分格（1 / 2 格布局）那一截正好落在顶栏 → 顶栏"闪一下白"；
+ *   · 第二行分格（4 格布局的 3 / 4）落在上一格的底部 → 那块既不画网页也不画面板，
+ *     看上去就是一块透明区域。
+ * 以前只有 200ms 轮询的 Z 序看门狗在兜，那半帧人眼看得见。
+ *
+ * 它是 **out-of-context** 钩子：不需要 DLL 注入，回调投递到安装线程自己的消息队列，
+ * 由那个线程的消息泵取出 —— Electron 主进程正好有一条，所以在主线程安装即可。
+ * 万一装不上，轮询看门狗还在，只是延迟回到 200ms（不会出现错误行为）。
+ */
+const WinEventProc = koffi.proto('void WinEventProc(uint64 hook, uint32 event, uint64 hwnd, int32 idObject, int32 idChild, uint32 eventThread, uint32 eventTime)')
+const WinEventProcPtr = koffi.pointer(WinEventProc)
+const SetWinEventHook = user32.func('SetWinEventHook', HANDLE, ['uint32', 'uint32', HANDLE, WinEventProcPtr, 'uint32', 'uint32', 'uint32'])
+const UnhookWinEvent = user32.func('UnhookWinEvent', BOOL, [HANDLE])
+const GetForegroundWindow = user32.func('GetForegroundWindow', HWND, [])
+
+export const EVENT_SYSTEM_FOREGROUND = 0x0003
+/** out-of-context（回调投递到本线程消息队列，不需要注入 DLL） */
+const WINEVENT_OUTOFCONTEXT = 0x0000
+/** 跳过本进程产生的事件：面板 / 设置窗口自己抢前台不必打扰我们 */
+const WINEVENT_SKIPOWNPROCESS = 0x0002
+
+const foregroundSubs = new Set<(hwnd: number) => void>()
+/** koffi 的回调必须长期持有引用：对象被 GC 掉之后原来的函数指针就悬了 */
+let winEventCbPointer: unknown = null
+let foregroundHookHandle: number | bigint | null = null
+
+/** 当前前台窗口（拿不到就是 0） */
+export function foregroundWindow(): number {
+  try {
+    return Number(GetForegroundWindow()) || 0
+  }
+  catch {
+    return 0
+  }
+}
+
+/** 订阅前台变化；返回退订函数 */
+export function watchForeground(fn: (hwnd: number) => void): () => void {
+  foregroundSubs.add(fn)
+  void installForegroundHook()
+  return () => {
+    foregroundSubs.delete(fn)
+    // 最后一个订阅者退订就把钩子一并卸掉，别让系统继续朝一个没人听的回调投递事件
+    if (foregroundSubs.size === 0) unwatchForegroundAll()
+  }
+}
+
+function installForegroundHook() {
+  if (foregroundHookHandle) return
+  try {
+    winEventCbPointer = koffi.register((_hook: unknown, _event: unknown, hwnd: unknown, idObject: unknown, idChild: unknown, _thread: unknown, _ts: unknown) => {
+      // 只认窗口级的事件：OBJID_WINDOW(0) 且没有子对象
+      if (Number(idObject) !== 0 || Number(idChild) !== 0) return
+      const h = Number(hwnd) || 0
+      if (!h) return
+      if (process.env.AIQUAD_DEBUG_HOOK) console.log(`[win32] fg -> ${h}`)
+      for (const fn of Array.from(foregroundSubs)) {
+        try {
+          fn(h)
+        }
+        catch (e) {
+          console.warn('[win32] 前台变化回调出错', e)
+        }
+      }
+    }, WinEventProcPtr)
+    const handle = SetWinEventHook(
+      EVENT_SYSTEM_FOREGROUND,
+      EVENT_SYSTEM_FOREGROUND,
+      0,
+      winEventCbPointer,
+      0,
+      0,
+      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+    )
+    if (handle) {
+      foregroundHookHandle = handle
+      if (process.env.AIQUAD_DEBUG_HOOK) console.log('[win32] 前台钩子已挂载')
+    }
+    else console.warn('[win32] SetWinEventHook 未安装成功，层级维持仍依赖轮询看门狗')
+  }
+  catch (e) {
+    console.warn('[win32] SetWinEventHook 失败，层级维持仍依赖轮询看门狗', e)
+  }
+}
+
+/** 卸载前台钩子（正常退出时调用；进程要结束时不调用也无所谓） */
+export function unwatchForegroundAll() {
+  if (foregroundHookHandle) {
+    try {
+      UnhookWinEvent(foregroundHookHandle)
+    }
+    catch {}
+    foregroundHookHandle = null
+  }
+  foregroundSubs.clear()
+}

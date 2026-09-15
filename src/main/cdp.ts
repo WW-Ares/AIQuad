@@ -36,10 +36,17 @@ export class CdpSession {
   }
 
   async connect(timeoutMs = 8000): Promise<void> {
+    // 依赖运行时内置的 WebSocket（Node 22+ / Electron 32+）。
+    // 老运行时上是 undefined，直接 new 会抛 TypeError，外面只当"这一格连不上"处理，
+    // 问题就永远查不出来，所以这里先显式报清楚。
+    const WS = (globalThis as any).WebSocket
+    if (typeof WS !== 'function') {
+      throw new Error(`CDP 需要运行时内置 WebSocket，当前 Node ${process.versions.node} 没有；请升级 Electron`)
+    }
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('CDP connect timeout')), timeoutMs)
       try {
-        const ws: any = new (globalThis as any).WebSocket(this.wsUrl, [], { perMessageDeflate: false })
+        const ws: any = new WS(this.wsUrl, [], { perMessageDeflate: false })
         this.ws = ws
         ws.onopen = () => {
           clearTimeout(timer)

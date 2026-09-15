@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
-import net from 'node:net'
 import path from 'node:path'
 import { screen } from 'electron'
 import type { AiService, AppConfig } from './types'
@@ -49,6 +48,11 @@ export interface ManagedInstance {
    * 用于"区域看门狗"判断区域有没有被外部（浏览器自己）改掉。
    */
   regionBox?: { left: number, top: number, right: number, bottom: number } | null
+  /**
+   * 最近一次成功施加的可见区里，被挖掉的那些小矩形（窗口内坐标）。
+   * 外接矩形看不出洞，看门狗只能靠它判断"洞还在不在"。
+   */
+  holes?: Array<{ left: number, top: number, right: number, bottom: number }>
   /** 当前是否已处于显示状态，避免反复 ShowWindow 造成闪烁 */
   shown?: boolean
 }
@@ -67,6 +71,15 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  * 两个数一起改，否则网页的直角会把面板画的圆角从里面顶掉，看起来像没改。
  */
 const PANE_RADIUS = 5
+/**
+ * 几何核对间隔（毫秒）。
+ *
+ * 这个值就是"浏览器偷偷改了窗口之后，用户看到异常的最长时间"。
+ * 一轮只是几个只读调用：实测 getWindowRect 1.7µs、windowRegionBox 0.6µs、
+ * chromeContentInsets 7.8µs，四格满打满算一轮不到 50µs，30ms 一跳等于 0.2% CPU，
+ * 换来的是最多两三帧就能把翘出来的一截按回去（原来是 250ms，肉眼能看清）。
+ */
+const GEOMETRY_WATCH_MS = 30
 /**
  * 实测不到网页内容区时的兜底内衬。
  * 数值来自 Chrome 150 / 100% DPI / 标准窗口的实测（见 win32.chromeContentInsets）。
@@ -147,14 +160,19 @@ export class InstanceManager {
    * 并弹对话框；排队启动可以彻底避免。
    */
   private chain: Promise<unknown> = Promise.resolve()
-  /** 区域看门狗定时器（见 watchRegions） */
-  private regionTimer: NodeJS.Timeout | null = null
-  /** 已经就"区域被外部改掉"告警过的格子，避免每轮都刷日志 */
-  private regionDriftLogged = new Set<string>()
+  /** 几何看门狗定时器（见 watchGeometry / verifyGeometry） */
+  private geomTimer: NodeJS.Timeout | null = null
+  /** 已经就"窗口被外部改掉"告警过的格子，避免每轮都刷日志 */
+  private driftLogged = new Set<string>()
+  /** 同一格反复被外部改动时的节流（见 verifyGeometry 的防打斗） */
+  private repositionGuard = new Map<string, { count: number, since: number }>()
+  private loopWarned = new Set<string>()
   /** 每个格子在"刚显示出来"前后的补施定时器（见 settleRegion） */
   private settleTimers = new Map<string, NodeJS.Timeout[]>()
   /** 层级看门狗定时器（见 watchZOrder） */
   private zTimer: NodeJS.Timeout | null = null
+  /** 前台窗口事件的退订函数（见 watchForeground → onForeground） */
+  private unForeground: (() => void) | null = null
 
   constructor(
     private opts: {
@@ -203,10 +221,12 @@ export class InstanceManager {
     this.panel.scale = s
     this.panel.hwnd = hwnd
     this.panel.topMost = topMost
-    // 面板一绑定就把区域看门狗挂上：浏览器会偷偷改掉我们的可见区（见 watchRegions）
-    this.watchRegions()
+    // 几何看门狗：浏览器会偷偷改掉我们的可见区、挪动窗口、重排自己的外壳（见 verifyGeometry）
+    this.watchGeometry()
     // 层级看门狗：置顶带里的次序会被系统重排，得盯着（见 enforceZOrder）
     this.watchZOrder()
+    // 前台窗口事件：用户一点某个分格，那个浏览器窗口就被抬到面板之上（见 onForeground）
+    if (!this.unForeground) this.unForeground = w32.watchForeground((h) => this.onForeground(h))
     for (const inst of this.instances.values()) {
       if (inst.hwnd && w32.isWindow(inst.hwnd)) {
         /**
@@ -319,6 +339,16 @@ export class InstanceManager {
 
   get(paneId: string) {
     return this.instances.get(paneId)
+  }
+
+  /** 这个窗口句柄是不是某个分格的浏览器窗口（主进程判断"点到面板外面没有"时用） */
+  hasWindow(hwnd: number): boolean {
+    const h = Number(hwnd)
+    if (!h) return false
+    for (const inst of this.instances.values()) {
+      if (inst.hwnd && Number(inst.hwnd) === h) return true
+    }
+    return false
   }
 
   list() {
@@ -978,51 +1008,191 @@ export class InstanceManager {
       right: g.region.x + g.region.width,
       bottom: g.region.y + g.region.height,
     }
+    // 洞单独记账：外接矩形相同、洞没了这种情况，只有逐点判断才看得出来
+    inst.holes = rects.slice(1).map((r) => ({
+      left: r.x,
+      top: r.y,
+      right: r.x + r.width,
+      bottom: r.y + r.height,
+    }))
   }
 
   /**
-   * 区域看门狗：浏览器**自己也会**给窗口设区域，会把我们用来
-   * "裁掉标题栏 + 挖洞"的区域顶掉。
+   * 几何看门狗的挂载点。
    *
-   * 踩过的现场（2026-09-14，用户机器）：Win11 上顶部控制栏被一块浅灰盖住，
-   * 完全看不清按钮——那就是 Chrome 自己的窗口标题栏没被裁掉，直接压在面板上。
-   * 本机是 Win10，Chrome 不给窗口设区域，所以怎么都复现不出来。
+   * 踩过的现场（2026-09-14）：Win11 上顶部控制栏被一块浅灰盖住，完全看不清按钮
+   * ——那就是 Chrome 自己的窗口标题栏没被裁掉，直接压在面板上。
+   * 本机（Win10 + 软件渲染）Chrome 不给窗口设区域，所以怎么都复现不出来。
    *
-   * 结论：定位完不能"设一次就完事"。定期回读可见区外接矩形，
-   * 一旦和期望不符就重新施加。正常情况零开销（只读不写），也不会闪。
+   * 结论：定位完不能"设一次就完事"，得持续核对（见 verifyGeometry）。
    */
-  private watchRegions() {
-    if (this.regionTimer) return
-    this.regionTimer = setInterval(() => {
-      for (const inst of this.instances.values()) {
-        const hwnd = inst.hwnd
-        if (!hwnd || !inst.shown || !inst.regionBox || !w32.isWindow(hwnd)) continue
-        const box = w32.windowRegionBox(hwnd)
-        const w = inst.regionBox
-        const same = !!box
-          && Math.abs(box.left - w.left) <= 2 && Math.abs(box.top - w.top) <= 2
-          && Math.abs(box.right - w.right) <= 2 && Math.abs(box.bottom - w.bottom) <= 2
-        if (same) continue
-        if (!this.regionDriftLogged.has(inst.paneId)) {
-          this.regionDriftLogged.add(inst.paneId)
-          const got = box ? `${box.left},${box.top},${box.right},${box.bottom}` : '无区域'
-          console.warn(`[panel] ${inst.paneId} 的窗口可见区被外部改动（实测 ${got}｜期望 ${w.left},${w.top},${w.right},${w.bottom}）→ 已重新施加`)
-        }
-        const g = this.geometry(inst)
-        if (g) this.applyRegion(inst, g)
-      }
-    }, 500)
+  private watchGeometry() {
+    if (this.geomTimer) return
+    this.geomTimer = setInterval(() => this.verifyGeometry(), GEOMETRY_WATCH_MS)
     // 不要因为这个保活定时器把进程钉住
-    ;(this.regionTimer as { unref?: () => void }).unref?.()
+    ;(this.geomTimer as { unref?: () => void }).unref?.()
   }
 
-  stopRegionWatch() {
-    if (this.regionTimer) {
-      clearInterval(this.regionTimer)
-      this.regionTimer = null
+  /**
+   * 逐格核对三件事，任何一件不对就修回去：
+   *
+   * ① 浏览器"外壳"厚度（内衬）——`chromeContentInsets` 量出来的顶部偏移就是标题栏+工具栏
+   *    那一截。这个数**会变**：Chrome 在激活/失活、换皮肤、显示资料气泡时会重新排布
+   *    自己的窗口，子窗口位置跟着动。内衬一旦过期，几何就是按旧厚度算的，
+   *    窗口位置、要裁掉的高度全都偏——表现正是"点一下网页，顶上冒出一条浏览器的边"。
+   * ② 窗口矩形——浏览器自己会挪窗口、改尺寸（Chrome 会按自己的记忆恢复窗口状态，
+   *    也会在重排时把宽度钳到最小值）。位置错了就整块内容跟着错位。
+   * ③ 可见区（区域）——被外部改掉时，"被裁掉的那截浏览器外壳"就会露出来。
+   *
+   * 这三样原来只查了③，①② 没人在看：只要浏览器动过窗口而不是动区域，
+   * 看门狗就认为"一切正常"。现在合成一轮，代价仍然是几个微秒级的只读调用
+   * （实测 getWindowRect 1.7µs、windowRegionBox 0.6µs、chromeContentInsets 7.8µs），
+   * 所以间隔可以压到 30ms —— 也就是最多两三帧就能纠正，而不是原来那半秒。
+   */
+  private verifyGeometry() {
+    // 滑动动画期间窗口位置由 relocateAll 逐帧对齐，这里插一脚只会打架
+    if (this.sliding) return
+    for (const inst of this.instances.values()) {
+      const hwnd = inst.hwnd
+      if (!hwnd || !inst.regionBox || !w32.isWindow(hwnd)) continue
+      if (!inst.shown) {
+        /**
+         * "该显示却藏着"也要补：分格里的窗口一旦被藏起来，面板那格是透明的，
+         * 用户看到的就是桌面上的一块空洞。能走到这里说明没人要它藏
+         * （不是收起面板、不是浮层让位、也不是要被清理的格子），那就亮出来。
+         */
+        if (inst.desiredVisible && !this.occluded.has(inst.paneId) && !this.suppressed) {
+          this.positionWindow(inst, true)
+        }
+        continue
+      }
+      // 我们记的是"已经显示"，可窗口其实被别人藏掉了（inst.shown 只由本进程维护，
+      // 外部的 ShowWindow 我们看不见）。一并补上，否则那一格会一直是个空洞。
+      if (!w32.isWindowVisible(hwnd)) {
+        if (inst.desiredVisible && !this.occluded.has(inst.paneId) && !this.suppressed) {
+          this.positionWindow(inst, true)
+        }
+        continue
+      }
+
+      let rebuild = false
+
+      // ① 内衬变了（浏览器重排了自己的外壳）
+      const native = w32.chromeContentInsets(hwnd)
+      if (native && this.saneInsets(native)) {
+        const cur = inst.insets
+        if (!cur
+          || Math.abs(cur.top - native.top) > 1 || Math.abs(cur.left - native.left) > 1
+          || Math.abs(cur.right - native.right) > 1 || Math.abs(cur.bottom - native.bottom) > 1) {
+          if (!this.driftLogged.has(inst.paneId)) {
+            this.driftLogged.add(inst.paneId)
+            const was = cur ? `${cur.left},${cur.top},${cur.right},${cur.bottom}` : '未测'
+            console.warn(`[panel] ${inst.paneId} 的浏览器外壳厚度变了（${was} → ${native.left},${native.top},${native.right},${native.bottom}）→ 已按新厚度重新定位`)
+          }
+          inst.insets = native
+          rebuild = true
+        }
+      }
+
+      const g = this.geometry(inst)
+      if (!g) continue
+
+      // ② 窗口被挪走/改了大小
+      if (!rebuild) {
+        const rect = w32.getWindowRect(hwnd)
+        if (rect && (Math.abs(rect.left - g.x) > 1 || Math.abs(rect.top - g.y) > 1
+          || Math.abs((rect.right - rect.left) - g.w) > 1 || Math.abs((rect.bottom - rect.top) - g.h) > 1)) {
+          if (!this.driftLogged.has(inst.paneId)) {
+            this.driftLogged.add(inst.paneId)
+            console.warn(`[panel] ${inst.paneId} 的窗口被外部挪动/缩放（实测 ${rect.left},${rect.top} ${rect.right - rect.left}x${rect.bottom - rect.top}｜期望 ${g.x},${g.y} ${g.w}x${g.h}）→ 已摆回`)
+          }
+          rebuild = true
+        }
+      }
+
+      if (rebuild) {
+        /**
+         * 防打斗：正常情况下一次就摆平。要是某个窗口每轮都对不上，
+         * 说明有别的程序在跟我们抢这个窗口——那时候每 30ms 硬掰一次会让它
+         * 肉眼可见地抖，还白烧 CPU。修够次数就收手，只保证"别露边"（区域），
+         * 位置交给下一次真正的几何变化（切布局、拖面板）去纠正。
+         */
+        const rec = this.repositionGuard.get(inst.paneId)
+        const now = Date.now()
+        const cur = !rec || now - rec.since > 5000 ? { count: 0, since: now } : rec
+        cur.count += 1
+        this.repositionGuard.set(inst.paneId, cur)
+        if (cur.count > 20) {
+          if (!this.loopWarned.has(inst.paneId)) {
+            this.loopWarned.add(inst.paneId)
+            console.warn(`[panel] ${inst.paneId} 的窗口反复被外部改动（5 秒内 ${cur.count} 次），停止重复摆位以免抖动`)
+          }
+          this.applyRegion(inst, g)
+          continue
+        }
+        w32.moveWindowNoClamp(hwnd, g.x, g.y, g.w, g.h, false)
+        this.applyRegion(inst, g)
+        continue
+      }
+      this.repositionGuard.delete(inst.paneId)
+
+      // ③ 可见区被改掉
+      const box = w32.windowRegionBox(hwnd)
+      const w = inst.regionBox!
+      const same = !!box
+        && Math.abs(box.left - w.left) <= 2 && Math.abs(box.top - w.top) <= 2
+        && Math.abs(box.right - w.right) <= 2 && Math.abs(box.bottom - w.bottom) <= 2
+      if (same) {
+        /**
+         * 外接矩形一样，洞也可能没了（切换器胶囊 / 展开中的下拉菜单会被网页盖住）。
+         * GetRgnBox 看不出洞，只能拿洞心去问"这个点现在是不是可见"。
+         */
+        const lost = (inst.holes || []).find((h) => {
+          const cx = Math.round((h.left + h.right) / 2)
+          const cy = Math.round((h.top + h.bottom) / 2)
+          // true = 这个点现在是可见的，也就是洞没了；null = 读不出来，别自作主张重设
+          return w32.pointInWindowRegion(hwnd, cx, cy) === true
+        })
+        if (!lost) continue
+        if (!this.driftLogged.has(inst.paneId)) {
+          this.driftLogged.add(inst.paneId)
+          console.warn(`[panel] ${inst.paneId} 的挖洞被外部抹掉（${lost.left},${lost.top},${lost.right},${lost.bottom}）→ 已重新施加`)
+        }
+        this.applyRegion(inst, g)
+        continue
+      }
+      if (!this.driftLogged.has(inst.paneId)) {
+        this.driftLogged.add(inst.paneId)
+        const got = box ? `${box.left},${box.top},${box.right},${box.bottom}` : '无区域'
+        console.warn(`[panel] ${inst.paneId} 的窗口可见区被外部改动（实测 ${got}｜期望 ${w.left},${w.top},${w.right},${w.bottom}）→ 已重新施加`)
+      }
+      this.applyRegion(inst, g)
+    }
+  }
+
+  /**
+   * 退出前的收尾：把两个看门狗、补施定时器和前台事件钩子都拆掉。
+   *
+   * 之前只定义了停止方法却没人调用（`unForeground` 存了退订函数也没用过），
+   * 属于纯死代码；退出流程里显式收一遍，进程能干净结束，
+   * 也不会在 killAll 之后还去核对已经不存在的窗口。
+   */
+  dispose() {
+    if (this.geomTimer) {
+      clearInterval(this.geomTimer)
+      this.geomTimer = null
+    }
+    if (this.zTimer) {
+      clearInterval(this.zTimer)
+      this.zTimer = null
     }
     for (const timers of this.settleTimers.values()) for (const t of timers) clearTimeout(t)
     this.settleTimers.clear()
+    try {
+      this.unForeground?.()
+    }
+    catch {}
+    this.unForeground = null
   }
 
   private setShown(inst: ManagedInstance, visible: boolean) {
@@ -1069,6 +1239,49 @@ export class InstanceManager {
     const t = setInterval(() => this.enforceZOrder(), 200)
     ;(t as { unref?: () => void }).unref?.()
     this.zTimer = t
+  }
+
+  /**
+   * 前台窗口变了（事件驱动，由 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 投递）。
+   *
+   * 用户点某一个分格里的网页时，系统会做两件事：把这个浏览器窗口提到置顶带顶端
+   * （= 浮到面板之上），并且很可能顺手把它的窗口区域重设一遍——而我们正是靠那个
+   * 区域把浏览器的标签栏 / 工具栏从可视区裁掉的。两件事叠起来的后果：
+   *   · 第一行分格（1 / 2 格布局）被抬上去的那截正好压在顶栏 → 顶栏闪一下白；
+   *   · 第二行分格（4 格布局里的 3 / 4）压在它**上一格**的底部 → 那块既没画网页
+   *     也没画面板（面板在分格处是透明的），看上去就是一块透明区域。
+   *
+   * 轮询看门狗只能把这件事在 200ms 内纠正回来，那半帧是看得见的；
+   * 这条回调在**前台切换的那一刻**就把落下的活补完。
+   *
+   * 代价可以忽略：一次前台变化才跑一次，而且只在真的压到自己的窗口时才动 Win32。
+   */
+  private onForeground(hwnd: number) {
+    if (!this.panel.hwnd) return
+    const mine = Array.from(this.instances.values()).filter(
+      (i) => i.shown && i.hwnd && Number(i.hwnd) === hwnd,
+    )
+    if (!mine.length) {
+      // 前台跑到别处去了（可能是别的程序、也可能是面板自己）。
+      // 那一刻没有谁刚爬到面板上面，只顺手把整体次序收一遍。
+      this.enforceZOrder()
+      return
+    }
+    try {
+      for (const inst of mine) {
+        this.syncInsets(inst)
+        const g = this.geometry(inst)
+        if (!g) continue
+        // 位置 + 区域同一帧补回去：激活会触发 Chrome 自己重画边框，
+        // 那时它很可能顺手把宽度钳回最小值（窄分格尤其明显）。
+        w32.moveWindowNoClamp(inst.hwnd!, g.x, g.y, g.w, g.h, false)
+        this.applyRegion(inst, g)
+      }
+      this.enforceZOrder()
+    }
+    catch (e) {
+      console.warn('[instance] 处理前台变化时出错', e)
+    }
   }
 
   /** 把落在面板之上的实例窗口按回面板下方 */
@@ -1164,21 +1377,39 @@ export class InstanceManager {
   }
   suspend(paneId: string) {
     const inst = this.instances.get(paneId)
-    if (!inst?.pid) return
-    if (inst.shared) {
-      // 共享会话下所有分格在同一个浏览器进程里，挂起进程会把所有分格一起冻住，
-      // 所以这里降级为"隐藏窗口"（浏览器继续在后台跑）
+    if (!inst) return
+    /**
+     * 冻不了的情况（共享会话 / 还没起来 / 拿不到进程）一律降级为"隐藏窗口"。
+     * 这里不能只是 return：切布局时 syncInstances 靠它把不再显示的分格收起来，
+     * 一旦什么都不做，浏览器窗口就留在屏幕上变成孤儿窗口。
+     */
+    if (inst.shared || !inst.pid || inst.status !== 'ready') {
       this.hide(paneId)
       return
     }
-    if (inst.status !== 'ready') return
+    // 共享会话下所有分格在同一个浏览器进程里，挂起进程会把所有分格一起冻住
     if (w32.suspendProcess(inst.pid)) this.emit(inst, 'suspended')
+    else this.hide(paneId)
   }
 
   resume(paneId: string) {
     const inst = this.instances.get(paneId)
     if (!inst?.pid || inst.status !== 'suspended') return
     if (w32.resumeProcess(inst.pid)) this.emit(inst, 'ready')
+  }
+
+  /**
+   * 把所有处于"休眠"（进程被挂起）的实例解冻。
+   *
+   * 退出前必须做一次：挂起的进程收不到 `WM_CLOSE`，窗口不会自己走退出流程，
+   * 只能等兜底超时强杀，档案里的登录态就有写不完整的风险。见 killAll 的注释。
+   */
+  resumeAll() {
+    for (const inst of this.instances.values()) {
+      if (inst.status !== 'suspended' || !inst.pid) continue
+      // 解冻只是让进程能处理消息，不改"这一格该不该显示"
+      if (w32.resumeProcess(inst.pid)) this.emit(inst, 'ready')
+    }
   }
 
   hide(paneId: string) {
@@ -1234,6 +1465,16 @@ export class InstanceManager {
    * 窗口全部关闭后浏览器会自己退出，这样档案（含登录态）才是干净落盘的。
    */
   killAll() {
+    /**
+     * 被冻住的实例必须先解冻。
+     *
+     * `suspend()` 是用 `NtSuspendProcess` 把浏览器进程的所有线程停住（"后台分格休眠"），
+     * 这种进程收不到 `WM_CLOSE`——消息泵本身停了，窗口不会走退出流程，
+     * 于是这里只能等 `shutdownAll` 的兜底超时（6 秒）再强杀，Cookie / Local Storage
+     * 这类"退出时才落盘"的东西就有丢掉的风险。
+     * 先 resume 一下，它们就能正常优雅退出。
+     */
+    this.resumeAll()
     for (const inst of this.instances.values()) {
       try {
         inst.cdp?.close()
@@ -1278,13 +1519,4 @@ export class InstanceManager {
       ? path.join(this.opts.profilesRoot, SHARED_DIR_NAME)
       : null
   }
-}
-
-export async function portInUse(port: number) {
-  return new Promise<boolean>((resolve) => {
-    const s = net.createServer()
-    s.once('error', () => resolve(true))
-    s.once('listening', () => s.close(() => resolve(false)))
-    s.listen(port, '127.0.0.1')
-  })
 }

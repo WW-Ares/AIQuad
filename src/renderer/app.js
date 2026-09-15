@@ -42,11 +42,31 @@ const state = {
  * 面板显示的那一瞬间由主进程按指针位置先定一次，这里接上之后逐帧修正。
  */
 let passthrough = null
+/** 最近一次指针位置：下拉开合之后要拿它重算一次穿透（收不回来就会卡在不穿透上） */
+let pointerAt = { x: -1, y: -1 }
+
 function syncPassthrough(x, y) {
-  const hit = document.elementFromPoint(x, y)
+  if (x != null) pointerAt = { x, y }
+  /**
+   * 下拉展开期间**整块面板都必须收回鼠标**。
+   *
+   * 平时分格是穿透的，点在网页上的单击会直接落到下面的浏览器窗口，渲染层根本
+   * 收不到 click ——结果"点列表外面收起列表"这件最自然的事做不到，只能回过头去
+   * 菜单开着的时候先不穿透，点在面板范围内的任何地方（包括其它分格的网页上）
+   * 都由面板接住，落到下面那个 document 级监听里把菜单收起来。
+   */
+  if (state.menuPane) {
+    setPassthrough(false)
+    return
+  }
+  const hit = document.elementFromPoint(pointerAt.x, pointerAt.y)
   const pane = hit && hit.closest('.pane')
   const widget = !!(hit && hit.closest('.ai-selector, .ai-menu'))
   const through = !!(pane && pane.classList.contains('ready') && !widget)
+  setPassthrough(through)
+}
+
+function setPassthrough(through) {
   if (through === passthrough) return
   passthrough = through
   api.mousePassthrough(through)
@@ -268,6 +288,9 @@ function toggleMenu(paneId) {
     updatePane(paneId)
     setOcclude(paneId, true)
   }
+  // 开合之后都要立刻按当前指针位置重定一次穿透：
+  // 菜单开着 → 面板收回鼠标（点在网页上也能收菜单）；收起来了 → 把网页的点击还回去
+  syncPassthrough()
 }
 
 /**
@@ -380,6 +403,13 @@ function applyConfig(cfg) {
   for (const b of document.querySelectorAll('[data-layout]')) {
     b.classList.toggle('active', b.dataset.layout === String(cfg.layout))
   }
+  // 置顶开关跟随配置（设置页改了这里也会跟着变）
+  const pin = document.getElementById('btn-pin')
+  if (pin) {
+    const on = cfg.alwaysOnTop !== false
+    pin.classList.toggle('active', on)
+    pin.title = on ? '面板置顶（点击取消置顶）' : '面板未置顶（点击置顶）'
+  }
 }
 
 /* ---------------- 初始化 ---------------- */
@@ -396,7 +426,15 @@ async function init() {
     for (const id of state.paneIds) updatePane(id)
   })
   api.on('request-rects', () => reportRects())
-  api.on('panel-shown', () => reportRects())
+  api.on('panel-shown', () => {
+    // 收再呼出时不该还挂着上一次展开的列表
+    if (state.menuPane) toggleMenu(null)
+    reportRects()
+  })
+  // 点在面板外面（别的窗口 / 桌面）：这条由主进程的前台窗口事件转发过来
+  api.on('outside-click', () => {
+    if (state.menuPane) toggleMenu(null)
+  })
   api.on('layout-changed', () => {
     applyConfig(state.config)
     reportRects()
@@ -419,6 +457,13 @@ async function init() {
       api.setLayout(b.dataset.layout)
     })
   }
+  const pin = document.getElementById('btn-pin')
+  pin?.addEventListener('click', (e) => {
+    e.stopPropagation()
+    // 面板要不要压在别的程序之上交给用户决定：关掉之后如果不希望再被面板挡着，
+    // 这一下正好把它放回到普通窗口层级
+    api.setAlwaysOnTop(!state.config.alwaysOnTop)
+  })
   document.getElementById('btn-settings')?.addEventListener('click', (e) => {
     e.stopPropagation()
     api.openSettings()

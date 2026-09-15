@@ -7,7 +7,7 @@ import { detectBrowsers, pickBrowser, type BrowserInfo } from './browser-detect'
 import { InstanceManager } from './instance-manager'
 import { getSystemProxy, profilesRoot, testProxy } from './proxy'
 import { clearProfileCache, clearProfileCacheSync, humanSize, scanProfileCache, type CacheCleanResult, type CacheStat } from './cache-cleaner'
-import { updater } from './updater'
+import { isQuittingForUpdate, updater } from './updater'
 import * as w32 from './win32'
 import type { AppConfig, LayoutId, PaneRect } from './types'
 import { AUTO_CLEAN_THRESHOLD_BYTES } from './types'
@@ -63,7 +63,19 @@ function hwndOf(win: BrowserWindow) {
 function syncPanelToManager() {
   if (!manager || !panelWindow || panelWindow.isDestroyed()) return
   const b = panelWindow.getBounds()
-  manager.setPanel({ x: b.x, y: b.y }, scaleOf(panelWindow), hwndOf(panelWindow), true)
+  manager.setPanel({ x: b.x, y: b.y }, scaleOf(panelWindow), hwndOf(panelWindow), topMostWanted())
+}
+
+/**
+ * 面板要不要置顶，现在是**用户的选择**（顶栏那个图钉开关 / 设置页的开关）。
+ *
+ * 早先写死为 true，理由是"面板必须压住浏览器窗口，否则顶栏会被浏览器的工具栏盖掉"。
+ * 那句只对了一半：真正压得住的是**同带内的相对次序**，由 Z 序看门狗维持，
+ * 与"是否属于置顶层"无关。关掉置顶之后面板仍在浏览器窗口之上，
+ * 只是和别的程序一样可以被别的窗口盖住——这正是用户想要的效果。
+ */
+function topMostWanted(): boolean {
+  return config?.get().alwaysOnTop !== false
 }
 
 /* ---------------- 面板尺寸计算（贴屏幕左/右，占屏宽比例，全高） ---------------- */
@@ -183,6 +195,14 @@ function slideTo(fromX: number, toX: number, bounds: { y: number; width: number;
 
 /* ---------------- 面板窗口 ---------------- */
 
+function applyAlwaysOnTop() {
+  const on = topMostWanted()
+  panelWindow?.setAlwaysOnTop(on)
+  if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.setAlwaysOnTop(on)
+  manager?.setTopMost(on)
+  manager?.raiseAll()
+}
+
 function createPanelWindow() {
   const cfg = config.get()
   const b = targetBounds()
@@ -219,7 +239,8 @@ function createPanelWindow() {
      */
     transparent: true,
     hasShadow: false,
-    alwaysOnTop: true,
+    // 置顶与否由开关决定（见 topMostWanted）。默认值 true 沿用老行为
+    alwaysOnTop: cfg.alwaysOnTop !== false,
     backgroundColor: '#00000000',
     title: 'AIQuad',
     /**
@@ -339,8 +360,10 @@ function showPanel() {
     const h = hwndOf(win)
     if (h) w32.makeToolWindow(h, true)
   }
-  // 面板必须置顶：它是宿主，顶栏与悬浮胶囊都画在它上面来压住浏览器窗口
-  win.setAlwaysOnTop(true)
+  // 面板必须压在浏览器窗口之上：顶栏与悬浮胶囊都画在它上面。
+  // 注意这跟"是不是置顶窗口"是两件事——置顶只决定和别的程序比谁在上，
+  // 面板与浏览器窗口之间的相对次序由 Z 序看门狗维持（见 applyAlwaysOnTop）
+  applyAlwaysOnTop()
   /**
    * 面板刚出现的这一帧先按**指针当前位置**定好穿透状态。
    *
@@ -435,9 +458,9 @@ function applyPanelBounds() {
   if (!panelWindow || panelWindow.isDestroyed()) return
   const cfg = config.get()
   const b = targetBounds()
-  // 恒为 true：面板要压住浏览器窗口，否则顶栏与悬浮胶囊被浏览器标题栏盖掉
-  panelWindow.setAlwaysOnTop(true)
-  manager?.setTopMost(true)
+  // 置顶与否听用户的（必要时在 openSettings 里也会被同步）
+  panelWindow.setAlwaysOnTop(topMostWanted())
+  manager?.setTopMost(topMostWanted())
   if (!panelWindow.isVisible()) {
     panelWindow.setBounds(b)
     syncPanelToManager()
@@ -456,6 +479,11 @@ function applyPanelBounds() {
     panelWindow.setBounds(b)
     syncPanelToManager()
     panelWindow.webContents.send('request-rects')
+    return
+  }
+  // 只是切了置顶开关、几何一个像素没变时别滑：白白 200ms 动画，浏览器窗口跟着抖一下
+  if (cur.x === b.x && cur.y === b.y && cur.width === b.width && cur.height === b.height) {
+    syncPanelToManager()
     return
   }
   slideTo(cur.x, b.x, b, 200, () => {
@@ -478,8 +506,11 @@ function openSettings() {
     title: 'AIQuad · 设置',
     backgroundColor: '#15181f',
     autoHideMenuBar: true,
-    // 面板是置顶的，设置窗口不跟着置顶就会被面板整个挡住
-    alwaysOnTop: true,
+    /**
+     * 面板可能置顶（用户开着的那个开关），设置窗口不跟着走就会被面板整个挡住；
+     * 面板没置顶时也跟着放下来，免得它反过来压住别的程序。
+     */
+    alwaysOnTop: config.get().alwaysOnTop !== false,
     icon: appIcon(),
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
@@ -630,6 +661,8 @@ function setLayout(layout: LayoutId) {
   broadcastConfig()
   panelWindow?.webContents.send('layout-changed', layout)
   setTimeout(syncInstances, 120)
+  // 布局一变就重新开始倒计时：刚被藏起来的那几个格子还留着，切回去才不用重开浏览器
+  schedulePaneCleanup()
 }
 
 /* ---------------- 实例同步 ---------------- */
@@ -642,6 +675,66 @@ function visiblePaneIds(): string[] {
 
 let syncRunning = false
 let syncPending = false
+
+/**
+ * 是不是"自己家的窗口"。
+ *
+ * 用途只有一个：点到面板外面（别的程序 / 桌面）时通知渲染层把展开的 AI 列表收起来。
+ * 列表展开期间面板会把鼠标收回来（否则点击会穿透落到下面的网页上），
+ * 面板内部怎么点它都知道；唯独点在面板外面的世界里的事主进程才看得见。
+ */
+function ownWindow(hwnd: number): boolean {
+  if (!hwnd) return false
+  if (panelWindow && !panelWindow.isDestroyed() && hwndOf(panelWindow) === hwnd) return true
+  if (settingsWindow && !settingsWindow.isDestroyed() && hwndOf(settingsWindow) === hwnd) return true
+  return manager?.hasWindow(hwnd) ?? false
+}
+
+function watchOutsideClicks() {
+  w32.watchForeground((hwnd) => {
+    if (!hwnd || ownWindow(hwnd)) return
+    eachWindow((w) => w.webContents.send('outside-click'))
+  })
+}
+
+/**
+ * 未使用分格的定时清理。
+ *
+ * 切到 1 格之后，原来 2 / 4 格的窗口只是**藏起来**（`desiredVisible = false`），
+ * 页面还活着：4 个 AI 页面的常驻内存是 1GB 级别（见 scripts/perf-baseline.js），
+ * 而收起态一点都省不下来。所以这里给它们一个倒计时——超过设定分钟数还没被
+ * 切回来，就把那几个格子的浏览器窗口真正关掉。
+ *
+ * 为什么要等：来回切布局是高频操作，立刻关掉的话每次切回去都要重新拉浏览器。
+ * 每次布局变化都会重置这个计时器，只有真的闲置够久才动手。
+ */
+let paneCleanupTimer: NodeJS.Timeout | null = null
+
+function schedulePaneCleanup() {
+  if (paneCleanupTimer) {
+    clearTimeout(paneCleanupTimer)
+    paneCleanupTimer = null
+  }
+  const cfg = config.get()
+  if (!manager || cfg.paneCleanup === false) return
+  const minutes = Math.max(1, Number(cfg.paneCleanupDelayMin) || 10)
+  const t = setTimeout(() => {
+    paneCleanupTimer = null
+    const keep = visiblePaneIds()
+    let closed = 0
+    for (const inst of manager?.list() ?? []) {
+      if (keep.includes(inst.paneId)) continue
+      manager?.kill(inst.paneId, true)
+      closed += 1
+    }
+    if (closed) {
+      console.log(`[pane] 已清理 ${closed} 个闲置分格（闲置超过 ${minutes} 分钟）`)
+      broadcastStatus()
+    }
+  }, minutes * 60_000)
+  t.unref?.()
+  paneCleanupTimer = t
+}
 
 async function syncInstances() {
   if (!manager || !browserInfo) return
@@ -679,6 +772,7 @@ async function syncInstances() {
   }
   finally {
     syncRunning = false
+    schedulePaneCleanup()
     if (syncPending) {
       syncPending = false
       setTimeout(() => void syncInstances(), 60)
@@ -729,6 +823,8 @@ async function bootstrap() {
   createPanelWindow()
   createTray()
   registerShortcuts()
+  // 点到面板外面（别的窗口 / 桌面）时通知渲染层收起 AI 列表
+  watchOutsideClicks()
 
   panelWindow?.once('ready-to-show', () => {
     showPanel()
@@ -796,6 +892,31 @@ let trayRebuild: (() => void) | null = null
 
 /* ---------------- IPC ---------------- */
 
+/**
+ * 只放行 http/https 地"用默认浏览器打开"。
+ *
+ * `shell.openExternal` 会把地址交给系统去挑默认程序，`file:`、`ms-msdt:`、
+ * `ms-settings:` 这类同样照单全收。"在浏览器里打开"这个入口的语义就只是网页，
+ * 别让它变成一条能启动本地程序的通道——AI 服务的地址是用户在设置里自己填的，
+ * 填错或被人塞进一条奇怪的地址时不该有这个口子。
+ */
+async function openExternalWeb(url: string): Promise<boolean> {
+  const raw = String(url || '')
+  let u: URL
+  try {
+    u = new URL(raw)
+  }
+  catch {
+    return false
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    console.warn(`[open-external] 已拦截非网页地址：${raw}`)
+    return false
+  }
+  await shell.openExternal(u.toString())
+  return true
+}
+
 function setupIpc() {
   ipcMain.handle('get-config', () => config.get())
   ipcMain.handle('get-app-info', async () => ({
@@ -835,8 +956,13 @@ function setupIpc() {
       }
       catch {}
     }
-    if (patch.position !== undefined || patch.windowWidthRatio !== undefined || patch.alwaysOnTop !== undefined) {
+    const alwaysOnTopChanged = before.alwaysOnTop !== next.alwaysOnTop
+    if (alwaysOnTopChanged) applyAlwaysOnTop()
+    if (patch.position !== undefined || patch.windowWidthRatio !== undefined || alwaysOnTopChanged) {
       applyPanelBounds()
+    }
+    if (patch.paneCleanup !== undefined || patch.paneCleanupDelayMin !== undefined) {
+      schedulePaneCleanup()
     }
     // 这些改动写进了浏览器的启动参数，必须重启实例才能生效——
     // 否则用户改了代理/窗口形态却看不到任何反应，会以为是坏的
@@ -913,7 +1039,7 @@ function setupIpc() {
         manager?.focus(paneId)
         break
       case 'open-external':
-        if (ai) shell.openExternal(ai.url)
+        if (ai) await openExternalWeb(ai.url)
         break
       case 'restart':
         manager?.kill(paneId)
@@ -964,14 +1090,11 @@ function setupIpc() {
   })
   ipcMain.handle('test-proxy', async (_e, proxy: any, url: string) => testProxy(proxy, url))
   ipcMain.handle('open-path', (_e, p: string) => shell.openPath(p))
-  ipcMain.handle('open-external', (_e, url: string) => shell.openExternal(url))
+  ipcMain.handle('open-external', (_e, url: string) => openExternalWeb(url))
 
-  ipcMain.handle('set-always-on-top', (_e, _value: boolean) => {
-    // 面板必须始终置顶（它要把顶栏/悬浮胶囊画在浏览器窗口之上），这里不再提供关闭
-    config.update({ alwaysOnTop: true })
-    panelWindow?.setAlwaysOnTop(true)
-    manager?.setTopMost(true)
-    manager?.raiseAll()
+  ipcMain.handle('set-always-on-top', (_e, value: boolean) => {
+    config.update({ alwaysOnTop: !!value })
+    applyAlwaysOnTop()
     broadcastConfig()
   })
 }
@@ -1084,21 +1207,48 @@ app.on('before-quit', () => {
   isQuitting = true
 })
 
-app.on('will-quit', () => {
+/**
+ * 退出流程。
+ *
+ * 不能像以前那样在 `will-quit` 里同步干完：`killAll()` 只是给浏览器窗口发 `WM_CLOSE`，
+ * 那一刻浏览器进程还活着，Cache / Code Cache 这些文件仍被占着，删不掉，
+ * 而且浏览器走完自己的退出流程时还会把它们再写回去 —— "退出时清理"等于白做。
+ * 改成先关窗口、等浏览器进程真的退出、再动手删，最后自己调 `app.exit()` 收尾。
+ */
+let quitFinalized = false
+app.on('will-quit', (e) => {
+  if (quitFinalized) return
+  quitFinalized = true
   stopAnim()
   globalShortcut.unregisterAll()
-  manager?.killAll()
-  // 浏览器进程刚被杀掉，此刻缓存文件才腾得出手来删。
-  // "退出时清理"选的就是这条时机，删不干净的（极少数被系统占着的）下次启动还会补一刀。
-  if (config?.get().cacheCleanup === 'exit') {
+  manager?.dispose()
+  // 为了装更新而退出时别插手：安装程序已经拉起来了，只等本进程结束，
+  // 我们再把退出延后（甚至自己 app.exit）只会拖住它、甚至把它打断
+  if (isQuittingForUpdate()) {
+    manager?.killAll()
+    return
+  }
+  e.preventDefault()
+  void (async () => {
     try {
-      const r = clearProfileCacheSync(profilesRoot(app.getPath('userData')))
-      console.log(`[cache] 退出清理：释放 ${humanSize(r.removedBytes)}`)
+      // 4 秒足够浏览器优雅落盘；超时就强杀，不能让退出卡死
+      await manager?.shutdownAll(4000)
+      // 浏览器进程已经没了，此刻缓存文件才腾得出手来删。
+      // "退出时清理"选的就是这条时机，删不干净的（极少数被系统占着的）下次启动还会补一刀。
+      if (config?.get().cacheCleanup === 'exit') {
+        const r = clearProfileCacheSync(profilesRoot(app.getPath('userData')))
+        console.log(`[cache] 退出清理：释放 ${humanSize(r.removedBytes)}`)
+      }
     }
     catch (e) {
       console.warn('[cache] 退出清理失败', e)
     }
-  }
+    finally {
+      // 退出已经被 preventDefault 拦下了，必须自己收尾，
+      // 否则中途任何一步抛异常都会把进程永久留在"退不掉"的状态
+      app.exit(0)
+    }
+  })()
 })
 
 app.on('window-all-closed', () => {

@@ -48,6 +48,20 @@ let manualPending = false
 
 let changeHook: ((s: UpdateState, prevStatus: UpdateStatus) => void) | null = null
 
+/**
+ * 是否正在为"装更新"而退出。
+ *
+ * `quitAndInstall` 会先把安装程序拉起来、再让应用退出，安装程序要等本进程结束。
+ * 主进程那边为了清缓存把退出延后了几秒，这里就得多等几秒；
+ * 万一它自己 `app.exit()` 提前收尾，还可能把安装打断。所以装更新的退出走原路。
+ */
+let quittingForUpdate = false
+
+/** 供主进程在退出流程里判断"这次退出是不是为了装更新" */
+export function isQuittingForUpdate() {
+  return quittingForUpdate
+}
+
 function setState(patch: Partial<UpdateState>) {
   const prevStatus = state.status
   state = { ...state, ...patch, current: app.getVersion() }
@@ -134,7 +148,7 @@ export function initUpdater() {
   })
 
   autoUpdater.on('error', (err) => {
-    const msg = String(err?.message ?? err)
+    const msg = friendlyError(err)
     setState({ status: 'error', message: msg })
     if (manualPending) {
       manualPending = false
@@ -146,6 +160,27 @@ export function initUpdater() {
   setTimeout(() => { void checkForUpdates(false) }, 6000)
   // 之后每 6 小时查一次
   setInterval(() => { void checkForUpdates(false) }, 6 * 3600 * 1000)
+}
+
+/**
+ * 把更新器那串英文堆栈翻成人话。
+ *
+ * 最常撞到的是这一条：GitHub Release 里没上传 `latest.yml`（它就是更新索引，
+ * electron-updater 靠它知道最新版是哪个、差分块在哪）。少了它，检查更新必然
+ * 报 404 ——内容是一页 rcedit / builder-util-runtime 的堆栈，用户完全读不懂。
+ */
+function friendlyError(err: unknown): string {
+  const raw = String((err as any)?.message ?? err)
+  if (/latest(-[a-z0-9]+)?\.yml/i.test(raw) && /404/.test(raw)) {
+    return '发布里缺更新索引 latest.yml，暂时无法在线升级；请到 GitHub Releases 下载安装包手动覆盖安装'
+  }
+  if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|network|proxy/i.test(raw)) {
+    return `网络不通：${raw.split('\n')[0]}`
+  }
+  if (/Update feed URL/i.test(raw)) {
+    return '未找到更新配置（只有打包版才带），开发态不支持检查更新'
+  }
+  return raw
 }
 
 export function checkForUpdates(manual: boolean) {
@@ -187,6 +222,7 @@ function promptInstall(version: string) {
   const cb = (res: number) => {
     if (res === 0) {
       installPrompted = false
+      quittingForUpdate = true
       autoUpdater.quitAndInstall(false, true)
     }
   }
@@ -229,6 +265,7 @@ export const updater = {
   installIfReady(): boolean {
     if (state.status === 'downloaded') {
       installPrompted = false
+      quittingForUpdate = true
       autoUpdater.quitAndInstall(false, true)
       return true
     }

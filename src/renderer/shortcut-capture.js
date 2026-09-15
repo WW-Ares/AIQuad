@@ -218,7 +218,14 @@
 
   const registry = new WeakMap()
 
-  function init(root) {
+  /**
+   * @param root  作用域（默认 document）
+   * @param hooks { onIdle } 录制结束（抓到键 / Esc 取消 / 失焦）后回调一次。
+   *   ⚠️ 必须回调：这个控件自己只会在录制/报错时写状态栏，结束后不吱声的话，
+   *   那句"录制中…"或红色警告就会**一直挂在页面上**——点 Esc 取消、按了不合规的键
+   *   再放弃录制，都会留下一条过期提示。交给外面重新校验一遍才能给出当前真状态。
+   */
+  function init(root, hooks) {
     const scope = root || document
     const list = scope.querySelectorAll('.sc-input')
     for (const el of list) {
@@ -234,7 +241,13 @@
           }
           else if (state === 'rec') {
             status.className = 'sc-status warn'
-            status.textContent = '录制中…按 Esc 取消，Backspace 清除'
+            status.textContent = '录制中：按 Esc 取消，Backspace 清除'
+          }
+          else {
+            // 录制结束：先把这个控件自己的提示收掉，再请外面重新校验四个框
+            status.className = 'sc-status'
+            status.textContent = ''
+            hooks?.onIdle?.(input)
           }
         },
       }))

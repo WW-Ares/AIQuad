@@ -1,7 +1,7 @@
 {
   "name": "aiquad",
-  "version": "0.4.8",
-  "description": "AIQuad - 用真实 Chrome/Edge 驱动的多 AI 并排对话面板，1/2/4 分格同开、登录态跨格共享",
+  "version": "0.4.9",
+  "description": "",
   "main": "dist/main/index.js",
   "author": "WW-Ares and AI collaborators",
   "license": "MIT",

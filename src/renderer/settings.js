@@ -80,6 +80,9 @@ function scStatus(text, kind) {
  * "有没有被别的程序占用"必须问主进程（只有它能试注册）。
  */
 async function validateShortcuts() {
+  // 认领本轮序号：并发的几轮里只有最后一轮能写状态栏，
+  // 否则晚回来的旧结论会盖掉新结论，页面上留着一条已经过期的话
+  const seq = ++validateSeq
   const seen = new Map()
   const localBad = new Set()
   let duplicateMsg = ''
@@ -121,6 +124,8 @@ async function validateShortcuts() {
       return { f, acc, res: { ok: true, err: String(e) } }
     }
   }))
+  // 探测期间又发起了新一轮（用户还在按键）：这一轮的结果已经过期，直接作废
+  if (seq !== validateSeq) return false
 
   const takenList = probes.filter((p) => p.acc && p.res && p.res.ok === false)
   for (const p of probes) {
@@ -140,7 +145,9 @@ async function validateShortcuts() {
 /** 把主进程回报的注册失败原因显示出来 */
 function renderShortcutIssues(issues) {
   if (!Array.isArray(issues) || !issues.length) {
-    if ($('sc-status').className !== 'sc-status err') return
+    // 之前这里两个分支都是 return（写错成空操作）：主进程这次没报问题，
+    // 但页面上很可能还挂着上一轮的红字。既然是"没有失败项"，就把红字收掉。
+    if ($('sc-status').className.includes('err')) scStatus('')
     return
   }
   const text = issues.map((i) => {
@@ -154,6 +161,37 @@ function renderShortcutIssues(issues) {
     if (f) $(f.id).classList.add('bad')
   }
   scStatus(text, 'err')
+}
+
+/**
+ * 校验的合并入口。
+ *
+ * 一次"抓到快捷键"会连着触发两轮校验：控件 onIdle 一次、input 的 change 一次。
+ * 两次都去问主进程（试注册）没有必要，而且它们并发跑完的先后顺序不保证——
+ * 晚回来的那个会覆盖早回来的，状态栏可能停在一个已经过期的结论上。
+ * 所以合并到一个短防抖里，并且只认最后一次的结果（见 validateShortcuts 里的 seq 判断）。
+ */
+let validateTimer = null
+let validateSeq = 0
+/** 等这轮校验跑完要做的事（目前只有"通过了就保存"） */
+let validateCbs = []
+function scheduleValidate(delay = 30, done) {
+  if (typeof done === 'function') validateCbs.push(done)
+  if (validateTimer) clearTimeout(validateTimer)
+  validateTimer = setTimeout(async () => {
+    validateTimer = null
+    const cbs = validateCbs
+    validateCbs = []
+    const ok = await validateShortcuts()
+    for (const cb of cbs) {
+      try {
+        cb(ok)
+      }
+      catch (e) {
+        console.warn('[settings] 校验回调出错', e)
+      }
+    }
+  }, delay)
 }
 
 function ratioPercent() {
@@ -174,8 +212,11 @@ function fill() {
   setRadio('position', cfg.position)
   $('ratio').value = ratioPercent()
   $('ratio-val').textContent = `${ratioPercent()}%`
-  // 面板必须置顶才能压住浏览器窗口（顶栏、悬浮胶囊都画在面板上），恒为 true
-  $('opt-ontop').checked = true
+  // 面板必须置顶才能压住浏览器窗口（顶栏、悬浮胶囊都画在面板上）时那条硬约束已放开：
+  // 现在交给用户选，关掉之后面板就是一个普通窗口
+  $('opt-ontop').checked = cfg.alwaysOnTop !== false
+  $('opt-cleanup').checked = cfg.paneCleanup !== false
+  $('cleanup-min').value = cfg.paneCleanupDelayMin || 10
   $('opt-autostart').checked = !!cfg.autoStart
   $('opt-hibernate').checked = !!cfg.hibernateBackground
 
@@ -329,6 +370,7 @@ function renderAiRows() {
     inName.addEventListener('change', () => {
       const cur = findAi(ai.id)
       if (cur) cur.name = inName.value
+      scheduleSave(200)
     })
     tdName.appendChild(inName)
 
@@ -338,6 +380,7 @@ function renderAiRows() {
     inUrl.addEventListener('change', () => {
       const cur = findAi(ai.id)
       if (cur) cur.url = inUrl.value
+      scheduleSave(200)
     })
     tdUrl.appendChild(inUrl)
 
@@ -353,6 +396,7 @@ function renderAiRows() {
     cat.addEventListener('change', () => {
       const cur = findAi(ai.id)
       if (cur) cur.category = cat.value
+      scheduleSave(0)
     })
     tdCat.appendChild(cat)
 
@@ -372,6 +416,7 @@ function renderAiRows() {
       if (cur.proxyMode === 'custom' && !cur.proxy) {
         cur.proxy = { mode: 'custom', type: 'http', host: '', port: '', bypassList: '' }
       }
+      scheduleSave(0)
       renderAiRows()
     })
     tdProxy.appendChild(sel)
@@ -423,21 +468,27 @@ function renderAiRows() {
         sel2.appendChild(o)
       }
       sel2.addEventListener('change', () => {
-        ai.proxy.type = sel2.value
+        const cur = findAi(ai.id)?.proxy
+        if (cur) cur.type = sel2.value
+        scheduleSave(0)
       })
       const host = document.createElement('input')
       host.placeholder = '127.0.0.1'
       host.style.width = '140px'
       host.value = ai.proxy?.host || ''
       host.addEventListener('change', () => {
-        ai.proxy.host = host.value
+        const cur = findAi(ai.id)?.proxy
+        if (cur) cur.host = host.value
+        scheduleSave(150)
       })
       const port = document.createElement('input')
       port.placeholder = '端口'
       port.style.width = '90px'
       port.value = ai.proxy?.port || ''
       port.addEventListener('change', () => {
-        ai.proxy.port = port.value
+        const cur = findAi(ai.id)?.proxy
+        if (cur) cur.port = port.value
+        scheduleSave(150)
       })
       td.append(document.createTextNode(' 单独代理：'), sel2, host, port)
       tr2.appendChild(td)
@@ -463,11 +514,30 @@ function collect() {
   cfg.position = getRadio('position') || 'right'
   cfg.windowWidthRatio = Number($('ratio').value || 30) / 100
   cfg.cacheCleanup = $('cache-mode').value || 'auto'
-  // 恒为 true：面板压不住浏览器窗口的话顶栏就会被浏览器的标题栏盖掉
-  cfg.alwaysOnTop = true
+  // 面板要不要压在别的程序之上，由用户决定（早先恒为 true）
+  cfg.alwaysOnTop = $('opt-ontop').checked
   cfg.autoStart = $('opt-autostart').checked
   cfg.hibernateBackground = $('opt-hibernate').checked
+  cfg.paneCleanup = $('opt-cleanup').checked
+  cfg.paneCleanupDelayMin = Math.min(120, Math.max(1, Number($('cleanup-min').value) || 10))
   return cfg
+}
+
+/**
+ * 自动保存（取代原来的"保存并应用"按钮）。
+ *
+ * 合到一次 tick 里发：同一个控件连续改动（或一次 `change` 里连着改几项）只会有一次 IPC。
+ * 延迟不为零是有意的——保存会把配置写给主进程，代理 / 浏览器这类改动还要连带
+ * 重启实例，在一串改动的中途反复触发没有意义。
+ */
+let autoSaveTimer = null
+let saveFlashTimer = null
+function scheduleSave(delay = 200) {
+  if (autoSaveTimer) clearTimeout(autoSaveTimer)
+  autoSaveTimer = setTimeout(() => {
+    autoSaveTimer = null
+    void save(false)
+  }, delay)
 }
 
 async function save(showResult = true) {
@@ -483,10 +553,15 @@ async function save(showResult = true) {
     if (showResult) {
       r.textContent = res?.shortcutIssues?.length ? '已保存，但有快捷键没生效' : '已保存并应用'
       r.className = res?.shortcutIssues?.length ? 'result err' : 'result ok'
-      setTimeout(() => {
-        r.textContent = ''
-      }, 2500)
+      if (saveFlashTimer) clearTimeout(saveFlashTimer)
+      saveFlashTimer = setTimeout(() => { r.textContent = '' }, 2500)
+      return
     }
+    // 后台自动保存：给一个很快就淡掉的提示，让用户知道改动已经落盘了
+    r.textContent = res?.shortcutIssues?.length ? '已自动保存，但有快捷键没生效' : '已自动保存'
+    r.className = res?.shortcutIssues?.length ? 'result err' : 'result ok'
+    if (saveFlashTimer) clearTimeout(saveFlashTimer)
+    saveFlashTimer = setTimeout(() => { r.textContent = '' }, 1600)
   }
   catch (e) {
     // 任何一步失败都要**说出来**。以前这里静默失败，用户只能看到"改了没反应"，
@@ -501,20 +576,23 @@ async function init() {
   cfg = await api.getConfig()
   info = await api.getAppInfo()
 
-  // 快捷键抓取控件必须在 fill() 之前初始化，否则 fill() 设的值会被覆盖
-  if (window.ShortcutCapture) ShortcutCapture.init(document)
+  // 快捷键抓取控件必须在 fill() 之前初始化，否则 fill() 设的值会被覆盖。
+  // onIdle：录制结束（抓到键 / Esc 取消 / 失焦）后重新校验一遍，
+  // 不然那句"录制中"或红色警告会一直挂在页面上。
+  if (window.ShortcutCapture) ShortcutCapture.init(document, { onIdle: () => scheduleValidate() })
   fill()
 
-  $('btn-save').addEventListener('click', () => save(true))
+  bindAutoSave()
 
   // 抓取到一个组合后：先本地校验（重复/缺修饰键），再问主进程（是否被占用），
   // 都过了才自动保存，让用户当场就能按下去试。
   for (const f of SC_FIELDS) {
     const el = document.getElementById(f.id)
     if (!el) continue
-    el.addEventListener('change', async () => {
-      const ok = await validateShortcuts()
-      if (ok) await save(false)
+    // 也走防抖：抓一次键会同时触发 onIdle 与 change，各自起一轮校验的话，
+    // 先跑的那轮会被序号判为过期，保存就被吞掉了。合到一轮里，跑完再决定存不存。
+    el.addEventListener('change', () => {
+      scheduleValidate(30, (ok) => { if (ok) void save(false) })
     })
   }
   // 启动时注册失败的项（比如组合已被系统占用）也要显示出来
@@ -599,6 +677,31 @@ async function init() {
   // 位置 / 宽度比例改动后立即预览效果
   for (const r of document.querySelectorAll('input[name="position"]')) {
     r.addEventListener('change', () => save(false))
+  }
+}
+
+/* ---------------- 自动保存 ---------------- */
+
+/**
+ * 所有改动即时落盘，没有"保存并应用"这一步了。
+ *
+ * 下拉 / 勾选 / 单选：change 立刻存。
+ * 文本框：只在 change（失焦或回车）时存，**不监听 input** —— 代理主机、端口这类
+ * 字段一改动就会触发浏览器实例重启，边打字边重启是不可接受的。
+ */
+function bindAutoSave() {
+  const instant = ['proxy-mode', 'proxy-type', 'browser-pref', 'window-mode', 'opt-shared']
+  const text = ['proxy-host', 'proxy-port', 'proxy-bypass', 'browser-path', 'cleanup-min']
+  const toggles = ['opt-ontop', 'opt-autostart', 'opt-hibernate', 'opt-cleanup']
+
+  for (const id of instant) {
+    document.getElementById(id)?.addEventListener('change', () => scheduleSave(0))
+  }
+  for (const id of toggles) {
+    document.getElementById(id)?.addEventListener('change', () => scheduleSave(0))
+  }
+  for (const id of text) {
+    document.getElementById(id)?.addEventListener('change', () => scheduleSave(150))
   }
 }
 

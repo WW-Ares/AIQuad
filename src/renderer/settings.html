@@ -13,7 +13,7 @@
       <div class="row">
         <label>呼出快捷键</label>
         <input id="sc-toggle" class="sc-input" style="width:180px" readonly title="点击后按下组合键" />
-        <span class="muted">点击后按下组合键自动抓取；默认 <kbd>Alt+Space</kbd>。<kbd>Esc</kbd> 取消 · <kbd>Backspace</kbd> 清除（= 禁用该键）</span>
+        <span class="muted">点一下框，再按组合键；<kbd>Esc</kbd> 取消，<kbd>Backspace</kbd> 清除</span>
       </div>
       <div class="row">
         <label>停靠位置</label>
@@ -25,32 +25,35 @@
       <div class="row">
         <label>面板宽度</label>
         <div class="seg" id="ratio-presets">
-          <button type="button" data-ratio="20">窄 · 20%</button>
-          <button type="button" data-ratio="30">标准 · 30%</button>
-          <button type="button" data-ratio="40">宽 · 40%</button>
-          <button type="button" data-ratio="50">半屏 · 50%</button>
+          <button type="button" data-ratio="20">20%</button>
+          <button type="button" data-ratio="30">30%</button>
+          <button type="button" data-ratio="40">40%</button>
+          <button type="button" data-ratio="50">50%</button>
         </div>
-      </div>
-      <div class="row">
-        <label>自定义</label>
-        <input type="range" id="ratio" min="20" max="60" step="1" value="30" style="width:220px" />
-        <span class="muted"><b id="ratio-val">30%</b> · <span id="ratio-px">约 – px</span> · 高度为屏幕全高</span>
+        <input type="range" id="ratio" min="20" max="60" step="1" value="30" style="width:160px" />
+        <span class="muted"><b id="ratio-val">30%</b> · <span id="ratio-px">约 – px</span></span>
       </div>
       <div class="row">
         <label>分格切换</label>
         <input id="sc-1" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
         <input id="sc-2" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
         <input id="sc-4" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
-        <span class="muted">依次对应 1 / 2 / 4 格（竖长面板不适合三段，故不提供 3 格）。默认留空，用顶栏按钮切；想要快键就在框里按一下</span>
+        <span class="muted">依次对应 1 / 2 / 4 格，可留空</span>
       </div>
       <div class="sc-status-row"><span id="sc-status" class="sc-status"></span></div>
       <div class="row">
         <label>窗口行为</label>
         <div class="radios">
-          <label class="radio"><input type="checkbox" id="opt-ontop" disabled checked /> 始终置顶（面板与分格里的网页作为整体置顶，不可关闭）</label>
+          <label class="radio"><input type="checkbox" id="opt-ontop" /> 始终置顶<em>（面板钉在其它窗口之上）</em></label>
           <label class="radio"><input type="checkbox" id="opt-autostart" /> 开机自动启动</label>
-          <label class="radio"><input type="checkbox" id="opt-hibernate" /> 后台分格休眠以节省内存</label>
+          <label class="radio"><input type="checkbox" id="opt-hibernate" /> 后台分格休眠<em>（省 CPU，不省内存；共享登录态下无效）</em></label>
         </div>
+      </div>
+      <div class="row">
+        <label>闲置分格</label>
+        <label class="radio"><input type="checkbox" id="opt-cleanup" /> 清理当前布局用不到的分格</label>
+        <input type="number" id="cleanup-min" min="1" max="120" step="1" style="width:64px" />
+        <span class="muted">分钟后关闭，真正把内存还回来（重新切回多格要重开一次）</span>
       </div>
     </div>
 
@@ -85,10 +88,7 @@
         <button id="btn-test-proxy">测试</button>
         <span class="result" id="proxy-result"></span>
       </div>
-      <div class="muted">可为每个 AI 单独指定代理策略（见下方列表）：海外 AI 走代理、国内 AI 直连，既提速又省额度。
-        修改代理后，对应浏览器实例会自动重启生效。<br>
-        <b>注意</b>：开启「登录态共享」时所有分格属于同一个浏览器进程，代理是进程级设置，
-        此时只有<b>全局代理</b>生效；需要按 AI 分别走代理，请在「浏览器内核」里关闭登录态共享。</div>
+      <div class="muted">改动会自动重启受影响的实例；下表的「单独代理」只在关掉登录态共享后可生效（同一进程只能有一个代理）。</div>
     </div>
 
     <h2>AI 服务</h2>
@@ -119,8 +119,7 @@
         </select>
         <button id="btn-add-ai">添加</button>
       </div>
-      <div class="muted">分组决定它在分格底部选择器里的归类（国外 / 国内）。
-        隐藏只把它从选择器里摘掉，已经开着的格子不受影响；删除才会连同它的名字、网址一起丢掉。</div>
+      <div class="muted">分组决定它在分格底部选择器里的归类；隐藏只是从选择器里摘掉，已经开着的格子不受影响。</div>
     </div>
 
     <h2>数据与缓存</h2>
@@ -128,26 +127,20 @@
       <div class="row">
         <label>浏览器档案</label>
         <span class="muted" id="cache-stat">统计中…</span>
-        <button id="btn-clear-cache">清理缓存（保留登录态）</button>
+        <button id="btn-clear-cache">清理缓存</button>
         <span class="result" id="cache-result"></span>
       </div>
       <div class="row">
         <label>自动清理</label>
         <select id="cache-mode">
-          <option value="auto">缓存超过 500MB 时，下次启动自动清理</option>
+          <option value="auto">缓存超过 500MB 时，下次启动清理</option>
           <option value="exit">退出程序时清理</option>
-          <option value="off">不自动清理（只手动）</option>
+          <option value="off">不自动清理，只手动</option>
         </select>
       </div>
       <div class="muted" id="cache-detail"></div>
-      <div class="muted">
-        每格都是一份真实的 Chrome / Edge 档案，里面除了登录态，绝大部分是浏览器随时能再生成的缓存：
-        <code>Cache</code>、<code>Code Cache</code>、着色器缓存。挂久了单份能涨到几百 MB。<br>
-        清理只删这几类目录，<b>Cookies / Local Storage / IndexedDB 一律不动</b>，已经登录的 AI 站不会被踢下线。<br>
-        你在对话里上传的图片和文件由各 AI 站点自己保管（在它们的服务器上），不进这些缓存目录；
-        它们的大小不受这里清理的影响。<br>
-        浏览器正在运行时，一部分缓存文件被占着删不掉，这类会跳过并在下次启动补齐，不影响使用。
-      </div>
+      <div class="muted">每格是一份真实浏览器档案，可清的就是 <code>Cache</code>、<code>Code Cache</code>、着色器缓存这几类能自动重生成的目录；
+        Cookies 与 Local Storage 一律不动，不会掉登录。运行中被占用的文件会跳过，下次启动补上。</div>
     </div>
 
     <h2>浏览器内核</h2>
@@ -164,32 +157,24 @@
       <div class="row">
         <label>窗口形态</label>
         <select id="window-mode">
-          <option value="standard">标准浏览器窗口（推荐，登录兼容性最好）</option>
-          <option value="app">应用窗口（无工具栏，但可能被 Google 判定为内嵌浏览器）</option>
+          <option value="standard">标准浏览器窗口（推荐）</option>
+          <option value="app">应用窗口（无工具栏）</option>
         </select>
+        <span class="muted">标准窗口的标签栏与地址栏会被裁到分格之外</span>
       </div>
       <div class="row">
         <label>登录态共享</label>
         <div class="radios">
-          <label class="radio"><input type="checkbox" id="opt-shared" /> 所有分格共用同一份浏览器档案（推荐）</label>
+          <label class="radio"><input type="checkbox" id="opt-shared" /> 所有分格共用同一份档案<em>（一处登录，处处生效）</em></label>
         </div>
       </div>
       <div class="row">
         <label>自定义路径</label>
         <input id="browser-path" class="grow" placeholder="留空则自动探测" />
-        <button id="btn-open-profiles">打开用户档案目录</button>
+        <button id="btn-open-profiles">打开档案目录</button>
       </div>
-      <div class="muted">
-        <b>标准浏览器窗口</b>下，浏览器会以普通窗口启动（<code>display-mode: browser</code>，与手动打开浏览器完全一致），
-        其标签栏与地址栏随后被自动裁剪到分格之外，所以外观依然是一张干净的网页。<br>
-        <b>应用窗口</b>使用 <code>--app</code> 模式，虽然天生没有工具栏，但页面能通过
-        <code>matchMedia('(display-mode: standalone)')</code> 识别出自己运行在应用窗口里，
-        Google 等站点会据此拒绝登录。<br>
-        <b>登录态共享</b>开启时，所有分格属于同一个浏览器进程、共用一份档案：
-        在任意一格登录后，其它格立即继承，不用重复登录。
-        代价是代理只能走全局设置，且做不到"一格一个账号"；需要按 AI 分别走代理或分账号登录时再关掉它。
-        浏览器升级后如果路径变化，应用会重新探测，无需手动指定。
-      </div>
+      <div class="muted">关掉登录态共享后每个分格独立进程，才能按 AI 分别设代理或登录不同账号，代价是内存占用翻倍。
+        应用窗口虽无工具栏，但页面能识别出自己是应用窗口，Google 等站点可能拒绝登录。</div>
     </div>
 
     <h2>关于</h2>
@@ -199,7 +184,7 @@
         <a href="#" data-open="https://github.com/WW-Ares/AIQuad">GitHub 仓库</a>
         <a href="#" data-open="https://github.com/WW-Ares/AIQuad/issues">问题反馈</a>
         <a href="#" data-open="https://github.com/WW-Ares/AIQuad/releases">版本历史</a>
-        <a href="#" data-open="https://github.com/WW-Ares/WSight">WSight（同作者的桌面悬浮组件）</a>
+        <a href="#" data-open="https://github.com/WW-Ares/WSight">WSight</a>
       </div>
       <div class="muted" id="about-oss"></div>
       <div class="row" style="margin-top:10px">
@@ -208,8 +193,7 @@
       </div>
     </div>
 
-    <div class="row" style="margin-bottom:30px">
-      <button id="btn-save" style="padding:6px 16px">保存并应用</button>
+    <div class="row" style="margin-bottom:24px">
       <span class="result" id="save-result"></span>
     </div>
   </div>

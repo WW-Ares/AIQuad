@@ -3,7 +3,7 @@ import path from 'node:path'
 import type { AiService, AppConfig } from './types'
 import { normalizeAccelerator } from './accelerator'
 
-const CONFIG_VERSION = 4
+const CONFIG_VERSION = 5
 
 /**
  * 早期版本给"分格切换"预设了 Ctrl+Alt+1/2/4，实际会和其它软件抢键，
@@ -65,6 +65,9 @@ export function defaultConfig(): AppConfig {
     sharedSession: true,
     alwaysOnTop: true,
     hibernateBackground: false,
+    // 用不到的分格先藏着，闲置 10 分钟就真的关掉（页面才是内存大头）
+    paneCleanup: true,
+    paneCleanupDelayMin: 10,
     autoStart: false,
     browserPreference: 'auto',
     customBrowserPath: '',
@@ -114,7 +117,7 @@ export class ConfigStore {
    * 兼容旧版本配置：补齐分组、图标等新增字段，修正非法的布局值。
    * 否则旧配置里的 AI 项会因缺少 category 而无法在切换器中显示。
    */
-  private normalize() {
+  normalize() {
     const builtin = new Map(DEFAULT_AI.map((a) => [a.id, a]))
     const seen = new Set<string>()
     this.data.aiList = this.data.aiList
@@ -168,6 +171,11 @@ export class ConfigStore {
     }
     if (!['off', 'auto', 'exit'].includes(this.data.cacheCleanup)) this.data.cacheCleanup = 'auto'
 
+    this.data.paneCleanup = this.data.paneCleanup !== false
+    const delay = Number(this.data.paneCleanupDelayMin)
+    // 太小等于"一切就关"（来回切布局要重开浏览器），太大就失去意义
+    this.data.paneCleanupDelayMin = Number.isFinite(delay) ? Math.min(120, Math.max(1, Math.round(delay))) : 10
+
     const ratio = Number(this.data.windowWidthRatio)
     if (!Number.isFinite(ratio) || ratio < 0.15 || ratio > 0.9) this.data.windowWidthRatio = 0.3
 
@@ -214,8 +222,16 @@ export class ConfigStore {
     return this.data
   }
 
+  /**
+   * 顶层浅合并后立刻过一遍 normalize。
+   *
+   * 不校验的话，任何越界值（比例填了 5、布局写成 '3'）都会直接落到磁盘和正在跑的
+   * 界面上，要等下次启动才被纠正——那之前面板就是坏的。取舍和 load() 一致：
+   * 宁可悄悄修正，也不要带病运行。
+   */
   update(patch: Partial<AppConfig>): AppConfig {
     this.data = { ...this.data, ...patch, version: CONFIG_VERSION }
+    this.normalize()
     this.save()
     return this.data
   }

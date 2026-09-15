@@ -425,6 +425,8 @@ kbd {
   overflow-y: auto;
   height: 100%;
   user-select: text;
+  /* 窗口能拉到很宽，正文限制一下行宽，长句子不至于一路横到屏幕边上 */
+  max-width: 1060px;
 }
 .settings h2 {
   font-size: 14px;
@@ -491,6 +493,12 @@ kbd {
   cursor: pointer;
 }
 .radio input { accent-color: var(--accent); cursor: pointer; margin: 0; }
+/* 选项后面那截补充说明（<em>）：比正文弱一级，但不用斜体/不用括号喊 */
+.radio em {
+  font-style: normal;
+  color: var(--text-dim);
+  margin-left: 1px;
+}
 
 .settings table { width: 100%; border-collapse: collapse; }
 .settings th,

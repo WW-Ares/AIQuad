@@ -1,5 +1,16 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+/** 渲染层允许订阅的推送频道 */
+const PUSH_CHANNELS = [
+  'config-updated',
+  'instances-updated',
+  'request-rects',
+  'panel-shown',
+  'outside-click',
+  'layout-changed',
+  'update-status',
+]
+
 const api = {
   getConfig: () => ipcRenderer.invoke('get-config'),
   getAppInfo: () => ipcRenderer.invoke('get-app-info'),
@@ -33,7 +44,17 @@ const api = {
   /** 清理上述缓存（保留 Cookies / Local Storage，登录态不受影响） */
   clearCache: () => ipcRenderer.invoke('clear-cache'),
   setAlwaysOnTop: (v: boolean) => ipcRenderer.invoke('set-always-on-top', v),
+  /**
+   * 订阅主进程推送。
+   *
+   * 只放行下面这些频道：放行任意频道等于让渲染层能顺手监听内部消息
+   * （包括只该给主进程看的那些），属于没必要的暴露面。
+   */
   on: (channel: string, fn: (...args: any[]) => void) => {
+    if (!PUSH_CHANNELS.includes(channel)) {
+      console.warn(`[preload] 拒绝订阅未开放的频道：${channel}`)
+      return () => {}
+    }
     const listener = (_e: any, ...args: any[]) => fn(...args)
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)

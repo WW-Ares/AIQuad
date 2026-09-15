@@ -93,6 +93,22 @@ async function main() {
   const origPct = Math.round((origCfg.windowWidthRatio || 0.3) * 100)
   const targetPct = origPct >= 45 ? 35 : 45
 
+  /**
+   * "AI 隐藏"这一组用例的前提是**起跑时没有隐藏项**。
+   *
+   * 上一轮跑失败时配置里可能留下 `hidden`，于是"只隐藏了这一个"必然不成立，
+   * 而"再点一次恢复可见"会去点第一行（那行并没有被隐藏），永远等不到"没有隐藏项"，
+   * 失败就这么一轮一轮传染下去 —— 连收尾还原都会把那个残留再写回去。
+   * 所以起跑前清一次，并且**以清过的这份作为还原基线**。
+   */
+  let baseline = original
+  if (origCfg.aiList?.some((a) => a.hidden)) {
+    const clean = { ...origCfg, aiList: origCfg.aiList.map((a) => ({ ...a, hidden: false })) }
+    baseline = JSON.stringify(clean, null, 2)
+    fs.writeFileSync(CONFIG, baseline, 'utf8')
+    console.log('（起跑前清掉了遗留的 hidden 标记，收尾也按这份还原）')
+  }
+
   const env = { ...process.env, ELECTRON_ENABLE_LOGGING: '1' }
   delete env.ELECTRON_RUN_AS_NODE
   const child = spawn(ELECTRON, [`--remote-debugging-port=${PORT}`, ROOT], {
@@ -290,7 +306,7 @@ async function main() {
     await sleep(1200)
     // 还原用户原本的配置
     try {
-      fs.writeFileSync(CONFIG, original, 'utf8')
+      fs.writeFileSync(CONFIG, baseline, 'utf8')
       console.log('\n（已还原原始配置）')
     }
     catch {}
