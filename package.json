@@ -1,6 +1,6 @@
 {
   "name": "aiquad",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "",
   "main": "dist/main/index.js",
   "author": "WW-Ares and AI collaborators",
@@ -26,7 +26,9 @@
     "start": "npm run build && electron .",
     "dev": "electron .",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
-    "dist": "npm run clean && npm run build && electron-builder"
+    "dist": "npm run clean && npm run build && electron-builder",
+    "release:notes": "node scripts/release-notes.js",
+    "release:check": "node scripts/post-release-check.js"
   },
   "engines": {
     "node": ">=20"
