@@ -159,6 +159,57 @@ export function makeToolWindow(hwnd: number | bigint, refresh = false) {
   }
 }
 
+/**
+ * 摘掉浏览器窗口的"标题栏位 + 可调整边框"，让 DWM 不再给这扇窗画框架。
+ *
+ * 为什么必须摘：Win11 的原生窗口框架（那一圈 1px 外框线 + 右上角的 ✕）和系统背板一样，
+ * 是 **DWM 在合成阶段单独绘制的一层，不受 `SetWindowRgn` 约束**。分格里的浏览器外壳本来
+ * 是要整块裁掉的，偏偏这圈框线和那个 ✕ 照旧画在窗口矩形的边上；2 格 / 4 格布局里它们
+ * 正好落在相邻分格上，就是用户看到的「一条横线和一个 ✕ 入侵到上面那格」
+ * （2026-09-15 查实，0.4.10 关掉背板后剩下的就是这个）。
+ *
+ * 实测数据（`scripts/verify-clip-pixels.js` 的像素统计；采样带 761×92，
+ * 指标 = 带子顶部 4 行的"中性色像素"数，框线/按钮是中性色，棋盘格不是）：
+ *   基线（样式 0x16cf0000）        ：1543
+ *   只去 WS_THICKFRAME             ：1543  ← **一点没变**，它不是元凶
+ *   只去 WS_SYSMENU                ： 856
+ *   只去 WS_CAPTION                ： 851
+ *   **CAPTION + THICKFRAME 都去**  ：  59  ← 只剩棋盘格自己的抗锯齿噪声
+ *   再等 5 秒 / 再点一下激活分格    ：  59  ← Chrome 不会把它改回来
+ *   还原样式                       ：1543  ← 完全可逆
+ * 所以摘掉这两位就够了；SYSMENU / MIN / MAX 留着不碍事（实测与"全去"同值 59）。
+ *
+ * ⚠️ 唯一的副作用是好事：摘掉边框后窗口的外壳厚度会跟着变小
+ *    （实测 {8,96,7,7} → {6,96,7,6}），`verifyGeometry` 的第 ① 项会发现并重新定位。
+ *
+ * 返回 true 表示这次真的改了（本来就没这两位时不重复写，省掉一次 FRAMECHANGED 重排）。
+ */
+export function stripWindowFrame(hwnd: number | bigint) {
+  try {
+    const style = Number(GetWindowLongPtrW(hwnd, GWL_STYLE))
+    const want = (style & ~(WS_CAPTION | WS_THICKFRAME)) >>> 0
+    if (want === (style >>> 0)) return false
+    SetWindowLongPtrW(hwnd, GWL_STYLE, BigInt(want))
+    SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    return true
+  }
+  catch (e) {
+    console.warn('[win32] stripWindowFrame failed', e)
+    return false
+  }
+}
+
+/** 窗口样式里是否还留着会被 DWM 画成框架的位（看门狗据此核对） */
+export function windowHasFrame(hwnd: number | bigint): boolean {
+  try {
+    return (Number(GetWindowLongPtrW(hwnd, GWL_STYLE)) & (WS_CAPTION | WS_THICKFRAME)) !== 0
+  }
+  catch {
+    return false
+  }
+}
+
 /** 把浏览器窗口改成子窗口样式（仅用于嵌入验证脚本） */
 export function makeChildWindow(hwnd: number | bigint) {
   try {
@@ -433,6 +484,79 @@ export function windowRegionBox(hwnd: number | bigint) {  try {
   }
   catch {
     return null
+  }
+}
+
+/* ---------------- DWM 系统背板（Win11 那截"裁不掉的浏览器外壳"的元凶） ---------------- */
+
+/**
+ * Win11 会给窗口铺一层由 **DWM 自己绘制**的"系统背板"（Mica / Acrylic / Tabbed），
+ * 它是独立于窗口内容的一层，**不受 `SetWindowRgn` 约束**。
+ *
+ * 后果（2026-09-15 查实的现网 bug）：浏览器标准窗口自带约 96px 的标题栏+标签栏+地址栏，
+ * 我们靠 `SetWindowRgn` 把它从可视区裁掉——**Chrome 自己的内容确实被裁掉了**，可背板
+ * 那一层照旧铺满整窗。于是那一截在外观上变成一条**死板纯色**（跟着壁纸变：浅色壁纸下
+ * 是奶白色 `#F9F1EB`，另一个时刻是 `#F3F3F3`），并且照样盖在邻居上面。
+ *
+ * 为什么常年查不出来：`GetWindowRgn` / `PtInRegion` 读回来一切正常（区域确实设上了，
+ * 命中测试也确实生效），所有基于区域的自检都判"通过"。**只有采屏幕像素才看得见**。
+ * 这也解释了为什么它只在 Win11 复现：Win10 没有系统背板这一层。
+ *
+ * 关掉它的代价约等于零：这层只在"窗口可见"时有意义，而分格里的浏览器外壳本来就要被裁掉。
+ */
+const dwmapi = (() => {
+  try {
+    return koffi.load('dwmapi.dll')
+  }
+  catch (e) {
+    console.warn('[win32] dwmapi.dll 加载失败，系统背板只能听天由命', e)
+    return null
+  }
+})()
+const DwmSetWindowAttribute = dwmapi?.func('DwmSetWindowAttribute', 'int32', [HWND, UINT, 'uint8 *', UINT]) ?? null
+const DwmGetWindowAttribute = dwmapi?.func('DwmGetWindowAttribute', 'int32', [HWND, UINT, 'uint8 *', UINT]) ?? null
+
+/**
+ * `DWMWA_SYSTEMBACKDROP_TYPE`：Win11 22H2（build 22621）起才有。
+ * 老系统调用会返回 `E_INVALIDARG`，我们一律当"没有背板这回事"处理，什么都不做。
+ */
+const DWMWA_SYSTEMBACKDROP_TYPE = 38
+/** 背板类型：0 让系统自己挑（Win11 上会挑 Mica），1 就是不要背板 */
+export const DWMSBT_AUTO = 0
+export const DWMSBT_NONE = 1
+
+/** 读窗口当前的系统背板类型；读不到（Win10 / 老版本）返回 null */
+export function windowBackdropType(hwnd: number | bigint): number | null {
+  if (!DwmGetWindowAttribute) return null
+  try {
+    const buf = Buffer.alloc(4)
+    if (DwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, buf, 4) !== 0) return null
+    return buf.readUInt32LE(0)
+  }
+  catch {
+    return null
+  }
+}
+
+/** 这个窗口是不是还挂着会铺满整窗的背板（拿不准时返回 false，宁可不折腾） */
+export function windowBackdropIsPainted(hwnd: number | bigint): boolean {
+  const t = windowBackdropType(hwnd)
+  return t !== null && t !== DWMSBT_NONE
+}
+
+/**
+ * 关掉窗口的系统背板。返回 true 表示这次确实调成功了。
+ * Win10 上会返回 false —— 那边本来也没这层，属于正常情况，不要当失败刷日志。
+ */
+export function disableWindowBackdrop(hwnd: number | bigint): boolean {
+  if (!DwmSetWindowAttribute) return false
+  try {
+    const buf = Buffer.alloc(4)
+    buf.writeUInt32LE(DWMSBT_NONE, 0)
+    return DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, buf, 4) === 0
+  }
+  catch {
+    return false
   }
 }
 

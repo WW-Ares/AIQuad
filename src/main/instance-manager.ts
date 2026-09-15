@@ -10,6 +10,23 @@ import * as w32 from './win32'
 
 export type InstanceStatus = 'idle' | 'starting' | 'ready' | 'failed' | 'suspended'
 
+/**
+ * 负向对照开关（**只给回归脚本用**，正常运行绝不设置）。
+ *
+ * 置 1 时 `fixBackdrop` 故意什么都不做，让"被裁掉的浏览器外壳以纯色露在相邻分格上"
+ * 这个 bug 重新出现 —— 这样 `scripts/verify-clip-pixels.js` 才能证明
+ * "自己真的看得见这个 bug"，而不是永远报绿。
+ */
+const KEEP_BACKDROP = !!process.env.AIQUAD_TEST_KEEP_BACKDROP
+/**
+ * 同上，但只管"原生窗口框架"（外框线 + ✕）那一半，见 `fixFrame`。
+ *
+ * 为什么单独留一个：`AIQUAD_TEST_KEEP_BACKDROP=1` 会**同时**把两处修复都关掉，
+ * 那样量到的中性色像素是"背板纯色 + 框线"混在一起，没法单独验证框线判据。
+ * 只关这一个（背板照常修）就能量出"干干净净的框线"长什么样 —— 判据的阈值就是这么定的。
+ */
+const KEEP_FRAME = KEEP_BACKDROP || !!process.env.AIQUAD_TEST_KEEP_FRAME
+
 /** 网页内容区相对窗口左上角的偏移与内衬（物理像素） */
 export interface InstanceInsets {
   left: number
@@ -167,6 +184,16 @@ export class InstanceManager {
   /** 同一格反复被外部改动时的节流（见 verifyGeometry 的防打斗） */
   private repositionGuard = new Map<string, { count: number, since: number }>()
   private loopWarned = new Set<string>()
+  /** 已经就"系统背板又回来了"告警过的格子 */
+  private backdropWarned = new Set<string>()
+  /** 已经摘过原生窗口框架并打过日志的窗口（见 fixFrame） */
+  private frameLogged = new Set<number>()
+  /** 已经就"原生窗口框架又回来了"告警过的格子 */
+  private frameWarned = new Set<string>()
+  /** "有窗口跑到面板之上"这条告警的节流时间戳（见 verifyGeometry 的 ④） */
+  private zAboveWarnedAt = 0
+  /** 已经就"关掉系统背板"打过日志的窗口 */
+  private backdropLogged = new Set<number>()
   /** 每个格子在"刚显示出来"前后的补施定时器（见 settleRegion） */
   private settleTimers = new Map<string, NodeJS.Timeout[]>()
   /** 层级看门狗定时器（见 watchZOrder） */
@@ -473,6 +500,18 @@ export class InstanceManager {
 
       // 窗口此刻是隐藏的：改扩展样式（任务栏/Alt+Tab 隐藏）必须在隐藏状态下才生效
       w32.makeToolWindow(win.hwnd)
+      /**
+       * Win11 的 DWM 系统背板必须关掉，否则"被 SetWindowRgn 裁掉的那一截外壳"
+       * 会以一条死板纯色的形式留在画面上（见 fixBackdrop 的注释）。
+       * 这一步放在最前面：它影响的是"这一格到底会不会露出东西"，与几何无关。
+       */
+      this.fixBackdrop(win.hwnd)
+      /**
+       * 原生窗口框架（那圈外框线 + 右上角的 ✕）也要摘掉，理由见 fixFrame。
+       * 位置有讲究：必须排在下面的 `syncInsets` **之前** —— 摘掉边框会让外壳厚度
+       * 跟着变小（实测 {8,96,7,7} → {6,96,7,6}），先摘再量，量到的才是最终值。
+       */
+      this.fixFrame(win.hwnd)
       // 不设 owner（理由见 setPanel 的长注释）；置顶状态与面板保持一致，
       // 否则面板浮在别的程序之上、网页却被别的程序盖住，只剩一圈黑边。
       w32.setTopMost(win.hwnd, this.panel.topMost)
@@ -919,7 +958,24 @@ export class InstanceManager {
      */
     return {
       x: Math.round((this.panel.x + r.x) * s - ins.left),
-      y: Math.round((this.panel.y + r.y) * s - ins.top),
+      /**
+       * ⚠️ 顶边**向下取整**，不要用 `Math.round`。
+       *
+       * 顶栏那一排的网页是故意往上出血、被顶栏压住一点点的（见 styles.css 的
+       * `--bleed-top`），出血的那一截就是"点分格时网页闪一下"的高度。
+       * `Math.round` 会把顶边最多**往下**推 0.5px —— 于是一方面出血量变得不确定，
+       * 另一方面面板的不透明区只画到顶栏下沿，一旦窗口顶边被推到它下面，
+       * 中间就露出后面的桌面（浅色桌面上就是那条"白条"）。
+       *
+       * `Math.floor` 保证窗口顶边永远落在分格矩形**之上或正好齐平**，两个问题一起消掉：
+       *   · 不会把网页顶边推到顶栏不透明区之下 → 不可能出缝；
+       *   · 出血量恒等于 `--bleed-top`（+ 不到 1px 的零头）→ 闪的那一条只有 1~2px。
+       * 代价是每个分格（含下排）整体上移不到 1px，落在相邻分格的 2px 遮边底下，看不见。
+       *
+       * `ins.top` 是整数，所以 `Math.floor(a - ins.top) === Math.floor(a) - ins.top`，
+       * 直接在整段上取整即可。
+       */
+      y: Math.floor((this.panel.y + r.y) * s - ins.top),
       w: Math.max(1, pw + ins.left + ins.right),
       h: Math.max(1, ph + ins.top + ins.bottom),
       region: { x: ins.left, y: ins.top, width: pw, height: ph },
@@ -928,11 +984,67 @@ export class InstanceManager {
     }
   }
 
+  /**
+   * 关掉这一格浏览器窗口的 Win11 系统背板（Mica）。
+   *
+   * 这是"分格里露出一条死板外壳色"的**根因**，也是 2026-09-15 之前一直没找到的那一半：
+   * 浏览器标准窗口自带约 96px 的标题栏 + 标签栏 + 地址栏，我们靠 `SetWindowRgn` 把它
+   * 从可视区裁掉。可 Win11 的系统背板是**由 DWM 单独绘制的一层**，不受窗口区域约束，
+   * 照旧铺满整个窗口矩形——于是被裁掉的那一截以"死板纯色"留在画面上（浅色壁纸下是
+   * 奶白色），并且照旧压在邻居上面。
+   *
+   * 为什么以前只有一半被解决：0.4.5 的"分层合成"让面板置顶 + 分格处透明输出 alpha=0，
+   * 于是这截色块**压在面板顶栏上**的那一半被盖住了；压在**相邻分格**上的那一半没人管
+   * ——2 格 / 4 格布局里点下面那格时，它就正好盖住上面那格的底部，也就是用户看到的现象。
+   *
+   * 为什么自检一直"全绿"：`GetWindowRgn` / `PtInRegion` 读回来完全正常（区域确实设上了，
+   * 命中测试也确实生效），所有基于区域的断言都判通过。**只有采屏幕像素才看得见**，
+   * 所以 `scripts/verify-clip-pixels.js` 改成拿像素说话。
+   *
+   * 代价约等于零：这层只在窗口可见时有意义，而分格里的浏览器外壳本来就是要裁掉的。
+   * Win10 上这个调用返回失败 —— 那边本来也没这层，不是错误。
+   */
+  private fixBackdrop(hwnd: number) {
+    if (KEEP_BACKDROP) return
+    if (!w32.disableWindowBackdrop(hwnd)) return
+    if (this.backdropLogged.has(hwnd)) return
+    this.backdropLogged.add(hwnd)
+    console.log(`[instance] 已关闭 ${hwnd.toString(16)} 的 Win11 系统背板（那截被裁掉的外壳不会再以纯色露出来）`)
+  }
+
+  /**
+   * 摘掉这一格窗口的原生框架 —— 那圈 1px 外框线，和右上角的 ✕。
+   *
+   * 它和系统背板是**同一类东西**：DWM 在合成阶段单独画的一层，不受 `SetWindowRgn` 约束。
+   * 0.4.10 关掉背板之后剩下的就是它 —— 2 格 / 4 格下点下面那格，上面那格底部会多出
+   * "一条横线 + 一个 ✕"，那正是下面那格窗口矩形边上的原生框架（2026-09-15 查实）。
+   * 根因、逐项实测数据、以及"为什么只摘 CAPTION + THICKFRAME"见 `win32.stripWindowFrame`。
+   *
+   * 幂等：样式本来就干净时 `stripWindowFrame` 返回 false，不会重复触发 FRAMECHANGED 重排。
+   * 返回 true 表示这次改了样式 —— 调用方**必须重新量内衬**（摘掉边框后外壳厚度会变小，
+   * 实测 {8,96,7,7} → {6,96,7,6}），否则这一格会按旧厚度错位。
+   */
+  private fixFrame(hwnd: number): boolean {
+    if (KEEP_FRAME) return false
+    if (!w32.stripWindowFrame(hwnd)) return false
+    if (!this.frameLogged.has(hwnd)) {
+      this.frameLogged.add(hwnd)
+      console.log(`[instance] 已摘掉 ${hwnd.toString(16)} 的原生窗口框架（外框线与 ✕ 不会再画到邻格上）`)
+    }
+    return true
+  }
+
   /** 只定位、不改变期望可见性 */
   private positionWindow(inst: ManagedInstance, desiredVisible?: boolean) {
     if (desiredVisible !== undefined) inst.desiredVisible = desiredVisible
     const hwnd = inst.hwnd
     if (!hwnd || !w32.isWindow(hwnd)) return
+
+    /**
+     * 原生框架要是被挂回来了（Chrome 重排时会重设自己的窗口样式），先摘掉再算几何：
+     * 摘掉边框会改变外壳厚度，而下面 `geometry()` 正是拿厚度算位置的。
+     */
+    if (this.fixFrame(hwnd)) this.syncInsets(inst)
 
     const g = this.geometry(inst)
     const usable = !!g && g.region.width >= 60 && g.region.height >= 60
@@ -944,6 +1056,8 @@ export class InstanceManager {
 
     // 同步移动+改尺寸：跨进程 SetWindowPos 带 ASYNC 会被 Chrome 丢弃（见 win32 注释）
     w32.moveWindowNoClamp(hwnd, g!.x, g!.y, g!.w, g!.h, false)
+    // 重新显示 / 变化尺寸都会让 Chrome 有机会把 Mica 背板再挂回来，顺手确认一次
+    this.fixBackdrop(hwnd)
     this.applyRegion(inst, g!)
     this.setShown(inst, true)
     this.settleRegion(inst)
@@ -1034,24 +1148,57 @@ export class InstanceManager {
   }
 
   /**
-   * 逐格核对三件事，任何一件不对就修回去：
+   * 逐格核对六件事，任何一件不对就修回去：
    *
+   * ⓪ 原生窗口框架（外框线 + 右上角的 ✕）——和背板同为 **DWM 画的、不受 `SetWindowRgn`
+   *    约束**的一层，回来了就会画到相邻分格上（见 fixFrame / stripWindowFrame）。
    * ① 浏览器"外壳"厚度（内衬）——`chromeContentInsets` 量出来的顶部偏移就是标题栏+工具栏
    *    那一截。这个数**会变**：Chrome 在激活/失活、换皮肤、显示资料气泡时会重新排布
    *    自己的窗口，子窗口位置跟着动。内衬一旦过期，几何就是按旧厚度算的，
    *    窗口位置、要裁掉的高度全都偏——表现正是"点一下网页，顶上冒出一条浏览器的边"。
    * ② 窗口矩形——浏览器自己会挪窗口、改尺寸（Chrome 会按自己的记忆恢复窗口状态，
    *    也会在重排时把宽度钳到最小值）。位置错了就整块内容跟着错位。
-   * ③ 可见区（区域）——被外部改掉时，"被裁掉的那截浏览器外壳"就会露出来。
+   * ③ 系统背板（Mica）——它不受 `SetWindowRgn` 约束，回来了就照样铺满整窗；
+   *    这一层被裁掉的那一截会以死板纯色露在相邻分格上（2026-09-15 查实的那个 bug）。
+   * ④ 层级——有没有自家窗口跑到面板上面去了（整轮只查一次，不是逐格）。
+   * ⑤ 可见区（区域）——被外部改掉时，"被裁掉的那截浏览器外壳"就会露出来。
    *
-   * 这三样原来只查了③，①② 没人在看：只要浏览器动过窗口而不是动区域，
-   * 看门狗就认为"一切正常"。现在合成一轮，代价仍然是几个微秒级的只读调用
-   * （实测 getWindowRect 1.7µs、windowRegionBox 0.6µs、chromeContentInsets 7.8µs），
+   * 这六样里原来只查了可见区（当时是唯一一项，也就是现在的 ⑤），①② 没人在看：
+   * 只要浏览器动过窗口而不是动区域，看门狗就认为"一切正常"。现在合成一轮，
+   * 代价仍然是几个微秒级的只读调用
+   * （实测 getWindowRect 1.7µs、windowRegionBox 0.6µs、chromeContentInsets 7.8µs、
+   * windowBackdropIsPainted 1.5µs、windowHasFrame 0.5µs，另加一趟 ~10 步的 Z 序巡查），
    * 所以间隔可以压到 30ms —— 也就是最多两三帧就能纠正，而不是原来那半秒。
+   *
+   * ⚠️ 顺序有讲究：带 `continue` 的核对（现在只有 ⑤ 可见区）必须排在最末，
+   * 否则它前面写什么都等于不执行。
    */
   private verifyGeometry() {
     // 滑动动画期间窗口位置由 relocateAll 逐帧对齐，这里插一脚只会打架
     if (this.sliding) return
+
+    /**
+     * ④ 层级：有没有自家窗口跑到面板上面去了。
+     *
+     * 正常路径靠前台事件钩子在 13~30ms 内按回去（见 `onForeground`），这一步只是兜底：
+     * 万一那次事件没送到（钩子没装上、或激活不是前台事件引起的），窗口就会**一直**
+     * 压在面板上，用户看到的是"第一行分格顶上多出一条网页"。原来的兜底是 200ms 的
+     * `watchZOrder`，最长要错 200ms、足够看清；压到 30ms 之后最多两三帧。
+     *
+     * 一格 Z 序巡查十几步只读调用，和同一轮的其它核对是一个量级，30ms 一跳可以忽略。
+     * 这里**不带 `continue`**，所以放在逐格核对之前、也不影响下面的顺序约定。
+     */
+    const above = this.windowsAbovePanel()
+    if (above.length) {
+      const now = Date.now()
+      if (now - this.zAboveWarnedAt > 5000) {
+        this.zAboveWarnedAt = now
+        console.warn(`[panel] ${above.length} 个分格窗口跑到了面板之上 → 已按回面板下方`)
+      }
+      const ph = this.panel.hwnd!
+      for (let i = above.length - 1; i >= 0; i--) w32.placeBelow(above[i], ph)
+    }
+
     for (const inst of this.instances.values()) {
       const hwnd = inst.hwnd
       if (!hwnd || !inst.regionBox || !w32.isWindow(hwnd)) continue
@@ -1076,6 +1223,27 @@ export class InstanceManager {
       }
 
       let rebuild = false
+
+      /**
+       * ⓪ 原生窗口框架被挂回来了 —— 那圈外框线 + 右上角的 ✕ 是 **DWM 画的**，
+       *    不受 `SetWindowRgn` 约束，会直接画到相邻分格上（见 fixFrame / stripWindowFrame）。
+       *    和背板一样：Chrome 重排自己的窗口时会把它一并带回来，而那一刻几何往往纹丝不动，
+       *    光靠"位置变了才处理"是兜不住的。
+       *    排在最前面是有前提的：摘掉它会让外壳厚度跟着变小，紧邻的 ① 正好量到新厚度、
+       *    触发一次重建位置。读一次窗口样式 0.5µs，和同一循环里的只读调用是一个量级。
+       *
+       *    ⚠️ 这里**故意不置 rebuild**：一旦置上，而框架又因为某种原因摘不掉
+       *    （比如负向对照开关、或 Chrome 顽固地改回来），这一环就会**每轮都跳进
+       *    rebuild 分支并以 `continue` 收尾**，把后面的 ③ 背板 / ⑤ 可见区核对一起跳过
+       *    —— 实测表现就是"背板被注入后半天没人管"。重建位置这件事交给紧邻的 ① 决定。
+       */
+      if (w32.windowHasFrame(hwnd)) {
+        if (!this.frameWarned.has(inst.paneId)) {
+          this.frameWarned.add(inst.paneId)
+          console.warn(`[panel] ${inst.paneId} 的原生窗口框架又回来了 → 已再摘一次（否则外框线和 ✕ 会画到邻格上）`)
+        }
+        this.fixFrame(hwnd)
+      }
 
       // ① 内衬变了（浏览器重排了自己的外壳）
       const native = w32.chromeContentInsets(hwnd)
@@ -1136,7 +1304,27 @@ export class InstanceManager {
       }
       this.repositionGuard.delete(inst.paneId)
 
-      // ③ 可见区被改掉
+      /**
+       * ③ 系统背板又回来了 —— Chrome 在激活 / 失活 / 换皮肤 / 刚显示出来时会重新给自己的
+       *    窗口挂上 Mica，而这一层**不受 SetWindowRgn 约束**（见 fixBackdrop）。
+       *    它回来了却没人管的话，被裁掉的那截外壳会重新变成一条死板纯色盖住邻居，
+       *    也就是本次要修的那个 bug —— 而这时候几何往往纹丝不动，
+       *    光靠位置/尺寸变化去触发 fixBackdrop 是**兜不住**的，必须在看门狗里主动问。
+       *    读一次属性 1.5µs，和同一循环里的 windowRegionBox(0.6µs) 是一个量级。
+       *
+       *    ⚠️ 这一段必须放在**可见区核对之前**：那一段自己带 `continue`（区域正常是常态），
+       *    放在它后面就等于永远不执行 —— 这不是推测，是第一次写在这里时实测到的
+       *    （verify-clip-pixels 的"注入背板后没人管"就是它）。
+       */
+      if (w32.windowBackdropIsPainted(hwnd)) {
+        if (!this.backdropWarned.has(inst.paneId)) {
+          this.backdropWarned.add(inst.paneId)
+          console.warn(`[panel] ${inst.paneId} 的 Win11 系统背板又回来了 → 已再关一次（否则被裁掉的外壳会以纯色露出来）`)
+        }
+        this.fixBackdrop(hwnd)
+      }
+
+      // ⑤ 可见区被改掉（放在最后：这一段的几个分支会 continue）
       const box = w32.windowRegionBox(hwnd)
       const w = inst.regionBox!
       const same = !!box
@@ -1247,9 +1435,16 @@ export class InstanceManager {
    * 用户点某一个分格里的网页时，系统会做两件事：把这个浏览器窗口提到置顶带顶端
    * （= 浮到面板之上），并且很可能顺手把它的窗口区域重设一遍——而我们正是靠那个
    * 区域把浏览器的标签栏 / 工具栏从可视区裁掉的。两件事叠起来的后果：
-   *   · 第一行分格（1 / 2 格布局）被抬上去的那截正好压在顶栏 → 顶栏闪一下白；
+   *   · 第一行分格（1 / 2 格布局、4 格布局的上排）被抬上去的那截正好压在顶栏
+   *     → 那一截露出来，看上去就是"点一下顶栏闪一下"；
    *   · 第二行分格（4 格布局里的 3 / 4）压在它**上一格**的底部 → 那块既没画网页
    *     也没画面板（面板在分格处是透明的），看上去就是一块透明区域。
+   *
+   * 第一行的"那一截"有多高，由 `--bleed-top`（styles.css）决定 —— 顶栏那一排的
+   * 网页是**故意**往上出血压在顶栏底下的（为了不留缝），被压住的那一条就是闪的那一条。
+   * 2026-09-15 实测：出血 8px 时是 120×9 个像素、持续 12~25ms；压到 1px 之后只剩 2 行，
+   * 而这 2 行已经是几何上的下限（窗口顶边是整数像素，面板不透明区的下沿不是）。
+   * 要彻底消掉只能不让窗口浮上去（需要 `WS_EX_NOACTIVATE` 那一路，尚未做）。
    *
    * 轮询看门狗只能把这件事在 200ms 内纠正回来，那半帧是看得见的；
    * 这条回调在**前台切换的那一刻**就把落下的活补完。
@@ -1268,12 +1463,22 @@ export class InstanceManager {
       return
     }
     try {
+      /**
+       * ⚠️ **先按 Z 序**，再补位置和区域。
+       *
+       * 这一条回调能压住"闪一下"多久，只看它多快把窗口按回面板下方 —— 其余几件事
+       * （重量内衬、补位置、补区域）都是窗口已经在面板后面做的，看不见。
+       * 实测把 `enforceZOrder` 提到最前面，能把露出时间从 12~25ms 压到一帧以内
+       * （`scripts/` 之外的高频探针 `.diag/probe-topbar.js` 量的：看那一帧还有多高）。
+       *
+       * 位置 + 区域仍然要**紧接着**补回去：激活会触发 Chrome 自己重画边框，
+       * 那时它很可能顺手把宽度钳回最小值（窄分格尤其明显）。
+       */
+      this.enforceZOrder()
       for (const inst of mine) {
         this.syncInsets(inst)
         const g = this.geometry(inst)
         if (!g) continue
-        // 位置 + 区域同一帧补回去：激活会触发 Chrome 自己重画边框，
-        // 那时它很可能顺手把宽度钳回最小值（窄分格尤其明显）。
         w32.moveWindowNoClamp(inst.hwnd!, g.x, g.y, g.w, g.h, false)
         this.applyRegion(inst, g)
       }
@@ -1288,13 +1493,28 @@ export class InstanceManager {
   private enforceZOrder() {
     const ph = this.panel.hwnd
     if (!ph || !w32.isWindow(ph)) return
+    const above = this.windowsAbovePanel()
+    if (!above.length) return
+    // 从最靠下的开始按，最后按的离面板最近，最终次序与插入顺序一致
+    for (let i = above.length - 1; i >= 0; i--) w32.placeBelow(above[i], ph)
+  }
+
+  /**
+   * 当前跑到面板之上的自家窗口（可能不止一个）。
+   *
+   * 从 Z 序最顶层往下走，在碰到面板之前遇到的自己人都算 —— 面板理应永远压在
+   * 这些浏览器窗口之上（见 enforceZOrder 的说明），所以这个列表正常永远是空的。
+   * 拆出来是因为 `verifyGeometry` 也要问同一个问题（见那里 ⑤ 的说明），
+   * 巡查一趟是十几步只读调用。
+   */
+  private windowsAbovePanel(): number[] {
+    const ph = this.panel.hwnd
+    if (!ph || !w32.isWindow(ph)) return []
     const mine = new Set<number>()
     for (const inst of this.instances.values()) {
       if (inst.hwnd && inst.shown && w32.isWindow(inst.hwnd)) mine.add(inst.hwnd)
     }
-    if (!mine.size) return
-
-    // 从 Z 序最顶层往下走，遇到面板之前碰到自己的窗口，就说明它跑到面板上面了
+    if (!mine.size) return []
     const above: number[] = []
     let h = w32.getTopWindow()
     let guard = 0
@@ -1302,9 +1522,7 @@ export class InstanceManager {
       if (mine.has(h)) above.push(h)
       h = w32.getWindow(h, w32.GW_HWNDNEXT)
     }
-    if (!above.length) return
-    // 从最靠下的开始按，最后按的离面板最近，最终次序与插入顺序一致
-    for (let i = above.length - 1; i >= 0; i--) w32.placeBelow(above[i], ph)
+    return above
   }
 
   /**

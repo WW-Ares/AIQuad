@@ -44,8 +44,18 @@ const PANEL_BG = [21, 24, 31]
 /** 分格"没就位"时的底色（--pane-empty），分格已就位时也不该是它 */
 const PANE_EMPTY = [27, 31, 39]
 
+/**
+ * 整屏截图，并把**虚拟桌面原点**一并带回来。
+ *
+ * ⚠️ 这里必须回传原点：截图是「虚拟桌面」的图，但 `GetWindowRect` 给的是以**主显示器**
+ * 左上角为原点的坐标。多显示器时两者不相等 —— 本机虚拟桌面是 3640×1920 @ (-1080, 0)，
+ * 也就是左边还有一块屏。原来 `pixelAt` 直接拿屏幕坐标当图内坐标用，读到的位置整体偏了
+ * 1080px（读的是别的窗口），于是一个"顶栏必须是面板底色"的断言会在**完全无关的地方**取样，
+ * 报出来的失败跟被测代码毫无关系。0.4.10 排查时踩到，已修。
+ */
 function shot(name) {
   const out = path.join(projectRoot, '.tmp', name)
+  const meta = `${out}.meta`
   const ps = [
     'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
     '$vs = [System.Windows.Forms.SystemInformation]::VirtualScreen',
@@ -54,23 +64,34 @@ function shot(name) {
     '$g.CopyFromScreen($vs.Left, $vs.Top, 0, 0, $bmp.Size)',
     `$bmp.Save('${out.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png)`,
     '$g.Dispose(); $bmp.Dispose()',
+    `[System.IO.File]::WriteAllText('${meta.replace(/\\/g, '\\\\')}', "$($vs.Left),$($vs.Top)")`,
   ].join('; ')
-  try { execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' }) }
+  let vs = { left: 0, top: 0 }
+  try {
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' })
+    const [left, top] = fs.readFileSync(meta, 'utf8').trim().split(',').map(Number)
+    if (Number.isFinite(left) && Number.isFinite(top)) vs = { left, top }
+  }
   catch (e) { console.log('  截图失败:', e.message) }
-  return out
+  return { png: out, vs }
 }
 
-/** 读整屏某一个点的颜色 */
-function pixelAt(png, x, y) {
+/** 读整屏某一个**屏幕坐标**点的颜色 */
+function pixelAt(screen, x, y) {
+  const gx = Math.round(x - screen.vs.left)
+  const gy = Math.round(y - screen.vs.top)
   const ps = [
     'Add-Type -AssemblyName System.Drawing',
-    `$bmp = [System.Drawing.Image]::FromFile('${png.replace(/\\/g, '\\\\')}')`,
-    `$c = $bmp.GetPixel(${Math.round(x)}, ${Math.round(y)})`,
-    'Write-Output "$($c.R),$($c.G),$($c.B)"',
+    `$bmp = [System.Drawing.Image]::FromFile('${screen.png.replace(/\\/g, '\\\\')}')`,
+    `if (${gx} -lt 0 -or ${gy} -lt 0 -or ${gx} -ge $bmp.Width -or ${gy} -ge $bmp.Height) { Write-Output 'out-of-range' } else {`,
+    `  $c = $bmp.GetPixel(${gx}, ${gy})`,
+    '  Write-Output "$($c.R),$($c.G),$($c.B)"',
+    '}',
     '$bmp.Dispose()',
   ].join('; ')
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' })
+    if (!/^\d+,\d+,\d+$/.test(out.trim())) return null
     return out.trim().split(',').map(Number)
   }
   catch { return null }
