@@ -7,194 +7,395 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="settings">
-    <h2>面板与呼出</h2>
-    <div class="card">
-      <div class="row">
-        <label>呼出快捷键</label>
-        <input id="sc-toggle" class="sc-input" style="width:180px" readonly title="点击后按下组合键" />
-        <span class="muted">点一下框，再按组合键；<kbd>Esc</kbd> 取消，<kbd>Backspace</kbd> 清除</span>
-      </div>
-      <div class="row">
-        <label>停靠位置</label>
-        <div class="radios">
-          <label class="radio"><input type="radio" name="position" value="left" /> 屏幕左侧</label>
-          <label class="radio"><input type="radio" name="position" value="right" /> 屏幕右侧</label>
-        </div>
-      </div>
-      <div class="row">
-        <label>面板宽度</label>
-        <div class="seg" id="ratio-presets">
-          <button type="button" data-ratio="20">20%</button>
-          <button type="button" data-ratio="30">30%</button>
-          <button type="button" data-ratio="40">40%</button>
-          <button type="button" data-ratio="50">50%</button>
-        </div>
-        <input type="range" id="ratio" min="20" max="60" step="1" value="30" style="width:160px" />
-        <span class="muted"><b id="ratio-val">30%</b> · <span id="ratio-px">约 – px</span></span>
-      </div>
-      <div class="row">
-        <label>分格切换</label>
-        <input id="sc-1" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
-        <input id="sc-2" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
-        <input id="sc-4" class="sc-input" style="width:120px" readonly title="点击后按下组合键" />
-        <span class="muted">依次对应 1 / 2 / 4 格，可留空</span>
-      </div>
-      <div class="sc-status-row"><span id="sc-status" class="sc-status"></span></div>
-      <div class="row">
-        <label>窗口行为</label>
-        <div class="radios">
-          <label class="radio"><input type="checkbox" id="opt-ontop" /> 始终置顶<em>（面板钉在其它窗口之上）</em></label>
-          <label class="radio"><input type="checkbox" id="opt-autostart" /> 开机自动启动</label>
-          <label class="radio"><input type="checkbox" id="opt-hibernate" /> 后台分格休眠<em>（省 CPU，不省内存；共享登录态下无效）</em></label>
-        </div>
-      </div>
-      <div class="row">
-        <label>闲置分格</label>
-        <label class="radio"><input type="checkbox" id="opt-cleanup" /> 清理当前布局用不到的分格</label>
-        <input type="number" id="cleanup-min" min="1" max="120" step="1" style="width:64px" />
-        <span class="muted">分钟后关闭，真正把内存还回来（重新切回多格要重开一次）</span>
-      </div>
-    </div>
+  <!--
+    设置页的信息架构（2026-09-15 重构，做法照搬 WSight 的设置面板）。
 
-    <h2>代理设置</h2>
-    <div class="card">
-      <div class="row">
-        <label>全局代理</label>
-        <select id="proxy-mode">
-          <option value="system">跟随系统代理</option>
-          <option value="custom">自定义代理</option>
-          <option value="none">不使用代理（直连）</option>
-        </select>
-        <select id="proxy-type">
-          <option value="http">HTTP</option>
-          <option value="https">HTTPS</option>
-          <option value="socks5">SOCKS5</option>
-        </select>
-        <input id="proxy-host" placeholder="127.0.0.1" style="width:140px" />
-        <input id="proxy-port" placeholder="端口" style="width:90px" />
-      </div>
-      <div class="row">
-        <label>绕过列表</label>
-        <input id="proxy-bypass" class="grow" placeholder="多个用分号分隔，例如 intranet.com;*.local" />
-      </div>
-      <div class="row">
-        <label>系统代理</label>
-        <span class="muted" id="system-proxy">检测中…</span>
-      </div>
-      <div class="row">
-        <label>连通性测试</label>
-        <input id="proxy-test-url" class="grow" value="https://www.google.com" />
-        <button id="btn-test-proxy">测试</button>
-        <span class="result" id="proxy-result"></span>
-      </div>
-      <div class="muted">改动会自动重启受影响的实例；下表的「单独代理」只在关掉登录态共享后可生效（同一进程只能有一个代理）。</div>
-    </div>
+    三条规则，改这个文件前先读：
 
-    <h2>AI 服务</h2>
-    <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th style="width:130px">名称</th>
-            <th>网址</th>
-            <th style="width:96px">分组</th>
-            <th style="width:120px">代理策略</th>
-            <th style="width:120px">操作</th>
-          </tr>
-        </thead>
-        <tbody id="ai-rows"></tbody>
-      </table>
-      <div class="row" style="margin-top:10px">
-        <input id="new-ai-name" placeholder="名称" style="width:130px" />
-        <input id="new-ai-url" class="grow" placeholder="https://..." />
-        <select id="new-ai-category">
-          <option value="us">国外 AI</option>
-          <option value="cn">国内 AI</option>
-        </select>
-        <select id="new-ai-proxy">
-          <option value="global">跟随全局</option>
-          <option value="direct">直连</option>
-          <option value="custom">单独代理</option>
-        </select>
-        <button id="btn-add-ai">添加</button>
-      </div>
-      <div class="muted">分组决定它在分格底部选择器里的归类；隐藏只是从选择器里摘掉，已经开着的格子不受影响。</div>
-    </div>
+      1. 一行只放「名字 +（当前值）+ 控件」。任何要一整句话才说得清的内容，一律收进
+         标签旁那个 13px 的 ⓘ（原生 title，悬浮才出现）。设置页一辈子只被认真读一次
+         —— 就是找控件那次 —— 行底下那句说明只会把下一个控件往下推。
+      2. 值和提示分工：值是「现在是多少」（放标签右边，.st-row-value / .st-row-note），
+         提示是「这是什么、为什么这么设计」（进 ⓘ）。值塞进 tooltip 等于把它藏起来。
+      3. 窗口宽 920px，所以卡片走两列网格（.st-grid），需要整宽的跨两列（.wide）。
+         一行行铺满 920px 的话，控件会离它的标签好几百像素远。
 
-    <h2>数据与缓存</h2>
-    <div class="card">
-      <div class="row">
-        <label>浏览器档案</label>
-        <span class="muted" id="cache-stat">统计中…</span>
-        <button id="btn-clear-cache">清理缓存</button>
-        <span class="result" id="cache-result"></span>
+    ⚠️ 改之前先看 scripts/verify-settings.js 与 scripts/verify-shortcut-capture.js，
+    这些契约被回归脚本钉着，别随手改名：
+      · settings.js 里 $('id') 引用的每个 id 都必须存在 —— 缺一个就会让 collect() 抛异常，
+        表现是「改了没反应」且毫无提示（真实事故：面板宽度比例失效）
+      · .sc-input 必须正好 4 个：sc-toggle / sc-1 / sc-2 / sc-4，且都是 readonly
+      · #ratio-presets button[data-ratio] / #ratio-val / #ratio-px
+      · #ai-rows tr td.ops button（第一个是隐藏开关）/ tr.ai-hidden / #save-result 的文案
+  -->
+  <div class="st">
+    <header class="st-head">
+      <div class="st-brand">
+        <img class="st-logo" src="assets/logo.png" alt="" />
+        <h1>AIQuad 设置</h1>
+        <span class="st-ver" id="app-ver">–</span>
       </div>
-      <div class="row">
-        <label>自动清理</label>
-        <select id="cache-mode">
-          <option value="auto">缓存超过 500MB 时，下次启动清理</option>
-          <option value="exit">退出程序时清理</option>
-          <option value="off">不自动清理，只手动</option>
-        </select>
-      </div>
-      <div class="muted" id="cache-detail"></div>
-      <div class="muted">每格是一份真实浏览器档案，可清的就是 <code>Cache</code>、<code>Code Cache</code>、着色器缓存这几类能自动重生成的目录；
-        Cookies 与 Local Storage 一律不动，不会掉登录。运行中被占用的文件会跳过，下次启动补上。</div>
-    </div>
-
-    <h2>浏览器内核</h2>
-    <div class="card">
-      <div class="row">
-        <label>使用浏览器</label>
-        <select id="browser-pref">
-          <option value="auto">自动（优先 Chrome）</option>
-          <option value="chrome">Google Chrome</option>
-          <option value="edge">Microsoft Edge</option>
-        </select>
-        <span class="muted" id="browser-info"></span>
-      </div>
-      <div class="row">
-        <label>窗口形态</label>
-        <select id="window-mode">
-          <option value="standard">标准浏览器窗口（推荐）</option>
-          <option value="app">应用窗口（无工具栏）</option>
-        </select>
-        <span class="muted">标准窗口的标签栏与地址栏会被裁到分格之外</span>
-      </div>
-      <div class="row">
-        <label>登录态共享</label>
-        <div class="radios">
-          <label class="radio"><input type="checkbox" id="opt-shared" /> 所有分格共用同一份档案<em>（一处登录，处处生效）</em></label>
-        </div>
-      </div>
-      <div class="row">
-        <label>自定义路径</label>
-        <input id="browser-path" class="grow" placeholder="留空则自动探测" />
-        <button id="btn-open-profiles">打开档案目录</button>
-      </div>
-      <div class="muted">关掉登录态共享后每个分格独立进程，才能按 AI 分别设代理或登录不同账号，代价是内存占用翻倍。
-        应用窗口虽无工具栏，但页面能识别出自己是应用窗口，Google 等站点可能拒绝登录。</div>
-    </div>
-
-    <h2>关于</h2>
-    <div class="card">
-      <div class="muted" id="about"></div>
-      <div class="link-row">
-        <a href="#" data-open="https://github.com/WW-Ares/AIQuad">GitHub 仓库</a>
-        <a href="#" data-open="https://github.com/WW-Ares/AIQuad/issues">问题反馈</a>
-        <a href="#" data-open="https://github.com/WW-Ares/AIQuad/releases">版本历史</a>
-        <a href="#" data-open="https://github.com/WW-Ares/WSight">WSight</a>
-      </div>
-      <div class="muted" id="about-oss"></div>
-      <div class="row" style="margin-top:10px">
-        <button id="btn-update" style="padding:4px 12px">检查更新</button>
-        <span class="muted" id="update-status"></span>
-      </div>
-    </div>
-
-    <div class="row" style="margin-bottom:24px">
+      <!-- 全页自动保存，没有「保存」按钮：这一条就是唯一的落盘回执 -->
       <span class="result" id="save-result"></span>
+    </header>
+
+    <div class="st-body">
+      <div class="st-grid">
+
+        <!-- ==================== 面板与呼出 ==================== -->
+        <section class="st-card wide">
+          <div class="st-card-head">
+            <h2>面板与呼出</h2>
+            <span>怎么叫出来、占多宽、钉在哪一层</span>
+          </div>
+          <div class="st-card-body">
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">呼出快捷键</span>
+                <i class="st-info" tabindex="0" title="点一下输入框再按组合键；Esc 取消，Backspace 清除。面板平时收在屏幕边外，按它就是滑进滑出的开关">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="sc-toggle" class="sc-input" readonly placeholder="未设置" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">分格切换</span>
+                <i class="st-info" tabindex="0" title="依次对应 1 / 2 / 4 格布局，留空就是不设。4 格要屏幕够宽才排得开">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <span class="st-sc-tag">1 格</span>
+                <input type="text" id="sc-1" class="sc-input" readonly placeholder="未设置" />
+                <span class="st-sc-tag">2 格</span>
+                <input type="text" id="sc-2" class="sc-input" readonly placeholder="未设置" />
+                <span class="st-sc-tag">4 格</span>
+                <input type="text" id="sc-4" class="sc-input" readonly placeholder="未设置" />
+              </div>
+            </div>
+
+            <div class="st-statusline"><span id="sc-status" class="sc-status"></span></div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">停靠位置</span>
+                <i class="st-info" tabindex="0" title="面板收在哪一侧、从哪一侧滑进来；改完立刻生效">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <div class="st-seg">
+                  <label><input type="radio" name="position" value="left" /><span>屏幕左侧</span></label>
+                  <label><input type="radio" name="position" value="right" /><span>屏幕右侧</span></label>
+                </div>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">面板宽度</span>
+                <b id="ratio-val" class="st-row-value">30%</b>
+                <span class="st-dot">·</span>
+                <span id="ratio-px" class="st-row-note">约 – px</span>
+                <i class="st-info" tabindex="0" title="占主屏工作区宽度的比例，决定网页能铺多开；右边显示换算出来的实际像素">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <div class="st-seg" id="ratio-presets">
+                  <button type="button" data-ratio="20">20%</button>
+                  <button type="button" data-ratio="30">30%</button>
+                  <button type="button" data-ratio="40">40%</button>
+                  <button type="button" data-ratio="50">50%</button>
+                </div>
+                <input type="range" id="ratio" min="20" max="60" step="1" value="30" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="opt-ontop">始终置顶</label>
+                <i class="st-info" tabindex="0" title="面板钉在其它窗口之上；关掉之后它就是个普通窗口，会被别的程序盖住">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="checkbox" id="opt-ontop" class="st-switch" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="opt-autostart">开机自动启动</label>
+                <i class="st-info" tabindex="0" title="登录 Windows 后自动启动，仍然是收在屏幕边外，不会自己弹出来">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="checkbox" id="opt-autostart" class="st-switch" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="opt-hibernate">后台分格休眠</label>
+                <i class="st-info" tabindex="0" title="当前布局用不到的分格挂起，省 CPU 不省内存；开着登录态共享时无效（同一进程只能有一个状态）">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="checkbox" id="opt-hibernate" class="st-switch" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="opt-cleanup">闲置分格自动清理</label>
+                <i class="st-info" tabindex="0" title="超过设定时间没被点到就把那些分格关掉，真正把内存还回来；代价是重新切回多格要重开一次">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <span class="st-sub" id="cleanup-sub">
+                  <input type="number" id="cleanup-min" class="st-num" min="1" max="120" step="1" />
+                  <span class="st-row-note">分钟</span>
+                </span>
+                <input type="checkbox" id="opt-cleanup" class="st-switch" />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== AI 服务 ==================== -->
+        <section class="st-card wide">
+          <div class="st-card-head">
+            <h2>AI 服务</h2>
+            <span>分格底部选择器里的条目：分组决定归类，隐藏只是从选择器里摘掉，已经开着的格子不受影响</span>
+          </div>
+          <div class="st-card-body">
+            <!-- 列表本身会随条目数无限变长，所以给它一个高度上限自己滚（表头 sticky），
+                 否则加满 30 个 AI 之后整页要滚四屏，上面那些卡片全被顶到看不见 -->
+            <div class="st-aiwrap">
+              <table class="st-table">
+                <colgroup>
+                  <col class="c-name" />
+                  <col />
+                  <col class="c-cat" />
+                  <col class="c-proxy" />
+                  <col class="c-ops" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>网址</th>
+                    <th>分组</th>
+                    <th title="跟随全局 / 直连 / 单独代理。单独代理只在关掉「登录态共享」后生效——同一个浏览器进程只能有一个代理">代理策略</th>
+                    <th class="ops">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="ai-rows"></tbody>
+              </table>
+            </div>
+
+            <div class="st-add">
+              <input type="text" id="new-ai-name" class="st-add-name" placeholder="名称" />
+              <input type="text" id="new-ai-url" class="grow" placeholder="https://..." />
+              <select id="new-ai-category">
+                <option value="us">国外 AI</option>
+                <option value="cn">国内 AI</option>
+              </select>
+              <select id="new-ai-proxy">
+                <option value="global">跟随全局</option>
+                <option value="direct">直连</option>
+                <option value="custom">单独代理</option>
+              </select>
+              <button type="button" class="st-btn small" id="btn-add-ai">添加</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== 浏览器内核 ==================== -->
+        <section class="st-card">
+          <div class="st-card-head">
+            <h2>浏览器内核</h2>
+            <span>用哪个浏览器承载网页</span>
+          </div>
+          <div class="st-card-body">
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="browser-pref">使用浏览器</label>
+                <i class="st-info" tabindex="0" title="自动会优先挑 Chrome；手动指定之后另一个就不再使用">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="browser-pref">
+                  <option value="auto">自动（优先 Chrome）</option>
+                  <option value="chrome">Google Chrome</option>
+                  <option value="edge">Microsoft Edge</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">当前内核</span>
+              </span>
+              <div class="st-row-ctl">
+                <span class="st-row-note" id="browser-info"></span>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="window-mode">窗口形态</label>
+                <i class="st-info" tabindex="0" title="标准窗口的标签栏与地址栏会被裁到分格之外；应用窗口没有工具栏，但页面能识别出自己是应用窗口，Google 等站点可能因此拒绝登录">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="window-mode">
+                  <option value="standard">标准浏览器窗口（推荐）</option>
+                  <option value="app">应用窗口（无工具栏）</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="opt-shared">登录态共享</label>
+                <i class="st-info" tabindex="0" title="所有分格共用同一份浏览器档案，一处登录处处生效。关掉后每格独立进程，才能按 AI 分别设代理或登录不同账号，代价是内存占用翻倍">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="checkbox" id="opt-shared" class="st-switch" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="browser-path">自定义路径</label>
+                <i class="st-info" tabindex="0" title="留空则自动探测 Chrome / Edge 的安装位置；便携版或装在非默认目录时才需要填">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="browser-path" class="grow" placeholder="留空则自动探测" />
+                <button type="button" class="st-btn small" id="btn-open-profiles">打开档案目录</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== 代理设置 ==================== -->
+        <section class="st-card">
+          <div class="st-card-head">
+            <h2>代理设置</h2>
+            <span>改动会自动重启受影响的实例</span>
+          </div>
+          <div class="st-card-body">
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="proxy-mode">全局代理</label>
+                <i class="st-info" tabindex="0" title="决定分格里的网页默认走哪条线路；「跟随系统」会读 Windows 的代理设置">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="proxy-mode">
+                  <option value="system">跟随系统代理</option>
+                  <option value="custom">自定义代理</option>
+                  <option value="none">不使用代理（直连）</option>
+                </select>
+                <select id="proxy-type">
+                  <option value="http">HTTP</option>
+                  <option value="https">HTTPS</option>
+                  <option value="socks5">SOCKS5</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">服务器</span>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="proxy-host" class="grow" placeholder="127.0.0.1" />
+                <input type="text" id="proxy-port" class="st-num" placeholder="端口" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="proxy-bypass">绕过列表</label>
+                <i class="st-info" tabindex="0" title="分号分隔，例如 intranet.com;*.local；命中的地址直连，不经过代理">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="proxy-bypass" class="grow" placeholder="intranet.com;*.local" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">系统代理</span>
+              </span>
+              <div class="st-row-ctl">
+                <span class="st-row-note" id="system-proxy">检测中…</span>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="proxy-test-url">连通性测试</label>
+                <i class="st-info" tabindex="0" title="用上面这套代理去访问这个地址，最多等 15 秒；结果只反映这一条线路通不通">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="proxy-test-url" class="grow" value="https://www.google.com" />
+                <button type="button" class="st-btn small" id="btn-test-proxy">测试</button>
+              </div>
+            </div>
+
+            <div class="st-statusline"><span class="result" id="proxy-result"></span></div>
+          </div>
+        </section>
+
+        <!-- ==================== 数据与缓存 ==================== -->
+        <section class="st-card wide">
+          <div class="st-card-head">
+            <h2>数据与缓存</h2>
+            <span>每格是一份真实浏览器档案；能清的只有浏览器自己会重新生成的目录</span>
+          </div>
+          <div class="st-card-body">
+            <div class="st-stat">
+              <span class="st-stat-main" id="cache-stat">统计中…</span>
+              <button type="button" class="st-btn small" id="btn-clear-cache">清理缓存</button>
+            </div>
+            <div class="st-note" id="cache-detail"></div>
+            <div class="st-statusline"><span class="result" id="cache-result"></span></div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="cache-mode">自动清理</label>
+                <i class="st-info" tabindex="0" title="只动 Cache / Code Cache / 着色器缓存这类能自动重生成的目录；Cookies 与 Local Storage 一律保留，不会掉登录。运行中被占用的文件会跳过，下次启动补上">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="cache-mode">
+                  <option value="auto">缓存超过 500MB 时，下次启动清理</option>
+                  <option value="exit">退出程序时清理</option>
+                  <option value="off">不自动清理，只手动</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== 关于 ==================== -->
+        <section class="st-card wide">
+          <div class="st-card-head">
+            <h2>关于</h2>
+            <span>开源、隐私与更新</span>
+          </div>
+          <div class="st-card-body">
+            <div class="st-note" id="about"></div>
+            <div class="st-linkrow">
+              <a href="#" data-open="https://github.com/WW-Ares/AIQuad">GitHub 仓库</a>
+              <a href="#" data-open="https://github.com/WW-Ares/AIQuad/issues">问题反馈</a>
+              <a href="#" data-open="https://github.com/WW-Ares/AIQuad/releases">版本历史</a>
+              <a href="#" data-open="https://github.com/WW-Ares/WSight">WSight</a>
+            </div>
+            <div class="st-note st-oss" id="about-oss"></div>
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">版本与更新</span>
+              </span>
+              <div class="st-row-ctl">
+                <span class="result" id="update-status"></span>
+                <button type="button" class="st-btn small" id="btn-update">检查更新</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
     </div>
   </div>
   <script src="shortcut-capture.js"></script>

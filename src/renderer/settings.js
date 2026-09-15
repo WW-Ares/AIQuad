@@ -259,8 +259,30 @@ function fill() {
     '商标：各 AI 的名称与图标归各自所有者，本项目只是在同一面板里打开它们的官网，既不代理账号也不转发对话内容。',
   ].join('<br>')
 
+  // 头部的版本胶囊。窗口标题栏不显示版本，用户报问题时要能一眼念出来
+  $('app-ver').textContent = `v${info?.version || '-'}`
+
   renderAiRows()
   void loadCacheStats()
+  syncCleanupDep()
+}
+
+/**
+ * 「闲置分格自动清理」的分钟数只有在开关打开时才有意义。
+ *
+ * 关着的时候把分钟框压暗并禁用：一个还能改、但改了完全不生效的输入框，
+ * 比一个明显灰掉的更让人困惑（改了没反应 = 以为程序坏了）。
+ * 注意**不要**顺手把值也清掉——`collect()` 读的是 `.value`，禁用不影响取值，
+ * 用户原来设的分钟数不会因为这个开关被关一下就丢。
+ */
+function syncCleanupDep() {
+  const on = document.getElementById('opt-cleanup')
+  const sub = document.getElementById('cleanup-sub')
+  const min = document.getElementById('cleanup-min')
+  if (!on) return
+  const active = !!on.checked
+  if (sub) sub.classList.toggle('off', !active)
+  if (min) min.disabled = !active
 }
 
 /* ---------------- 面板宽度预设 ---------------- */
@@ -583,6 +605,8 @@ async function init() {
   fill()
 
   bindAutoSave()
+  // 清理开关一翻，分钟框跟着亮/灭（bindAutoSave 也绑了这个 id，各管各的，互不影响）
+  document.getElementById('opt-cleanup')?.addEventListener('change', syncCleanupDep)
 
   // 抓取到一个组合后：先本地校验（重复/缺修饰键），再问主进程（是否被占用），
   // 都过了才自动保存，让用户当场就能按下去试。
