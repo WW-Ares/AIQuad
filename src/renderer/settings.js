@@ -307,9 +307,6 @@ function syncRatioUi(pct) {
   const ratio = $('ratio')
   if (ratio.dataset && !ratio.dataset.dragging) ratio.value = value
   $('ratio-val').textContent = `${value}%`
-  // 主屏工作区宽度 × 比例 = 面板实际宽度。给个数比给百分比直观
-  const sw = Number(info?.screenWidth)
-  $('ratio-px').textContent = Number.isFinite(sw) && sw > 0 ? `约 ${Math.round(sw * (value / 100))} px` : '约 – px'
   for (const b of document.querySelectorAll('#ratio-presets button')) {
     b.classList.toggle('active', Number(b.dataset.ratio) === value)
   }

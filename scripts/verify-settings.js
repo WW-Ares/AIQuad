@@ -207,12 +207,10 @@ async function main() {
       await new Promise((r) => setTimeout(r, 60))
       return {
         label: document.getElementById('ratio-val').textContent,
-        px: document.getElementById('ratio-px').textContent,
         active: btn.classList.contains('active'),
       }
     })()`)
     check(preset?.label === '40%', '点预设后界面立刻显示 40%', `label=${preset?.label}`)
-    check(/约 \d+ px/.test(preset?.px || ''), '给出实际像素估算', preset?.px)
     check(preset?.active === true, '预设按钮立刻呈选中态')
     const presetDisk = await waitConfig((c) => Math.round((c.windowWidthRatio || 0) * 100) === 40)
     check(presetDisk.ok, '预设写进 config.json', `耗时 ${presetDisk.waited}ms，磁盘值=${presetDisk.cfg?.windowWidthRatio}`)

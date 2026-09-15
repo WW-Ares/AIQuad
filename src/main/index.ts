@@ -501,11 +501,30 @@ function openSettings() {
     return
   }
   settingsWindow = new BrowserWindow({
-    width: 920,
+    width: 800,
     height: 720,
+    minWidth: 660,
+    minHeight: 520,
     title: 'AIQuad · 设置',
     backgroundColor: '#15181f',
     autoHideMenuBar: true,
+    /**
+     * ⚠️ 摘掉系统标题栏，改由页面里那条 `.st-head` 自己当标题栏。
+     *
+     * 起因：Windows 的**非激活**标题栏会被系统换一套配色重绘，而设置页是深色的
+     * —— 鼠标一离开窗口，顶上就白一条（用户看到的就是「标题栏时黑时白，全看有没有焦点」）。
+     * 自绘之后颜色只有 CSS 一个来源，失焦不再变脸。
+     * `titleBarOverlay` 保留最小化/最大化/关闭三个系统按钮，它的底色是静态的，
+     * 同样不随激活状态变。
+     *
+     * 三个必须记住的代价：
+     *   1. 拖动窗口改由 `.st-head` 的 `-webkit-app-region: drag` 承担；
+     *   2. `height` 必须与 `styles.css` 里 `.st-head` 的 height **同值**，
+     *      `color` 必须与 `--panel-bg` 同值，否则右上角按钮会和标题栏错位/出色差；
+     *   3. 没有系统标题栏 = 没有系统菜单，双击标题栏的最大化也没了（不是问题，但别以为坏了）。
+     */
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { color: '#15181f', symbolColor: '#c9d1e0', height: 40 },
     /**
      * 面板可能置顶（用户开着的那个开关），设置窗口不跟着走就会被面板整个挡住；
      * 面板没置顶时也跟着放下来，免得它反过来压住别的程序。

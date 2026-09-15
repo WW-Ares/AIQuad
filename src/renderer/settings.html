@@ -17,15 +17,21 @@
          —— 就是找控件那次 —— 行底下那句说明只会把下一个控件往下推。
       2. 值和提示分工：值是「现在是多少」（放标签右边，.st-row-value / .st-row-note），
          提示是「这是什么、为什么这么设计」（进 ⓘ）。值塞进 tooltip 等于把它藏起来。
-      3. 窗口宽 920px，所以卡片走两列网格（.st-grid），需要整宽的跨两列（.wide）。
-         一行行铺满 920px 的话，控件会离它的标签好几百像素远。
+      3. 窗口宽 800px，卡片走两列网格（.st-grid），要整宽的跨两列（.wide）。
+         **半宽的两张必须挨着**才排得成一行，落单的那张会在右边留一大片空白，所以顺序是：
+         面板与呼出(wide) → 代理设置 + 浏览器内核(两张半宽) → AI 服务(wide)
+         → 数据与缓存(wide) → 关于(wide)。
+         同一行的两张半宽卡是**等高**的（.st-grid 的 align-items: stretch），底边不会错开。
+      4. 行的布局是「定宽标签列（138px）+ 控件紧跟其后」。标签列**只放得下名字和一个 ⓘ**，
+         多塞一个值（比如"约 696 px"）就会把整列撑开、后面所有行的控件起点跟着错位 ——
+         值是控件的事，提示进 ⓘ。
 
     ⚠️ 改之前先看 scripts/verify-settings.js 与 scripts/verify-shortcut-capture.js，
     这些契约被回归脚本钉着，别随手改名：
       · settings.js 里 $('id') 引用的每个 id 都必须存在 —— 缺一个就会让 collect() 抛异常，
         表现是「改了没反应」且毫无提示（真实事故：面板宽度比例失效）
       · .sc-input 必须正好 4 个：sc-toggle / sc-1 / sc-2 / sc-4，且都是 readonly
-      · #ratio-presets button[data-ratio] / #ratio-val / #ratio-px
+      · #ratio-presets button[data-ratio] / #ratio-val（滑块右侧的百分比读数，文本是 `40%` 这种）
       · #ai-rows tr td.ops button（第一个是隐藏开关）/ tr.ai-hidden / #save-result 的文案
   -->
   <div class="st">
@@ -59,6 +65,14 @@
               </div>
             </div>
 
+            <!--
+              生效状态紧跟在它描述的那一行后面（呼出快捷键 + 分格切换是同一件事的两半，
+              状态行说的是这两处加起来有几个真的注册上了）。放在「分格切换」后面时，
+              看上去只像是在说分格那一行。
+              空的时候由 .st-statusline:has(> span:empty) 收掉，不留空行。
+            -->
+            <div class="st-statusline"><span id="sc-status" class="sc-status"></span></div>
+
             <div class="st-row">
               <span class="st-row-label">
                 <span class="st-name">分格切换</span>
@@ -73,8 +87,6 @@
                 <input type="text" id="sc-4" class="sc-input" readonly placeholder="未设置" />
               </div>
             </div>
-
-            <div class="st-statusline"><span id="sc-status" class="sc-status"></span></div>
 
             <div class="st-row">
               <span class="st-row-label">
@@ -92,10 +104,7 @@
             <div class="st-row">
               <span class="st-row-label">
                 <span class="st-name">面板宽度</span>
-                <b id="ratio-val" class="st-row-value">30%</b>
-                <span class="st-dot">·</span>
-                <span id="ratio-px" class="st-row-note">约 – px</span>
-                <i class="st-info" tabindex="0" title="占主屏工作区宽度的比例，决定网页能铺多开；右边显示换算出来的实际像素">i</i>
+                <i class="st-info" tabindex="0" title="占主屏工作区宽度的比例，决定网页能铺多开。左边是常用档，滑块可以微调到 20% ~ 60%">i</i>
               </span>
               <div class="st-row-ctl">
                 <div class="st-seg" id="ratio-presets">
@@ -105,6 +114,10 @@
                   <button type="button" data-ratio="50">50%</button>
                 </div>
                 <input type="range" id="ratio" min="20" max="60" step="1" value="30" />
+                <!-- 滑块右侧的实时读数，跟着滑块走 —— 所以放在滑块旁边而不是标签那一行：
+                     标签列是定宽的，多一个值就会把整列撑开、所有行的控件起点跟着错位。
+                     单位只用百分比，不换算像素（不同机器的像素值没法横向比较） -->
+                <b id="ratio-val" class="st-row-value">30%</b>
               </div>
             </div>
 
@@ -154,51 +167,78 @@
           </div>
         </section>
 
-        <!-- ==================== AI 服务 ==================== -->
-        <section class="st-card wide">
+        <!-- ==================== 代理设置 ==================== -->
+        <section class="st-card">
           <div class="st-card-head">
-            <h2>AI 服务</h2>
-            <span>分格底部选择器里的条目：分组决定归类，隐藏只是从选择器里摘掉，已经开着的格子不受影响</span>
+            <h2>代理设置</h2>
+            <span>改动会自动重启受影响的实例</span>
           </div>
           <div class="st-card-body">
-            <!-- 列表本身会随条目数无限变长，所以给它一个高度上限自己滚（表头 sticky），
-                 否则加满 30 个 AI 之后整页要滚四屏，上面那些卡片全被顶到看不见 -->
-            <div class="st-aiwrap">
-              <table class="st-table">
-                <colgroup>
-                  <col class="c-name" />
-                  <col />
-                  <col class="c-cat" />
-                  <col class="c-proxy" />
-                  <col class="c-ops" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>名称</th>
-                    <th>网址</th>
-                    <th>分组</th>
-                    <th title="跟随全局 / 直连 / 单独代理。单独代理只在关掉「登录态共享」后生效——同一个浏览器进程只能有一个代理">代理策略</th>
-                    <th class="ops">操作</th>
-                  </tr>
-                </thead>
-                <tbody id="ai-rows"></tbody>
-              </table>
+            <!--
+              下面两行挂 .st-row-inline：它们的控件列一旦按内容估宽就会超出行宽，
+              被 .st-row 的 flex-wrap 整条挤到标签下面（行高 39 → 65），并排的
+              「浏览器内核」就会比这张卡矮一截。类名的含义见 styles.css 那条注释。
+            -->
+            <div class="st-row st-row-inline">
+              <span class="st-row-label">
+                <label class="st-name" for="proxy-mode">全局代理</label>
+                <i class="st-info" tabindex="0" title="决定分格里的网页默认走哪条线路；「跟随系统」会读 Windows 的代理设置">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="proxy-mode">
+                  <option value="system">跟随系统</option>
+                  <option value="custom">自定义</option>
+                  <option value="none">直连</option>
+                </select>
+                <select id="proxy-type">
+                  <option value="http">HTTP</option>
+                  <option value="https">HTTPS</option>
+                  <option value="socks5">SOCKS5</option>
+                </select>
+              </div>
             </div>
 
-            <div class="st-add">
-              <input type="text" id="new-ai-name" class="st-add-name" placeholder="名称" />
-              <input type="text" id="new-ai-url" class="grow" placeholder="https://..." />
-              <select id="new-ai-category">
-                <option value="us">国外 AI</option>
-                <option value="cn">国内 AI</option>
-              </select>
-              <select id="new-ai-proxy">
-                <option value="global">跟随全局</option>
-                <option value="direct">直连</option>
-                <option value="custom">单独代理</option>
-              </select>
-              <button type="button" class="st-btn small" id="btn-add-ai">添加</button>
+            <div class="st-row st-row-inline">
+              <span class="st-row-label">
+                <span class="st-name">服务器</span>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="proxy-host" class="grow" placeholder="127.0.0.1" />
+                <input type="text" id="proxy-port" class="st-num" placeholder="端口" />
+              </div>
             </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="proxy-bypass">绕过列表</label>
+                <i class="st-info" tabindex="0" title="分号分隔，例如 intranet.com;*.local；命中的地址直连，不经过代理">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="proxy-bypass" class="grow" placeholder="intranet.com;*.local" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <span class="st-name">系统代理</span>
+              </span>
+              <div class="st-row-ctl">
+                <span class="st-row-note" id="system-proxy">检测中…</span>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="proxy-test-url">连通性测试</label>
+                <i class="st-info" tabindex="0" title="用上面这套代理去访问这个地址，最多等 15 秒；结果只反映这一条线路通不通">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="text" id="proxy-test-url" class="grow" value="https://www.google.com" />
+                <button type="button" class="st-btn small" id="btn-test-proxy">测试</button>
+              </div>
+            </div>
+
+            <div class="st-statusline"><span class="result" id="proxy-result"></span></div>
           </div>
         </section>
 
@@ -268,73 +308,51 @@
           </div>
         </section>
 
-        <!-- ==================== 代理设置 ==================== -->
-        <section class="st-card">
+        <!-- ==================== AI 服务 ==================== -->
+        <section class="st-card wide">
           <div class="st-card-head">
-            <h2>代理设置</h2>
-            <span>改动会自动重启受影响的实例</span>
+            <h2>AI 服务</h2>
+            <span>分格底部选择器里的条目：分组决定归类，隐藏只是从选择器里摘掉，已经开着的格子不受影响</span>
           </div>
           <div class="st-card-body">
-            <div class="st-row">
-              <span class="st-row-label">
-                <label class="st-name" for="proxy-mode">全局代理</label>
-                <i class="st-info" tabindex="0" title="决定分格里的网页默认走哪条线路；「跟随系统」会读 Windows 的代理设置">i</i>
-              </span>
-              <div class="st-row-ctl">
-                <select id="proxy-mode">
-                  <option value="system">跟随系统代理</option>
-                  <option value="custom">自定义代理</option>
-                  <option value="none">不使用代理（直连）</option>
-                </select>
-                <select id="proxy-type">
-                  <option value="http">HTTP</option>
-                  <option value="https">HTTPS</option>
-                  <option value="socks5">SOCKS5</option>
-                </select>
-              </div>
+            <!-- 列表本身会随条目数无限变长，所以给它一个高度上限自己滚（表头 sticky），
+                 否则加满 30 个 AI 之后整页要滚四屏，上面那些卡片全被顶到看不见 -->
+            <div class="st-aiwrap">
+              <table class="st-table">
+                <colgroup>
+                  <col class="c-name" />
+                  <col />
+                  <col class="c-cat" />
+                  <col class="c-proxy" />
+                  <col class="c-ops" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>网址</th>
+                    <th>分组</th>
+                    <th title="跟随全局 / 直连 / 单独代理。单独代理只在关掉「登录态共享」后生效——同一个浏览器进程只能有一个代理">代理策略</th>
+                    <th class="ops">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="ai-rows"></tbody>
+              </table>
             </div>
 
-            <div class="st-row">
-              <span class="st-row-label">
-                <span class="st-name">服务器</span>
-              </span>
-              <div class="st-row-ctl">
-                <input type="text" id="proxy-host" class="grow" placeholder="127.0.0.1" />
-                <input type="text" id="proxy-port" class="st-num" placeholder="端口" />
-              </div>
+            <div class="st-add">
+              <input type="text" id="new-ai-name" class="st-add-name" placeholder="名称" />
+              <input type="text" id="new-ai-url" class="grow" placeholder="https://..." />
+              <select id="new-ai-category">
+                <option value="us">国外 AI</option>
+                <option value="cn">国内 AI</option>
+              </select>
+              <select id="new-ai-proxy">
+                <option value="global">跟随全局</option>
+                <option value="direct">直连</option>
+                <option value="custom">单独代理</option>
+              </select>
+              <button type="button" class="st-btn small" id="btn-add-ai">添加</button>
             </div>
-
-            <div class="st-row">
-              <span class="st-row-label">
-                <label class="st-name" for="proxy-bypass">绕过列表</label>
-                <i class="st-info" tabindex="0" title="分号分隔，例如 intranet.com;*.local；命中的地址直连，不经过代理">i</i>
-              </span>
-              <div class="st-row-ctl">
-                <input type="text" id="proxy-bypass" class="grow" placeholder="intranet.com;*.local" />
-              </div>
-            </div>
-
-            <div class="st-row">
-              <span class="st-row-label">
-                <span class="st-name">系统代理</span>
-              </span>
-              <div class="st-row-ctl">
-                <span class="st-row-note" id="system-proxy">检测中…</span>
-              </div>
-            </div>
-
-            <div class="st-row">
-              <span class="st-row-label">
-                <label class="st-name" for="proxy-test-url">连通性测试</label>
-                <i class="st-info" tabindex="0" title="用上面这套代理去访问这个地址，最多等 15 秒；结果只反映这一条线路通不通">i</i>
-              </span>
-              <div class="st-row-ctl">
-                <input type="text" id="proxy-test-url" class="grow" value="https://www.google.com" />
-                <button type="button" class="st-btn small" id="btn-test-proxy">测试</button>
-              </div>
-            </div>
-
-            <div class="st-statusline"><span class="result" id="proxy-result"></span></div>
           </div>
         </section>
 

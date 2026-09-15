@@ -111,12 +111,10 @@ async function main() {
     btn.click()
     return {
       label: document.getElementById('ratio-val').textContent,
-      px: document.getElementById('ratio-px').textContent,
       active: btn.classList.contains('active'),
     }
   })()`)
   check(presetUi?.label === '40%', '点预设后界面立刻变 40%', `label=${presetUi?.label}`)
-  check(/约 \d+ px/.test(presetUi?.px || ''), '给出实际像素估算', presetUi?.px)
   check(presetUi?.active === true, '按钮呈选中态')
   const r1 = await waitDisk((c) => Math.round((c.windowWidthRatio || 0) * 100) === 40)
   check(r1.ok, '写进 config.json', `耗时 ${r1.waited}ms`)
