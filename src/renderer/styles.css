@@ -989,8 +989,11 @@ label.st-name { cursor: pointer; }
   table-layout: fixed;
   border-collapse: collapse;
 }
-.st-table .c-name { width: 150px; }
-.st-table .c-cat { width: 106px; }
+/* ⚠️ 列序契约（与 settings.html 的 colgroup、settings.js 的行构建一致）：
+   拖柄 / 名称 / 网址 / 代理 / 操作。第 1 列是纯拖柄列（无表头文字）。
+   分组没有列 —— 分组就是那些小标题块本身，腾出来的宽度给了名称和网址。 */
+.st-table .c-grip { width: 26px; }
+.st-table .c-name { width: 140px; }
 .st-table .c-proxy { width: 120px; }
 .st-table .c-ops { width: 116px; }
 
@@ -1061,11 +1064,11 @@ label.st-name { cursor: pointer; }
   box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.18);
 }
 /* 名称是这一行的「主键」（正文亮度、稍重），网址是技术性内容（等宽小字好扫列）。
-   ⚠️ 按列的位置选，而不是按类名：JS 建行时没给 td 加 class，
-   列顺序（名称 / 网址 / 分组 / 代理 / 操作）就是这里的契约，改列序要连这两个
-   选择器一起改 */
-.st .st-table td:first-child input { font-weight: 500; }
-.st .st-table td:nth-child(2) input {
+   ⚠️ 按**类名**选（`.c-name` / `.c-url`），不再按 `td:first-child` / `td:nth-child(2)`：
+   第 1 列已经让给了拖柄，按位置选会让名称套上等宽小字、网址套上名称字重。
+   类名由 settings.js 建行时写死，列序契约见上面的 colgroup。 */
+.st .st-table td.c-name input { font-weight: 500; }
+.st .st-table td.c-url input {
   font-family: ui-monospace, Consolas, "Courier New", monospace;
   font-size: 11px;
   color: var(--text-dim);
@@ -1091,7 +1094,8 @@ label.st-name { cursor: pointer; }
  */
 .st-table tr.ai-hidden td { opacity: 0.5; }
 .st-table tr.ai-hidden:hover td { opacity: 0.85; }
-.st-table tr.ai-hidden td:first-child { box-shadow: inset 2px 0 0 #4a5262; }
+/* 竖标画在**第一格**（也就是拖柄格）的左边 —— 按类名选，别再按 `td:first-child` */
+.st-table tr.ai-hidden td.c-grip { box-shadow: inset 2px 0 0 #4a5262; }
 
 /* 单独代理那一行：td 由 JS 设了 colSpan=5，认属性比认类名稳（类名是 JS 写的） */
 .st-table td[colspan] {
@@ -1120,6 +1124,74 @@ label.st-name { cursor: pointer; }
   border-color: rgba(239, 95, 95, 0.5);
 }
 .st-table td.ops button.btn-danger:hover { border-color: var(--err); }
+
+/* ---------------- 分组标题 + 拖动排序 ---------------- */
+
+/**
+ * 分组小标题行。
+ *
+ * 分组顺序 = 分格底部选择器的顺序（国外在前、国内在后，见 settings.js 的 AI_GROUPS），
+ * 这样「拖到哪一组」和「选择器里排在哪」才是同一件事。
+ *
+ * ⚠️ 下面这几条必须排在 `.st-table td[colspan]`（给「单独代理」附属行用的那条）**之后**，
+ * 也排在 `.st-table tbody tr:hover td` 之后：两边的特异度相等，靠源码顺序定胜负 ——
+ * 排前面的话分组行会被附属行的底色和缩进顶掉、悬停时还会整行亮起来。
+ */
+.st-table tbody tr.st-group > td {
+  padding: 9px 6px 3px 32px;
+  border-top: 0;
+  /* 不透明：同卡片底色，免得吸入悬停高亮 */
+  background: #1c2029;
+  font-size: 11px;
+  color: var(--fg-faint);
+  letter-spacing: 0.4px;
+}
+/* 拖动时指针所在的那一组：标题变蓝，说明「松手会归到这一组」 */
+.st-table tbody tr.st-group.over > td { color: var(--accent); }
+
+/**
+ * 拖柄列。
+ *
+ * 常态就给一个 --fg-faint 的六点（"极淡常显"）：完全藏起来的话，第一次用的人
+ * 根本不知道这列能拖；但每行顶着一个亮图标又太吵 —— 折中就是比 --text-dim 再退一级，
+ * 鼠标移到该行才提亮。
+ */
+.st-table td.c-grip { padding: 2px 2px; }
+.st-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  border-radius: 5px;
+  color: var(--fg-faint);
+  cursor: grab;
+  /* 拖柄上不许起选区：否则按下时先选中文字，把拖动搅了 */
+  user-select: none;
+  -webkit-user-select: none;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+/* svg 不参与命中测试：拖动的起点始终是外面这个 span（dragstart 的 target 才稳定） */
+.st-grip svg { display: block; pointer-events: none; }
+.st-grip:hover { color: #c8cfdb; background: rgba(255, 255, 255, 0.05); }
+.st-grip:active { cursor: grabbing; }
+
+/* 被拖起来的那一行：半透明；拖影另有一份由浏览器按整行拍 */
+.st-table tbody tr.st-dragging > td { opacity: 0.45; }
+.st-table tbody tr.st-dragging td.c-grip { color: #c8cfdb; }
+/* 隐藏行本来就已经压到 0.5，拖动时再叠一层就看不清了 */
+.st-table tbody tr.st-dragging.ai-hidden > td { opacity: 0.3; }
+
+/**
+ * 落点蓝线。整行高度为 0 —— 插进表里不会让上面的行跳一下。
+ * ⚠️ 同样要排在 `.st-table td[colspan]` 之后（它的 td 带 colspan，会被那条命中）。
+ */
+.st-table tbody tr.st-drop > td { padding: 0; border-top: 0; background: transparent; }
+.st-table tbody tr.st-drop > td > div {
+  height: 2px;
+  margin: 2px 2px 3px;
+  border-radius: 1px;
+  background: var(--accent);
+}
 
 .st-add {
   display: flex;
@@ -1201,8 +1273,7 @@ label.st-name { cursor: pointer; }
  */
 @media (max-width: 720px) {
   .st-grid { grid-template-columns: minmax(0, 1fr); }
-  .st-table .c-name { width: 132px; }
-  .st-table .c-cat { width: 98px; }
+  .st-table .c-name { width: 118px; }
   .st-table .c-proxy { width: 110px; }
   .st-table .c-ops { width: 110px; }
   .st-add-name { width: 132px; }

@@ -310,25 +310,31 @@
         <section class="st-card wide">
           <div class="st-card-head">
             <h2>AI 服务</h2>
-            <span>分格底部选择器里的条目：分组决定归类，隐藏只是从选择器里摘掉，已经开着的格子不受影响</span>
+            <span>分格底部选择器里的条目：隐藏只是从选择器里摘掉，已经开着的格子不受影响；按住最左边的抓手拖动可以调整先后，把条目拖到另一组的标题下就改归那一组</span>
           </div>
           <div class="st-card-body">
             <!-- 列表本身会随条目数无限变长，所以给它一个高度上限自己滚（表头 sticky），
                  否则加满 30 个 AI 之后整页要滚四屏，上面那些卡片全被顶到看不见 -->
             <div class="st-aiwrap">
               <table class="st-table">
+                <!-- ⚠️ 列序契约：拖柄 / 名称 / 网址 / 代理 / 操作。
+                     第 1 列是纯拖柄列（无表头文字），最后一列是操作。
+                     「分组」没有独立列 —— 分组就是这些小标题块本身，
+                     改分组靠把条目拖到另一块里（跨组拖动会顺带改 category）。
+                     改列序必须连 styles.css 里那几条按类名的列样式和 settings.js
+                     里附属行的 colSpan 一起改。 -->
                 <colgroup>
+                  <col class="c-grip" />
                   <col class="c-name" />
                   <col />
-                  <col class="c-cat" />
                   <col class="c-proxy" />
                   <col class="c-ops" />
                 </colgroup>
                 <thead>
                   <tr>
+                    <th class="grip"></th>
                     <th>名称</th>
                     <th>网址</th>
-                    <th>分组</th>
                     <th title="跟随全局 / 直连 / 单独代理。单独代理只在关掉「登录态共享」后生效——同一个浏览器进程只能有一个代理">代理策略</th>
                     <th class="ops">操作</th>
                   </tr>

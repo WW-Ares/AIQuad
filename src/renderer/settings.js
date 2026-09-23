@@ -375,15 +375,253 @@ function findAi(id) {
   return cfg.aiList.find((a) => a.id === id)
 }
 
+/* ---------------- 分组 + 拖动排序 ---------------- */
+
+/**
+ * 分组标题的顺序**必须**与分格底部的选择器一致（见 app.js 的 renderMenu）：
+ * 国外在前、国内在后。第三组是兜底 —— `category` 被手改成别的值时不能把整行弄丢，
+ * 否则用户在界面上再也改不回来。
+ */
+const AI_GROUPS = [
+  { key: 'us', title: '国外 AI' },
+  { key: 'cn', title: '国内 AI' },
+  { key: null, title: '未分组' },
+]
+
+/** 某个条目属于第几组。认不出的值落进兜底组。 */
+function aiGroupIndex(ai) {
+  const k = ai.category || 'cn'
+  const i = AI_GROUPS.findIndex((g) => g.key === k)
+  return i < 0 ? AI_GROUPS.length - 1 : i
+}
+
+/** 拖柄的六点图标。`fill="currentColor"` 让颜色完全由 CSS 决定（常态淡、悬停亮）。 */
+const GRIP_SVG
+  = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor" aria-hidden="true">'
+  + '<circle cx="2.5" cy="3" r="1.2"/><circle cx="7.5" cy="3" r="1.2"/>'
+  + '<circle cx="2.5" cy="8" r="1.2"/><circle cx="7.5" cy="8" r="1.2"/>'
+  + '<circle cx="2.5" cy="13" r="1.2"/><circle cx="7.5" cy="13" r="1.2"/>'
+  + '</svg>'
+
+let dragId = null
+let dropAt = null
+let aiDragBound = false
+
+function clearDragUi() {
+  const tbody = $('ai-rows')
+  const ph = document.getElementById('ai-drop-ph')
+  if (ph) ph.remove()
+  tbody.querySelectorAll('tr.st-dragging').forEach((r) => r.classList.remove('st-dragging'))
+  tbody.querySelectorAll('tr.st-group.over').forEach((r) => r.classList.remove('over'))
+  dragId = null
+  dropAt = null
+}
+
+/** 落点蓝线用的占位行。整行高度为 0，插进表里不会让上面的行跳一下。 */
+function dropPlaceholder() {
+  let ph = document.getElementById('ai-drop-ph')
+  if (ph) return ph
+  ph = document.createElement('tr')
+  ph.id = 'ai-drop-ph'
+  ph.className = 'st-drop'
+  const td = document.createElement('td')
+  // 列数 = 拖柄 + 名称 + 网址 + 代理 + 操作 = 5，加减列要连这里一起改
+  td.colSpan = 5
+  td.appendChild(document.createElement('div'))
+  ph.appendChild(td)
+  return ph
+}
+
+/**
+ * 指针落在「第几组的第几个位置」。
+ *
+ * 组 = 最后一个 top 在指针上方的分组标题；位置 = 该组内第一条「中点低于指针」的行之前。
+ * 被拖的那一行要**排除在外**（它还在 DOM 里占着位置），否则算出的下标会差一。
+ * 这里返回的下标口径 = 「去掉被拖行之后」的位置，与 applyAiReorder 一致。
+ */
+function dropTargetAt(y) {
+  const tbody = $('ai-rows')
+  const heads = [...tbody.querySelectorAll('tr.st-group')]
+  if (!heads.length) return null
+  let gi = 0
+  heads.forEach((h, i) => { if (h.getBoundingClientRect().top <= y) gi = i })
+  const rows = [...tbody.querySelectorAll('tr.ai-row')]
+    .filter((r) => r.dataset.gi === heads[gi].dataset.gi && r.dataset.aiId !== dragId)
+  let index = rows.length
+  for (let i = 0; i < rows.length; i++) {
+    const box = rows[i].getBoundingClientRect()
+    if (y < box.top + box.height / 2) { index = i; break }
+  }
+  return { gi, index, headEl: heads[gi], rows }
+}
+
+/** 把蓝线插到算出来的落点上，并把目标组的标题点亮（说明松手会归到这一组） */
+function showDropLine(t) {
+  const tbody = $('ai-rows')
+  const ph = dropPlaceholder()
+  const heads = [...tbody.querySelectorAll('tr.st-group')]
+  // 落在这组末尾时就插到下一个组标题之前，别越过组边界
+  const want = t.rows[t.index] || heads[t.gi + 1] || null
+  // dragover 是跟着鼠标频率来的：落点没变就别动 DOM（insertBefore 会触发重排）
+  if (ph.parentNode !== tbody || ph.nextSibling !== want) tbody.insertBefore(ph, want)
+  heads.forEach((h, i) => h.classList.toggle('over', i === t.gi))
+}
+
+/**
+ * 把条目挪到「第 gi 组的第 index 个位置」。
+ *
+ * ⚠️ 不用「先按组排序、再整体重排」来简化：数组里各组的条目本来就可能交错
+ * （老配置、以及用户一次只挪一条），整体重排会顺带改掉用户没碰过的顺序。
+ * 做法：先把被拖的摘出来，再在**剩下的**数组里找「目标位置那条」当锚点、插到它前面；
+ * 落点在该组末尾时，锚点换成「组顺序比它更靠后的第一条」。
+ */
+function applyAiReorder(id, gi, index) {
+  const item = cfg.aiList.find((a) => a.id === id)
+  if (!item) return false
+  const rest = cfg.aiList.filter((a) => a.id !== id)
+  const key = AI_GROUPS[gi]?.key ?? null
+  // 跨组拖动顺带改分组。兜底组的 key 是 null，不改（否则会把 category 写成 null）
+  if (key !== null && (item.category || 'cn') !== key) item.category = key
+  const members = rest.filter((a) => aiGroupIndex(a) === gi)
+  const anchor = members[index]
+  let at
+  if (anchor) at = rest.indexOf(anchor)
+  else {
+    const last = members[members.length - 1]
+    if (last) at = rest.indexOf(last) + 1
+    else {
+      const later = rest.find((a) => aiGroupIndex(a) > gi)
+      at = later ? rest.indexOf(later) : rest.length
+    }
+  }
+  rest.splice(at, 0, item)
+  cfg.aiList = rest
+  return true
+}
+
+/**
+ * 拖动排序。用 HTML5 原生拖放（`draggable` + `dragover`/`drop`），
+ * 而不是拿 pointer 事件重造一套 —— 原生那套自带拖影、跨行移动、Esc 取消。
+ *
+ * 只在**拖柄**上挂 `draggable`，整行不挂：否则想选中名称里的文字就会误触发拖动。
+ * 事件全挂在 tbody 上做委托 —— `renderAiRows()` 每次都把行重建，挂在行上会跟着丢。
+ *
+ * 拖动**只写配置、不碰浏览器**：主进程 `save-config` 的重启判据只认
+ * 代理 / 窗口形态 / 登录态共享 / 浏览器选择（见 main/index.ts），`syncInstances()`
+ * 也是按「格子的 aiId 有没有变」做差量的 —— 所以重排不会把分格里的网页重开。
+ */
+function bindAiDrag() {
+  if (aiDragBound) return
+  aiDragBound = true
+  const tbody = $('ai-rows')
+
+  tbody.addEventListener('dragstart', (e) => {
+    const grip = e.target?.closest?.('.st-grip')
+    if (!grip) return
+    const tr = grip.closest('tr')
+    dragId = tr?.dataset?.aiId || null
+    if (!dragId) return
+    e.dataTransfer.effectAllowed = 'move'
+    // 不带文本时 Firefox 不会启动拖放（Chromium 只是无害地带上）
+    e.dataTransfer.setData('text/plain', dragId)
+    // 拖影取整行，而不是那个 10×16 的小抓手
+    try {
+      const g = grip.getBoundingClientRect()
+      const r = tr.getBoundingClientRect()
+      e.dataTransfer.setDragImage(tr, g.left + g.width / 2 - r.left, g.top + g.height / 2 - r.top)
+    }
+    catch {}
+    // 类名要等拖影拍完再加（拖影是 dragstart 同步拍的），否则拖起来的那份残影也是半透明的
+    setTimeout(() => tr.classList.add('st-dragging'), 0)
+  })
+
+  tbody.addEventListener('dragover', (e) => {
+    if (!dragId) return
+    // 不 preventDefault 就收不到 drop
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    const t = dropTargetAt(e.clientY)
+    if (!t) return
+    dropAt = t
+    showDropLine(t)
+  })
+
+  tbody.addEventListener('drop', async (e) => {
+    if (!dragId || !dropAt) return
+    e.preventDefault()
+    const id = dragId
+    const { gi, index } = dropAt
+    clearDragUi()
+    if (!applyAiReorder(id, gi, index)) return
+    // 先按新顺序重画（手感上立刻到位），落库回来再对一次：
+    // 万一主进程那边把配置整过形，界面不会跟真实配置脱节
+    renderAiRows()
+    await save(false)
+    renderAiRows()
+  })
+
+  tbody.addEventListener('dragend', () => clearDragUi())
+}
+
 function renderAiRows() {
   const tbody = $('ai-rows')
   tbody.innerHTML = ''
-  for (const ai of cfg.aiList) {
+  bindAiDrag()
+
+  /**
+   * 按分组分块渲染，而不是直接按数组顺序平铺。
+   *
+   * 分格底部的选择器是「先按分组过滤、再按数组顺序排」的（见 app.js renderMenu），
+   * 组间位置由 category 决定、不由数组位置决定。平铺时把一条拖过组界，选择器里
+   * 只会看到「组内先后」变了，像"没拖到那么远" —— 分成块之后拖动才所见即所得。
+   *
+   * 摊成一个 slots 序列（组标题 + 组内各行）而不是写两层循环，是为了让下面这段
+   * 逐行构建的代码保持原样。
+   */
+  const slots = []
+  for (let gi = 0; gi < AI_GROUPS.length; gi++) {
+    const items = cfg.aiList.filter((a) => aiGroupIndex(a) === gi)
+    // 兜底组空着就不画标题，免得平时多出一行莫名其妙的「未分组」
+    if (!items.length && AI_GROUPS[gi].key === null) continue
+    slots.push({ gi, head: AI_GROUPS[gi].title })
+    for (const ai of items) slots.push({ gi, ai })
+  }
+
+  for (const slot of slots) {
+    if (slot.head) {
+      const head = document.createElement('tr')
+      head.className = 'st-group'
+      head.dataset.gi = String(slot.gi)
+      const headTd = document.createElement('td')
+      headTd.colSpan = 5
+      headTd.textContent = slot.head
+      head.appendChild(headTd)
+      tbody.appendChild(head)
+      continue
+    }
+
+    const ai = slot.ai
     // 隐藏项整体压暗，一眼能看出"它还在，但不在选择器里"
     const tr = document.createElement('tr')
-    if (ai.hidden) tr.className = 'ai-hidden'
+    tr.className = ai.hidden ? 'ai-row ai-hidden' : 'ai-row'
+    tr.dataset.aiId = ai.id
+    tr.dataset.gi = String(slot.gi)
+
+    /**
+     * 拖柄列。只在**它自己**身上挂 draggable —— 整行可拖的话，
+     * 想用鼠标选中名称/网址里的文字就会变成拖动。
+     */
+    const tdGrip = document.createElement('td')
+    tdGrip.className = 'c-grip'
+    const grip = document.createElement('span')
+    grip.className = 'st-grip'
+    grip.draggable = true
+    grip.title = '按住拖动可调整顺序；拖到另一组的标题下会改归那一组'
+    grip.innerHTML = GRIP_SVG
+    tdGrip.appendChild(grip)
 
     const tdName = document.createElement('td')
+    tdName.className = 'c-name'
     const inName = document.createElement('input')
     inName.value = ai.name
     inName.addEventListener('change', () => {
@@ -394,6 +632,7 @@ function renderAiRows() {
     tdName.appendChild(inName)
 
     const tdUrl = document.createElement('td')
+    tdUrl.className = 'c-url'
     const inUrl = document.createElement('input')
     inUrl.value = ai.url
     inUrl.addEventListener('change', () => {
@@ -402,22 +641,6 @@ function renderAiRows() {
       scheduleSave(200)
     })
     tdUrl.appendChild(inUrl)
-
-    const tdCat = document.createElement('td')
-    const cat = document.createElement('select')
-    for (const [v, t] of [['us', '国外 AI'], ['cn', '国内 AI']]) {
-      const o = document.createElement('option')
-      o.value = v
-      o.textContent = t
-      if ((ai.category || 'cn') === v) o.selected = true
-      cat.appendChild(o)
-    }
-    cat.addEventListener('change', () => {
-      const cur = findAi(ai.id)
-      if (cur) cur.category = cat.value
-      scheduleSave(0)
-    })
-    tdCat.appendChild(cat)
 
     const tdProxy = document.createElement('td')
     const sel = document.createElement('select')
@@ -471,12 +694,13 @@ function renderAiRows() {
 
     tdOp.append(hide, del)
 
-    tr.append(tdName, tdUrl, tdCat, tdProxy, tdOp)
+    tr.append(tdGrip, tdName, tdUrl, tdProxy, tdOp)
     tbody.appendChild(tr)
 
     if (ai.proxyMode === 'custom') {
       const tr2 = document.createElement('tr')
       const td = document.createElement('td')
+      // ⚠️ 列数 = 拖柄 + 名称 + 网址 + 代理 + 操作 = 5，加/减列要连这里一起改
       td.colSpan = 5
       const sel2 = document.createElement('select')
       for (const v of ['http', 'https', 'socks5']) {
