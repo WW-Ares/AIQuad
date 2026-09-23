@@ -200,6 +200,8 @@ export class InstanceManager {
   private zTimer: NodeJS.Timeout | null = null
   /** 前台窗口事件的退订函数（见 watchForeground → onForeground） */
   private unForeground: (() => void) | null = null
+  /** 上次"误认领自愈"复核的时刻（见 auditClaims） */
+  private lastClaimAuditAt = 0
 
   constructor(
     private opts: {
@@ -476,6 +478,8 @@ export class InstanceManager {
       if (!live) this.prepareProfile(profileDir)
 
       let exitCode: number | null = null
+      // 记下 spawn 时刻：独立档案模式下用它排除"用户自己早就开着的浏览器窗口"（见 claimsAsOwnBrowser）
+      const spawnAt = Date.now()
       const proc = await this.spawnBrowser(this.buildArgs(ai, profileDir, useShared))
       proc.on('exit', (code) => {
         exitCode = code
@@ -488,7 +492,7 @@ export class InstanceManager {
       // 所以不能把退出当失败——真正的判据是"窗口有没有出现"
       proc.unref()
 
-      const win = await this.waitNewWindow(beforeWindows, 45000)
+      const win = await this.waitNewWindow(beforeWindows, 45000, { spawnAt, shared: useShared })
       if (!win) {
         throw new Error(`未找到浏览器窗口${exitCode !== null ? `（启动进程已退出 code ${exitCode}）` : ''}`)
       }
@@ -799,11 +803,14 @@ export class InstanceManager {
    * 而不是"某个 pid 的窗口"——共享会话下新窗口属于**已经在运行**的进程，
    * 刚 spawn 的那个子进程只是把命令行交出去就退了，PID 根本对不上。
    */
-  private async waitNewWindow(before: Set<number>, timeoutMs: number): Promise<w32.BrowserWindowInfo | null> {
+  private async waitNewWindow(before: Set<number>, timeoutMs: number, spawn?: { spawnAt: number, shared: boolean }): Promise<w32.BrowserWindowInfo | null> {
     const start = Date.now()
+    const spawnAt = spawn?.spawnAt ?? 0
+    const shared = !!spawn?.shared
     for (;;) {
       const fresh = w32.listBrowserWindows()
         .filter((w) => !before.has(w.hwnd) && !this.claimed.has(w.hwnd))
+        .filter((w) => this.claimsAsOwnBrowser(w, spawnAt, shared))
       if (fresh.length) {
         // 极端情况下可能同时冒出多个（浏览器顺带弹出的页面），取面积最大的主窗口
         fresh.sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height)
@@ -815,6 +822,165 @@ export class InstanceManager {
       }
       if (Date.now() - start >= timeoutMs) return null
       await sleep(60)
+    }
+  }
+
+  /**
+   * 认领前的"验明正身"：这个窗口真的属于我们启动的浏览器吗？
+   *
+   * 为什么必须查：认领判据（类名 `Chrome_WidgetWin_1` + 内含 RenderWidgetHost 子窗口）
+   * 对 **Electron**（WorkBuddy / VS Code / Discord…）与 **WebView2**（Tauri 2 应用…）
+   * **同样成立**——它们是同一个 Chromium 窗口实现。光看长相会把别人的窗口抢过来，
+   * 轻则它跑进分格里，重则退出 AIQuad 时把它一起关掉（2026-09-23 查实，命中 WorkBuddy）。
+   *
+   * 四条判据，任一不过即否决：
+   *  ① exe 必须是浏览器：已知路径时要求**完整路径一致**，否则退回按文件名认。
+   *  ② **命令行必须带本应用档案目录**（`--user-data-dir=<profilesRoot>/…`）——唯一能
+   *     区分"我们的浏览器"和"用户自己开的同一个浏览器"的判据（2026-09-23 加，见
+   *     commandLineIsOurs）。读不到命令行时**不表态**，退回 ① 的老办法。
+   *  ③ **独立档案模式**下，进程创建时间不得早于本次 spawn（排除用户自己早就开着的
+   *     浏览器窗口与 pid 复用）。共享会话下**跳过此条**——那时新窗口属于**已经在运行**
+   *     的浏览器进程，创建时间当然早于本次 spawn，卡它会把自家窗口也挡掉。
+   *  ④ 取不到依据时（exe / 创建时间 / 命令行任一读不到）**放行**：宁可偶尔漏，
+   *     也不能把自家窗口挡在门外，否则这一格会一路卡到 45 秒超时，比误认还难看。
+   */
+  private claimsAsOwnBrowser(w: w32.BrowserWindowInfo, spawnAt: number, shared: boolean): boolean {
+    const exe = w32.processImagePath(w.pid)
+    if (!exe) return true
+    const norm = exe.replace(/\\/g, '/').toLowerCase()
+    const known = (this.opts.browser.exePath || '').replace(/\\/g, '/').toLowerCase()
+    if (known) {
+      if (norm !== known) return false
+    }
+    else {
+      const base = norm.split('/').pop() ?? ''
+      if (base !== 'chrome.exe' && base !== 'msedge.exe') return false
+    }
+    /**
+     * ② 命令行判据：**唯一能分清亲疏的一条**。
+     *
+     * exe 相同不代表是我们起的（用户自己开的 Chrome 同 exe）；反过来，命令行里带着
+     * 本应用的档案目录，就必然是被我们拉起来的。读不到命令行（`null`）就放行，
+     * 交给下一条创建时间判据兜。
+     */
+    if (this.commandLineIsOurs(w.pid) === false) return false
+    if (!shared && spawnAt) {
+      const created = w32.processCreationTime(w.pid)
+      // 留 5 秒容差：spawn 到进程真正起来之间有调度延迟
+      if (created && created < spawnAt - 5000) return false
+    }
+    return true
+  }
+
+  /**
+   * 误认领的**自愈**兜底（每 30 秒跑一次，见 verifyGeometry）。
+   *
+   * 认领判据再收紧也做不到 100% 排他，所以定期复核一遍纪录里的窗口：它所属进程
+   * 还是不是我们的浏览器？不是就当场放回去、并把这一格重开。
+   *
+   * ⚠️ 判据必须看 **exe**，不能看"pid 还对不对"——误认领发生时 `inst.pid` 记下的
+   * 就是那个外来进程的 pid，拿它自比永远自洽，等于没查（这正是当初没察觉的原因）。
+   */
+  private auditClaims() {
+    if (!this.instances.size) return
+    for (const [paneId, inst] of [...this.instances]) {
+      const hwnd = inst.hwnd
+      if (!hwnd || !w32.isWindow(hwnd)) continue
+      const pid = w32.getWindowPid(hwnd)
+      const exe = w32.processImagePath(pid)
+      // 取不到路径时不动：宁可漏一轮，也不能把自家窗口放跑
+      if (!exe) continue
+      if (!this.isBrowserExe(exe)) {
+        console.warn(`[instance] 分格 ${paneId} 认错窗口（${exe}）→ 当场放回并重开`)
+        this.releaseForeignWindow(paneId, inst)
+        continue
+      }
+      /**
+       * ② 同一个 exe 也要复核一遍。
+       *
+       * AIQuad 用的就是系统装的那个 Chrome，**用户自己开的 Chrome 窗口 exe 一模一样**，
+       * 光比 exe 认不出亲疏（这条缝 2026-09-23 实测确认）。命令行里没有本应用档案目录
+       * → 确认不是我们认领的窗口。读不到命令行（`null`）时不动，宁可漏一轮。
+       */
+      if (this.commandLineIsOurs(pid) === false) {
+        console.warn(`[instance] 分格 ${paneId} 认到了同 exe 但不是我们的窗口 → 当场放回并重开`)
+        this.releaseForeignWindow(paneId, inst)
+      }
+    }
+  }
+
+  /** exe 是不是我们的浏览器：优先与已知路径比，其次按文件名认（chrome.exe / msedge.exe） */
+  private isBrowserExe(exe: string): boolean {
+    const norm = exe.replace(/\\/g, '/').toLowerCase()
+    const known = (this.opts.browser.exePath || '').replace(/\\/g, '/').toLowerCase()
+    if (known && norm === known) return true
+    const base = norm.split('/').pop() ?? ''
+    return base === 'chrome.exe' || base === 'msedge.exe'
+  }
+
+  /**
+   * 这个进程**是不是我们启动的浏览器**——命令行判据，唯一的那条硬证据。
+   *
+   * 三态返回，调用方必须按三态处理：
+   *   `true`  —— 命令行里的 `--user-data-dir` 落在本应用档案根下，确认是我们起的；
+   *   `false` —— **读到了**命令行，但里面没有本应用档案目录（要么压根没带
+   *              `--user-data-dir`，比如用户自己开的 Chrome；要么指向别处）
+   *              → 确认**不是**我们；
+   *   `null`  —— 命令行读不到（进程刚退出 / 权限不足 / 32 位目标的偏移对不上）
+   *              → **不表态**，调用方退回"只看 exe"的老判据。
+   *
+   * 为什么必须有它：`isBrowserExe` 只能回答"是不是浏览器"。AIQuad 用的就是用户机器上
+   * 装的那份 Chrome，用户自己开的 Chrome 窗口 exe 一模一样 → 认领、自愈、关闭保护
+   * 三处判据全部失效（2026-09-23 实测确认这条缝）。而 `--user-data-dir` 是启动参数，
+   * 只有被我们拉起来的进程才有，别人不可能碰巧带上。
+   *
+   * ⚠️ 不能简化成"命令行里有没有 `--user-data-dir`"：AIQuad 自己的 Electron 进程也带
+   * （值是 `...\Roaming\aiquad`，比档案根少一层），Edge 的 crashpad 子进程也带自己的。
+   * 必须**归一化后按档案根比对**。
+   */
+  private commandLineIsOurs(pid: number): boolean | null {
+    if (!pid) return null
+    const cl = w32.processCommandLine(pid)
+    if (!cl) return null
+    /** 统一大小写与斜杠，并去掉尾部斜杠 */
+    const norm = (s: string) => s.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    const root = norm(this.opts.profilesRoot || '')
+    const m = /--user-data-dir=(?:"([^"]*)"|([^\s"]*))/i.exec(cl)
+    if (!root || !m) return false
+    const dir = norm(m[1] ?? m[2] ?? '')
+    return !!dir && (dir === root || dir.startsWith(`${root}/`))
+  }
+
+  /**
+   * 把误认来的窗口**还原成普通窗口**，然后把这一格重开。
+   *
+   * 还原动作与认领时做的三件事一一对应：撤销 `SetWindowRgn` 裁剪、清掉置顶、
+   * 恢复普通显示状态、摘掉工具窗口样式（让它回到任务栏与 Alt+Tab）。
+   *
+   * ⚠️ 这里**绝不能走 `kill()` / `releaseWindow()`**：那个窗口是别人的程序，
+   * 发 `WM_CLOSE` 或 `process.kill` 会把它一起关掉——正是要避免的最严重后果。
+   */
+  private releaseForeignWindow(paneId: string, inst: ManagedInstance) {
+    const hwnd = inst.hwnd
+    this.instances.delete(paneId)
+    if (hwnd && w32.isWindow(hwnd)) {
+      this.claimed.delete(hwnd)
+      try {
+        w32.setWindowRegion(hwnd, null)
+        w32.setTopMost(hwnd, false)
+        w32.showWindow(hwnd, w32.SW_SHOWNORMAL)
+        w32.restoreAppWindow(hwnd)
+      }
+      catch {}
+    }
+    try {
+      inst.cdp?.close()
+    }
+    catch {}
+    // 重开这一格（force=true：不复用刚被放弃的记账）
+    const ai = this.opts.config().aiList.find((a) => a.id === inst.aiId)
+    if (ai) {
+      this.launch(paneId, ai, true).catch((e) => console.warn('[instance] 误认领后重开失败', e))
     }
   }
 
@@ -1178,6 +1344,16 @@ export class InstanceManager {
     if (this.sliding) return
 
     /**
+     * 误认领自愈（见 auditClaims）：30ms 一跳没必要每轮都查，30 秒复核一次足够。
+     * 放在逐格核对**之前**：它会增删 instances，先改完再遍历，避免边遍历边改。
+     */
+    const now = Date.now()
+    if (now - this.lastClaimAuditAt > 30000) {
+      this.lastClaimAuditAt = now
+      this.auditClaims()
+    }
+
+    /**
      * ④ 层级：有没有自家窗口跑到面板上面去了。
      *
      * 正常路径靠前台事件钩子在 13~30ms 内按回去（见 `onForeground`），这一步只是兜底：
@@ -1528,10 +1704,13 @@ export class InstanceManager {
   /**
    * 鼠标是否落在某个**已就位**的分格上（坐标取 DIP 屏幕坐标系）。
    *
-   * 用途只有一个：面板显示的那一瞬间，主进程要靠它决定面板的初始鼠标穿透状态。
-   * 之后再靠渲染层的 mousemove 逐帧修正——主进程收不到鼠标移动，只能算这一下。
+   * `origin` 是"**按哪个位置算分格**"，默认用面板的当前原点。呼出动画期间必须显式传
+   * 目标/当前帧的原点——那时面板窗口正在屏幕外往回收，用它的实时位置算出来的永远是
+   * "鼠标不在分格上"（分格跟着面板一起在屏幕外），而这**不是**落位后的事实。
+   * 实测（`.tmp/verify-passthrough-show.js`）：不传 origin 时，呼出后头 338ms 一律判成
+   * 不穿透，手指快一点的那一下点击就被面板吃掉——这就是"呼出后点不动"的一半。
    */
-  cursorOverPane(): boolean {
+  cursorOverPane(origin?: { x: number, y: number }): boolean {
     let pt: { x: number, y: number }
     try {
       pt = screen.getCursorScreenPoint()
@@ -1539,8 +1718,8 @@ export class InstanceManager {
     catch {
       return false
     }
-    const px = this.panel.x
-    const py = this.panel.y
+    const px = origin ? origin.x : this.panel.x
+    const py = origin ? origin.y : this.panel.y
     for (const inst of this.instances.values()) {
       if (!inst.shown) continue
       const r = this.rects.get(inst.paneId)
@@ -1656,9 +1835,34 @@ export class InstanceManager {
     inst.targetId = undefined
     if (!hwnd) return
     this.claimed.delete(hwnd)
+    /**
+     * 只有"确实是我们的浏览器窗口"才发 WM_CLOSE。
+     *
+     * 万一认错了窗口（把别人的程序当成分格），这一发会把它一起关掉——用户看到的正是
+     * "一退 AIQuad，WorkBuddy 也跟着没了"。自愈（auditClaims）通常已经先纠正了，
+     * 这里再兜一层：宁可留着不关，也不能误伤别人的程序。
+     */
+    if (!w32.isWindow(hwnd)) return
+    const pid = w32.getWindowPid(hwnd)
+    const exe = w32.processImagePath(pid)
+    if (exe && !this.isBrowserExe(exe)) {
+      console.warn(`[instance] 放弃关闭非浏览器窗口（${exe}）`)
+      return
+    }
+    /**
+     * ② 同一个 exe 的还要再确认一次。
+     *
+     * 用户自己开的 Chrome 与我们的浏览器 exe 一模一样，命令行里没有本应用档案目录
+     * 就不是我们的窗口，这一发 `WM_CLOSE` 绝不能发出去。读不到命令行时按老办法放行
+     * （正常关自家窗口不能因为读不到就卡住）。
+     */
+    if (this.commandLineIsOurs(pid) === false) {
+      console.warn('[instance] 放弃关闭"同 exe 但不是我们的"窗口（命令行无本应用档案目录）')
+      return
+    }
     // 用 WM_CLOSE 而不是强杀：浏览器会走完整的退出流程，
     // 刚登录写下的 Cookie 才会真正落盘
-    if (w32.isWindow(hwnd)) w32.postClose(hwnd)
+    w32.postClose(hwnd)
   }
 
   kill(paneId: string, remove = true) {

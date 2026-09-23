@@ -50,6 +50,31 @@ export const WM_CLOSE = 0x0010
 
 const OpenProcess = kernel32.func('OpenProcess', HANDLE, [UINT, BOOL, 'uint32'])
 const CloseHandle = kernel32.func('CloseHandle', BOOL, [HANDLE])
+// 认领浏览器窗口前的"验明正身"要用到它们（见 instance-manager 的 waitNewWindow）
+const QueryFullProcessImageNameW = kernel32.func('QueryFullProcessImageNameW', BOOL, [HANDLE, UINT, 'char16 *', 'uint32 *'])
+const GetProcessTimes = kernel32.func('GetProcessTimes', BOOL, [HANDLE, 'uint8 *', 'uint8 *', 'uint8 *', 'uint8 *'])
+// 读"别的进程的命令行"要下到它的 PEB 里掏（见 processCommandLine）
+const ReadProcessMemory = kernel32.func('ReadProcessMemory', BOOL, [HANDLE, 'uint64', 'uint8 *', 'uint64', 'uint64 *'])
+const NtQueryInformationProcess = ntdll.func('NtQueryInformationProcess', 'int32', [HANDLE, INT, 'uint8 *', UINT, 'uint32 *'])
+
+/**
+ * 跨进程只读查询所需的最小权限。
+ *
+ * **不要用 `PROCESS_ALL_ACCESS`**：那是给自家子进程的，碰上别的进程
+ * （WorkBuddy、VS Code 这类）`OpenProcess` 会直接失败返回 0，校验就形同虚设。
+ * 只读查 exe 路径 / 创建时间，`QUERY_LIMITED_INFORMATION` 就够了。
+ */
+export const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+/**
+ * 下到目标进程的 PEB 里读命令行所需的权限（见 processCommandLine）。
+ *
+ * 比 `QUERY_LIMITED_INFORMATION` 高一级：跨进程读内存必须带 `VM_READ`，
+ * 而 `VM_READ` 只认 `QUERY_INFORMATION`。两个都是**只读**权限、不需要提权，
+ * 所以对别人的进程（用户自己的 Chrome 等）一样能拿到——这正是我们要的。
+ */
+export const PROCESS_QUERY_INFORMATION = 0x0400
+export const PROCESS_VM_READ = 0x0010
 
 // 窗口区域裁剪：用来把浏览器自带的标签栏/地址栏从可视区裁掉
 const CreateRectRgn = gdi32.func('CreateRectRgn', HANDLE, [INT, INT, INT, INT])
@@ -156,6 +181,31 @@ export function makeToolWindow(hwnd: number | bigint, refresh = false) {
   }
   catch (e) {
     console.warn('[win32] makeToolWindow failed', e)
+  }
+}
+
+/**
+ * `makeToolWindow` 的反向操作：去掉 WS_EX_TOOLWINDOW、补回 WS_EX_APPWINDOW，
+ * 让窗口重新回到任务栏与 Alt+Tab。
+ *
+ * 用途：万一认错了窗口（把别人的程序当成分格浏览器抢了过来），自愈时要把它
+ * 原样还回去（见 instance-manager 的 releaseForeignWindow）。
+ */
+export function restoreAppWindow(hwnd: number | bigint) {
+  try {
+    let ex = Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    ex = (ex | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, BigInt(ex))
+    // 扩展样式的改动要带 SWP_FRAMECHANGED 才会被系统重新套用
+    SetWindowPos(
+      hwnd,
+      0,
+      0, 0, 0, 0,
+      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+  }
+  catch (e) {
+    console.warn('[win32] restoreAppWindow failed', e)
   }
 }
 
@@ -788,6 +838,144 @@ export function getWindowPid(hwnd: number | bigint): number {
   }
   catch {
     return 0
+  }
+}
+
+/**
+ * 取进程可执行文件的**完整路径**（失败返回空串）。
+ *
+ * 用途：认领分格窗口前先验明正身（见 instance-manager 的 waitNewWindow）。
+ *
+ * 为什么必须验：判据"窗口类名是 `Chrome_WidgetWin_1`、里面装着
+ * `Chrome_RenderWidgetHostHWND`"对 **Electron**（WorkBuddy / VS Code / Discord…）
+ * 和 **WebView2**（Tauri 2 应用等）**同样成立**——它们是同一个 Chromium 窗口实现。
+ * 光看长相，AIQuad 会把别人的窗口当成自己的分格抢过来，退出时还会把它一起关掉。
+ * 唯一可靠的区分是"这个窗口属于哪个 exe"。
+ */
+export function processImagePath(pid: number): string {
+  if (!pid) return ''
+  let h = 0
+  try {
+    h = Number(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))
+    if (!h) return ''
+    const cap = new Uint32Array(1)
+    cap[0] = 1024
+    const buf = Buffer.alloc(2048)
+    const ok = QueryFullProcessImageNameW(h, 0, buf, cap)
+    return ok ? buf.toString('utf16le', 0, cap[0] * 2) : ''
+  }
+  catch {
+    return ''
+  }
+  finally {
+    if (h) {
+      try { CloseHandle(h) } catch {}
+    }
+  }
+}
+
+/**
+ * 取进程创建时间（Unix 毫秒时间戳；取不到返回 0）。
+ *
+ * 用途：认领窗口时排除"用户自己早就开着的浏览器窗口"和 pid 复用。
+ * FILETIME 是 100ns 单位、从 1601-01-01 起算，换算成 Unix 毫秒要减掉
+ * 两者相隔的 11644473600 秒。
+ */
+export function processCreationTime(pid: number): number {
+  if (!pid) return 0
+  let h = 0
+  try {
+    h = Number(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))
+    if (!h) return 0
+    const creation = Buffer.alloc(8)
+    const exitTime = Buffer.alloc(8)
+    const kernelTime = Buffer.alloc(8)
+    const userTime = Buffer.alloc(8)
+    if (!GetProcessTimes(h, creation, exitTime, kernelTime, userTime)) return 0
+    const filetime = creation.readBigUInt64LE(0)
+    if (filetime === 0n) return 0
+    return Number(filetime / 10000n) - 11644473600000
+  }
+  catch {
+    return 0
+  }
+  finally {
+    if (h) {
+      try { CloseHandle(h) } catch {}
+    }
+  }
+}
+
+/** 跨进程读一段内存（读不满 size 就当失败，返回 null） */
+function readMem(h: number, addr: bigint, size: number): Buffer | null {
+  try {
+    const buf = Buffer.alloc(size)
+    const got = Buffer.alloc(8)
+    if (!ReadProcessMemory(h, addr, buf, BigInt(size), got)) return null
+    return got.readBigUInt64LE(0) === BigInt(size) ? buf : null
+  }
+  catch {
+    return null
+  }
+}
+
+/** 跨进程读一个指针（x64 上是 8 字节） */
+function readPtr(h: number, addr: bigint): bigint {
+  const b = readMem(h, addr, 8)
+  return b ? b.readBigUInt64LE(0) : 0n
+}
+
+/**
+ * 取进程的**完整命令行**（取不到返回空串）。
+ *
+ * 为什么需要它：`processImagePath` 只能回答"这是不是一个浏览器"，回答不了
+ * **"这是不是我们启动的那个浏览器"** —— AIQuad 用的就是用户机器上装的那份 Chrome，
+ * 用户自己开的 Chrome 窗口 exe 一模一样，光看 exe 认不出亲疏（2026-09-23 实测确认）。
+ * 真正唯一的判据是命令行里的 `--user-data-dir=<本应用档案目录>`。
+ *
+ * Win32 没有现成 API，只能自己下到目标进程的 PEB 里掏：
+ *   `NtQueryInformationProcess(ProcessBasicInformation)` → `PebBaseAddress`
+ *   `PEB + 0x20` → `RTL_USER_PROCESS_PARAMETERS`
+ *   `RTL_USER_PROCESS_PARAMETERS + 0x70` → `CommandLine`(UNICODE_STRING)
+ *   `ReadProcessMemory` → 字符串本体
+ *
+ * ⚠️ `0x20` / `0x70` 是 **x64 专用**偏移。对着 32 位（WOW64）进程读会掏出垃圾，
+ * 所以拿到结果后先做形态校验（命令行必然含 `.exe`），不像就返回空串，
+ * 让调用方退回"只看 exe"的老判据 —— **宁可漏判，也绝不能误判成"这不是我们的窗口"**
+ * （后者会把自家窗口挡在门外，那一格会一路卡到 45 秒超时，比误认还难看）。
+ */
+export function processCommandLine(pid: number): string {
+  if (!pid) return ''
+  let h = 0
+  try {
+    h = Number(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid))
+    if (!h) return ''
+    // ① PROCESS_BASIC_INFORMATION（x64 共 48 字节），PebBaseAddress 在 +8
+    const pbi = Buffer.alloc(48)
+    const ret = new Uint32Array(1)
+    if (NtQueryInformationProcess(h, 0, pbi, 48, ret) !== 0) return ''
+    const peb = pbi.readBigUInt64LE(8)
+    if (!peb) return ''
+    const pp = readPtr(h, peb + 0x20n)
+    if (!pp) return ''
+    // ② UNICODE_STRING：Length(2) + MaximumLength(2) + 对齐(4) + Buffer(8)
+    const us = readMem(h, pp + 0x70n, 16)
+    if (!us) return ''
+    const bytes = us.readUInt16LE(0)
+    const bufPtr = us.readBigUInt64LE(8)
+    if (!bytes || !bufPtr || bytes > 0x8000) return ''
+    const raw = readMem(h, bufPtr, bytes)
+    if (!raw) return ''
+    const s = raw.toString('utf16le').replace(/\0+$/, '')
+    return /\.exe/i.test(s) ? s : ''
+  }
+  catch {
+    return ''
+  }
+  finally {
+    if (h) {
+      try { CloseHandle(h) } catch {}
+    }
   }
 }
 

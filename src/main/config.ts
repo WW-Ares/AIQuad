@@ -3,7 +3,7 @@ import path from 'node:path'
 import type { AiService, AppConfig } from './types'
 import { normalizeAccelerator } from './accelerator'
 
-const CONFIG_VERSION = 5
+const CONFIG_VERSION = 6
 
 /**
  * 早期版本给"分格切换"预设了 Ctrl+Alt+1/2/4，实际会和其它软件抢键，
@@ -14,6 +14,24 @@ const LEGACY_LAYOUT_SHORTCUTS: Record<string, string> = {
   layout1: 'Ctrl+Alt+1',
   layout2: 'Ctrl+Alt+2',
   layout4: 'Ctrl+Alt+4',
+}
+
+/**
+ * 内置项的**网址订正**表（随 CONFIG_VERSION 6 一起跑一次）。
+ *
+ * 网址写死在 DEFAULT_AI 里，但老用户的 config.json 存的是当时那份完整对象，
+ * 而 `normalize()` 合并时是 `{...base, ...a}`——用户值覆盖默认值，所以**光改
+ * DEFAULT_AI 修不了老配置**（大王机器上就是这种情况）。
+ *
+ * 这里按 id 登记"历史默认值 → 新值"，迁移时**只订正没被改过的**（值仍等于
+ * 历史默认值）；用户自己填过的网址/名称一律不动。
+ *
+ * 已订正过：
+ * - qwen：chat.qwen.ai（Qwen 国际站，国内方向不对）→ qianwen.com（阿里"千问"
+ *   官网，2025-11-24 启用的新域名，产品同时由"通义千问"更名"千问"）。
+ */
+const AI_URL_FIXES: Record<string, { from: string, to: string, oldName?: string, newName?: string }> = {
+  qwen: { from: 'https://chat.qwen.ai/', to: 'https://www.qianwen.com/', oldName: '通义千问', newName: '千问' },
 }
 
 /**
@@ -28,7 +46,7 @@ const DEFAULT_AI: AiService[] = [
   { id: 'perplexity', name: 'Perplexity', url: 'https://www.perplexity.ai/', category: 'us', logo: '', proxyMode: 'global', builtin: true },
   { id: 'deepseek', name: 'DeepSeek', url: 'https://chat.deepseek.com/', category: 'cn', logo: 'deepseek.png', proxyMode: 'direct', builtin: true },
   { id: 'kimi', name: 'Kimi', url: 'https://www.kimi.com/', category: 'cn', logo: 'kimi.png', proxyMode: 'direct', builtin: true },
-  { id: 'qwen', name: '通义千问', url: 'https://chat.qwen.ai/', category: 'cn', logo: 'qwen.png', proxyMode: 'direct', builtin: true },
+  { id: 'qwen', name: '千问', url: 'https://www.qianwen.com/', category: 'cn', logo: 'qwen.png', proxyMode: 'direct', builtin: true },
   { id: 'doubao', name: '豆包', url: 'https://www.doubao.com/chat/', category: 'cn', logo: 'doubao.png', proxyMode: 'direct', builtin: true },
   { id: 'yuanbao', name: '元宝', url: 'https://yuanbao.tencent.com/chat/', category: 'cn', logo: 'yuanbao.png', proxyMode: 'direct', builtin: true },
   { id: 'glm', name: '智谱清言', url: 'https://chatglm.cn/', category: 'cn', logo: '', proxyMode: 'direct', builtin: true },
@@ -137,6 +155,18 @@ export class ConfigStore {
         seen.add(a.id)
         return true
       })
+
+    // 内置项网址订正（见 AI_URL_FIXES）：只改"仍是历史默认值"的那些，
+    // 用户自己填过的网址/名称保持原样。必须放在上面的 map 之后 ——
+    // 那里的 `{...base, ...a}` 已经让用户值覆盖了默认值。
+    if (this.loadedVersion < 6) {
+      for (const a of this.data.aiList as any[]) {
+        const fix = AI_URL_FIXES[a.id]
+        if (!fix) continue
+        if (a.url === fix.from) a.url = fix.to
+        if (fix.oldName && a.name === fix.oldName) a.name = fix.newName
+      }
+    }
 
     // 布局只保留 1 / 2 / 4；旧版本若有 '3' 迁移到 '2'（上下两格）
     const layout = String(this.data.layout)

@@ -66,6 +66,14 @@ function syncPassthrough(x, y) {
   setPassthrough(through)
 }
 
+/**
+ * 只在状态**翻转**时才发 IPC：鼠标每动一像素都过一次主进程的话，划词、拖日历
+ * 这类操作会发涩（见文件头）。
+ *
+ * 呼出面板那一下**不在这里**对齐：渲染层手上的点位可能是陈旧的，硬发一次反而会
+ * 覆盖掉主进程刚算对的值（见 panel-shown 的说明）。`passthrough` 被置 null 之后，
+ * 下一次真的翻转必定会上报。
+ */
 function setPassthrough(through) {
   if (through === passthrough) return
   passthrough = through
@@ -427,9 +435,23 @@ async function init() {
   })
   api.on('request-rects', () => reportRects())
   api.on('panel-shown', () => {
-    // 收再呼出时不该还挂着上一次展开的列表
+    // 收起再呼出时不该还挂着上一次展开的列表
     if (state.menuPane) toggleMenu(null)
     reportRects()
+    /**
+     * 只把穿透缓存作废，**不要**拿手上的点位主动上报一次。
+     *
+     * `pointerAt` 只在 mousemove 时更新；面板收起期间指针挪过的话它就是个**陈旧值**，
+     * 拿它算出的穿透状态会把主进程刚算对的结果覆盖掉——实测日志里看得清清楚楚：
+     * `+326ms` 主进程判对 `true`，`+328ms` 被渲染层的陈旧点位覆盖成 `false`，
+     * 面板于是又把鼠标收走，正是"呼出后点不动"的另一种成因。
+     *
+     * 主进程手上有 `screen.getCursorScreenPoint()`（永远新鲜），"呼出后这一下算哪边"
+     * 整个交给它（见 showPanel 的逐帧精算与 settleAfterShow）。
+     * 作废缓存就够了：等指针真的动起来，`setPassthrough` 不会再被"值没变"短路，
+     * 必定重算并上报。
+     */
+    passthrough = null
   })
   // 点在面板外面（别的窗口 / 桌面）：这条由主进程的前台窗口事件转发过来
   api.on('outside-click', () => {

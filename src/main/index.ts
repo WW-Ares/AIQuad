@@ -107,12 +107,34 @@ let animTimer: NodeJS.Timeout | null = null
  */
 let animating = false
 
+/**
+ * 当前动画的收尾回调。
+ *
+ * `done` 在动画**正常跑完**时调用，`abort` 在动画**被下一次滑动打断**时调用。
+ * 分成两路是必须的：showPanel 的收尾（校准穿透、摘任务栏、通知渲染层）被打断时
+ * 也得补一次（否则面板停在算错的穿透状态，表现为"呼出后几秒点不动"）；
+ * 而 hidePanel 的收尾（`win.hide()`）**绝不能**在呼出过程中被补跑——
+ * 它会把刚滑进来的面板又藏起来。所以只有声明了 `abort` 的调用才会被补。
+ */
+let animSettle: { done: () => void, abort?: () => void } | null = null
+
+/** 只停机、不触发任何收尾（强制打断 / 退出流程用） */
 function stopAnim() {
   if (animTimer) {
     clearTimeout(animTimer)
     animTimer = null
   }
   animating = false
+  animSettle = null
+}
+
+/** 停机并按原因触发收尾：被打断走 `abort`，正常结束走 `done` */
+function settleAnim(interrupted: boolean) {
+  const s = animSettle
+  stopAnim()
+  if (!s) return
+  if (interrupted) s.abort?.()
+  else s.done()
 }
 
 /**
@@ -136,19 +158,37 @@ function easeInOutCubic(t: number) {
 }
 
 /**
- * 按指针当前位置刷新面板的鼠标穿透状态。
+ * 上一次真正下发给窗口的穿透值，`null` 表示"还没下发过"。
  *
- * 指针停在分格（网页）上就穿透，让点击落到下面的浏览器窗口；
- * 停在顶栏 / 中缝 / 悬浮胶囊上就不穿透，让面板自己收下点击。
+ * `slideTo` 会**逐帧**精算穿透（见 slideTo 的 trackPassthrough），值没变时再调一次
+ * `setIgnoreMouseEvents` 纯属白费；渲染层的上报也走这一个记账，否则两边会把对方
+ * 刚设好的值当成"变了"再设一遍。
  */
-function applyPassthrough(win: BrowserWindow) {
-  if (!win || win.isDestroyed()) return
+let lastThrough: boolean | null = null
+
+function setThrough(win: BrowserWindow, through: boolean) {
+  if (through === lastThrough) return
+  lastThrough = through
   try {
-    win.setIgnoreMouseEvents(!!manager?.cursorOverPane(), { forward: true })
+    win.setIgnoreMouseEvents(through, { forward: true })
   }
   catch {
     // 窗口正在销毁时 setIgnoreMouseEvents 会抛，忽略即可
   }
+}
+
+/**
+ * 按指针当前位置刷新面板的鼠标穿透状态。
+ *
+ * 指针停在分格（网页）上就穿透，让点击落到下面的浏览器窗口；
+ * 停在顶栏 / 中缝 / 悬浮胶囊上就不穿透，让面板自己收下点击。
+ *
+ * `origin` 是"按哪个位置算分格"，见 `cursorOverPane`。呼出动画期间必须逐帧传当前原点，
+ * 否则算出来的永远是"鼠标不在分格上"（因为面板自己还在屏幕外，分格跟着它一起在屏幕外）。
+ */
+function applyPassthrough(win: BrowserWindow, origin?: { x: number, y: number }) {
+  if (!win || win.isDestroyed()) return
+  setThrough(win, !!manager?.cursorOverPane(origin))
 }
 
 /**
@@ -162,17 +202,28 @@ function applyPassthrough(win: BrowserWindow) {
  * 帧间隔取 8ms 而不是 16ms：Windows 的定时器精度本来就在 15.6ms 上下跳，
  * 按 16ms 排会稳定掉到 ~30fps；给密一点，实际落到 60fps 附近更稳。
  */
-function slideTo(fromX: number, toX: number, bounds: { y: number; width: number; height: number }, duration: number, onDone?: () => void) {
-  stopAnim()
+function slideTo(
+  fromX: number,
+  toX: number,
+  bounds: { y: number; width: number; height: number },
+  duration: number,
+  onDone?: () => void,
+  onAbort?: () => void,
+  /** 呼出用 true：滑动过程中逐帧精算穿透（见 step 里的说明） */
+  trackPassthrough = false,
+) {
+  // 打断上一次滑动：它若声明了"被打断也要收尾"，就在这里补上（见 animSettle）
+  settleAnim(true)
   animating = true
+  animSettle = (onDone || onAbort) ? { done: onDone ?? (() => {}), abort: onAbort } : null
   // 滑动期间冻结几何校准，否则内衬重测带来的几像素抖动会一路干扰动画（见 setSliding）
   manager?.setSliding(true)
   const started = Date.now()
   const step = () => {
     if (!panelWindow || panelWindow.isDestroyed()) {
-      stopAnim()
-      animating = false
+      // 窗口都没了，收尾按"被打断"处理（回调里自带 isDestroyed 守卫）
       manager?.setSliding(false)
+      settleAnim(true)
       return
     }
     const t = Math.min(1, (Date.now() - started) / duration)
@@ -180,12 +231,21 @@ function slideTo(fromX: number, toX: number, bounds: { y: number; width: number;
     panelWindow.setBounds({ x, y: bounds.y, width: bounds.width, height: bounds.height })
     // 面板的新位置立刻交给浏览器窗口，同帧移动
     manager?.setPanelPosition(x, bounds.y)
+    /**
+     * 呼出动画期间**逐帧**精算穿透。
+     *
+     * 面板是从屏幕外滑进来的，所以"按面板实时位置算"的结果会自然地从
+     * 「鼠标不在分格上」过渡到「在」，恰好等于用户看到的事实：分格还没滑到指针底下时
+     * 先不穿透（免得点击穿透到下面那个无关程序），滑到了立刻穿透（这一下要落到网页上）。
+     *
+     * 不逐帧算、只等动画结束后的收尾纠正一次的话，实测要等到 **+338ms** 才变对，
+     * 手指快一点的第一下点击正好落在错窗里，表现就是"呼出后第一下点不动"。
+     */
+    if (trackPassthrough) applyPassthrough(panelWindow, { x, y: bounds.y })
     if (t >= 1) {
-      stopAnim()
-      animating = false
       // 先解除冻结（会补一次完整校准），再交给收尾逻辑
       manager?.setSliding(false)
-      onDone?.()
+      settleAnim(false)
       return
     }
     animTimer = setTimeout(step, 8)
@@ -206,6 +266,9 @@ function applyAlwaysOnTop() {
 function createPanelWindow() {
   const cfg = config.get()
   const b = targetBounds()
+
+  // 新窗口的初始穿透状态是"不穿透"，记账跟着归零，免得沿用上一个窗口的值而漏下发
+  lastThrough = null
 
   panelWindow = new BrowserWindow({
     x: b.x,
@@ -365,19 +428,6 @@ function showPanel() {
   // 面板与浏览器窗口之间的相对次序由 Z 序看门狗维持（见 applyAlwaysOnTop）
   applyAlwaysOnTop()
   /**
-   * 面板刚出现的这一帧先按**指针当前位置**定好穿透状态。
-   *
-   * 之后的每一次修正都靠渲染层的 mousemove，而主进程收不到鼠标移动；万一呼出面板时
-   * 指针恰好就停在某一格上，不先算这一下，用户的第一次点击会被面板吃掉（网页点不动）。
-   *
-   * 注意 `cursorOverPane()` 内部是实时取 `screen.getCursorScreenPoint()` 的，
-   * 但它依赖渲染层**上报过的**分格矩形；此刻矩形可能是空的（窗口刚建 / 页面还没量完），
-   * 算出来会是不穿透——面板吃掉所有点击，直到渲染层发来第一次 mousemove 才纠正。
-   * 所以动画结束后还要用刷新过的矩形再算一次（见 slideTo 的 onDone）。
-   */
-  applyPassthrough(win)
-
-  /**
    * 滑入期间实例窗口**保持显示**，跟着面板一起滑进来。
    *
    * 以前这里是先 `setSuppressed(true)` 把浏览器窗口全藏起来、等动画结束再亮出来，
@@ -389,6 +439,21 @@ function showPanel() {
   manager?.setSuppressed(false)
   win.webContents.send('request-rects')
 
+  /**
+   * 呼出的第一帧先按"不穿透"落地 —— 此刻面板整个还在屏幕外，分格也跟着在屏幕外，
+   * "指针是不是压在分格上"这个问题此刻本来就无从谈起（主进程拿不到别的答案）。
+   * 好处是滑动期间的点击先由面板吃掉，不会穿透到下面那个无关的程序上去。
+   *
+   * ⚠️ 这一步必须排在 `setSuppressed(false)` 之后：`cursorOverPane()` 只统计
+   * `inst.shown === true` 的分格，而收起时 `hidePanel()` 调过 `setSuppressed(true)`
+   * 把所有格的 `shown` 都置了 false。排在前面的话，之后 `slideTo` 的逐帧精算会一路
+   * 算成"不穿透"，直到落位后收尾才纠正 —— 那 300 多毫秒就是"呼出后第一下点不动"。
+   *
+   * 真正的穿透判定交给两处：`slideTo` 逐帧精算（见 trackPassthrough），
+   * 以及落位后的收尾 `settleAfterShow`。
+   */
+  applyPassthrough(win)
+
   slideTo(offX, b.x, b, 240, () => {
     /**
      * 这里**不要**再 syncPanelToManager()。
@@ -397,26 +462,51 @@ function showPanel() {
      * 再校准一次就是"动画结束、网页又自己挪几像素"。记账（面板原点）在动画期间
      * 每帧都由 setPanelPosition 更新，本来就是最新的。区域由 setSliding(false) 补。
      */
-    setTimeout(() => {
-      win.focus()
-      // 落位完成后矩形已刷新，用最新值再定一次穿透（show 前那次可能矩形还没上报）
-      applyPassthrough(win)
-      win.webContents.send('panel-shown')
-      /**
-       * 落位之后再把面板从任务栏摘掉。
-       *
-       * `transparent: true` 的窗口，Electron 是在 `show()` 之后才把窗口切成
-       * layered（补 WS_EX_LAYERED）的，这一下会把创建时加的 WS_EX_TOOLWINDOW
-       * 一并冲掉。实测此时再想补回那个样式位已经补不上了——窗口可见时直接
-       * SetWindowLongPtr 改 GWL_EXSTYLE 会被 Chromium 原样退回（先藏后改也没用），
-       * 所以只能退而求其次走 Electron 自己的 `setSkipTaskbar`，至少任务栏上不留按钮。
-       *
-       * 已知取舍：这种情况下面板会短暂出现在 Alt+Tab 列表里。
-       */
-      win.setSkipTaskbar(true)
-      setTimeout(() => manager?.focusAll(), 80)
-    }, 40)
-  })
+    setTimeout(() => settleAfterShow(win), 40)
+  }, () => {
+    /**
+     * 呼出动画被打断（连按两下快捷键"收起→呼出"、动画没跑完就关面板）时，
+     * 收尾同样要补一次，否则面板会停在算错的穿透状态上（见 settleAfterShow）。
+     */
+    settleAfterShow(win)
+  }, true)
+}
+
+/**
+ * 呼出之后的收尾：把"这一帧之后必须到位"的动作集中在这里，让**每条退出路径都跑到**。
+ *
+ * 原来这几件事散在 `slideTo` 的 `onDone` 里，而 `onDone` 只在动画正常跑完时才调用。
+ * 交织操作会把它整个跳过（连按两下快捷键、动画没跑完就关面板、动画期间退出）：
+ * 轻则面板带着算错的穿透状态（"呼出后几秒点不动"），重则面板留在任务栏 / Alt+Tab。
+ * 现在由 `settleAnim` 统一触发——正常结束走 `done`，被打断走 `abort`，两边都落到这里。
+ *
+ * 幂等：所有动作读的都是当前状态，重复执行无副作用。
+ */
+function settleAfterShow(win: BrowserWindow) {
+  if (!win || win.isDestroyed()) return
+  /**
+   * 面板已经收起了就别再抢焦点。
+   *
+   * 走到"被打断"这条路时紧接着就是收起面板，此时 `focus()` 会把焦点从用户正在
+   * 操作的地方抢走。但穿透校准与摘任务栏照旧执行——它们对"下次呼出"同样有效。
+   */
+  if (win.isVisible()) win.focus()
+  // 落位完成后矩形已刷新，用最新值再定一次穿透（show 前那次可能矩形还没上报）
+  applyPassthrough(win)
+  win.webContents.send('panel-shown')
+  /**
+   * 落位之后再把面板从任务栏摘掉。
+   *
+   * `transparent: true` 的窗口，Electron 是在 `show()` 之后才把窗口切成
+   * layered（补 WS_EX_LAYERED）的，这一下会把创建时加的 WS_EX_TOOLWINDOW
+   * 一并冲掉。实测此时再想补回那个样式位已经补不上了——窗口可见时直接
+   * SetWindowLongPtr 改 GWL_EXSTYLE 会被 Chromium 原样退回（先藏后改也没用），
+   * 所以只能退而求其次走 Electron 自己的 `setSkipTaskbar`，至少任务栏上不留按钮。
+   *
+   * 已知取舍：这种情况下面板会短暂出现在 Alt+Tab 列表里。
+   */
+  win.setSkipTaskbar(true)
+  if (win.isVisible()) setTimeout(() => manager?.focusAll(), 80)
 }
 
 function hidePanel() {
@@ -1044,7 +1134,9 @@ function setupIpc() {
    */
   ipcMain.on('mouse-passthrough', (_e, through: boolean) => {
     if (!panelWindow || panelWindow.isDestroyed()) return
-    panelWindow.setIgnoreMouseEvents(!!through, { forward: true })
+    // 走 setThrough 记账：渲染层上报的值也要进 lastThrough，
+    // 否则 slideTo 的逐帧精算会把自己或对方刚设好的值再设一遍
+    setThrough(panelWindow, !!through)
   })
 
   ipcMain.handle('pane-occlude', (_e, paneId: string, on: boolean, hole?: { x: number; y: number; width: number; height: number } | null) => {
