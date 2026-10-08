@@ -107,6 +107,15 @@ export const WS_THICKFRAME = 0x00040000
 export const WS_MINIMIZEBOX = 0x00020000
 export const WS_MAXIMIZEBOX = 0x00010000
 export const WS_SYSMENU = 0x00080000
+
+/**
+ * `WS_EX_TOPMOST`（扩展样式里的置顶位）。
+ *
+ * 为什么单独导出：`setTopMost()` 只负责**设**，没有任何地方能**读**。
+ * 而"设了之后有没有被别人清掉"恰恰是必须能查的（见 instance-manager 的
+ * `verifyGeometry` 第 ⑦ 项与 `windowIsTopMost`）。
+ */
+export const WS_EX_TOPMOST = 0x00000008
 export const WS_CLIPSIBLINGS = 0x04000000
 export const WS_CLIPCHILDREN = 0x02000000
 export const WS_EX_APPWINDOW = 0x00040000
@@ -257,6 +266,28 @@ export function windowHasFrame(hwnd: number | bigint): boolean {
   }
   catch {
     return false
+  }
+}
+
+/**
+ * 这个窗口当前**是不是在置顶带里**（读 `WS_EX_TOPMOST` 位）。
+ *
+ * ⚠️ **"不在置顶带"和"在置顶带里但排在别人下面"是两回事**，必须分开看：
+ *   · 前者：任何普通程序都能盖住它 → 用户看到"网页不见了，只剩黑框浮着"；
+ *   · 后者：`placeBelow` / `enforceZOrder` 就能按回去，看门狗原本就管得了。
+ * 现有层级机制**只处理后者**（`windowsAbovePanel()` 从 `getTopWindow()` 往下走到
+ * 面板就停，面板**之下**的窗口一眼都不看），所以这一位必须单独读出来核对。
+ *
+ * 读不出来时返回 `null`（不表态），调用方按三态处理 —— 宁可漏一轮，
+ * 也不能把"读不到"当成"没置顶"去乱设。
+ */
+export function windowIsTopMost(hwnd: number | bigint): boolean | null {
+  try {
+    if (!GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) return null
+    return (Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & WS_EX_TOPMOST) !== 0
+  }
+  catch {
+    return null
   }
 }
 

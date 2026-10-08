@@ -4,7 +4,7 @@ import path from 'node:path'
 import { screen } from 'electron'
 import type { AiService, AppConfig } from './types'
 import type { BrowserInfo } from './browser-detect'
-import { CdpSession, listPageTargets } from './cdp'
+import { CdpSession, listPageTargets, siteHostsFromUrls } from './cdp'
 import { buildBypassArg, buildProxyServerArg } from './proxy'
 import * as w32 from './win32'
 
@@ -192,6 +192,8 @@ export class InstanceManager {
   private frameWarned = new Set<string>()
   /** "有窗口跑到面板之上"这条告警的节流时间戳（见 verifyGeometry 的 ④） */
   private zAboveWarnedAt = 0
+  /** 已经就"掉出置顶带"告警过的格子（见 verifyGeometry 的 ⑦） */
+  private topmostWarned = new Set<string>()
   /** 已经就"关掉系统背板"打过日志的窗口 */
   private backdropLogged = new Set<number>()
   /** 每个格子在"刚显示出来"前后的补施定时器（见 settleRegion） */
@@ -217,6 +219,15 @@ export class InstanceManager {
        * `spawn` 会抛 ENOENT。所以每次启动前都要能重新解析。
        */
       resolveBrowser?: () => Promise<BrowserInfo | null>
+      /**
+       * 页面里点了链接 → 交给它用系统默认浏览器打开。
+       *
+       * 由 `index.ts` 注入 `openExternalWeb`（那里已经有一套 http/https 白名单，
+       * 绝不能在这里另起一份——两份白名单迟早会走偏）。
+       * 没有这个回调时链接拦截器**不装**：宁可什么都不做，
+       * 也不能出现"链接被拦下了却没人接手"的哑弹。
+       */
+      openExternal?: (url: string) => void
     },
   ) {}
 
@@ -231,6 +242,24 @@ export class InstanceManager {
   }
 
   /* ---------------- 面板绑定 ---------------- */
+
+  /**
+   * "站内域名"清单：配置里**所有** AI 站点的域名。
+   *
+   * 链接拦截器靠它放行站内导航（0.4.14 踩过的坑：只看协议不看域名，
+   * 把"切换历史会话 / 点侧栏栏位"全转交给系统浏览器了，整个站点被踢出分格）。
+   *
+   * 从配置现算而不是硬编码：大王新增一个 AI 站点后，它的站内导航同样要放行，
+   * 硬编码清单里没有它就会把坑换个站点再复现一遍（见 cdp.siteHostsFromUrls）。
+   */
+  private siteHosts(): string[] {
+    try {
+      return siteHostsFromUrls(this.opts.config().aiList.map(a => a.url))
+    }
+    catch {
+      return []
+    }
+  }
 
   /** 绑定面板窗口：记录其屏幕位置、缩放与置顶状态，实例据此定位 */
   setPanel(bounds: { x: number, y: number }, scale: number, hwnd: number, topMost: boolean) {
@@ -432,6 +461,26 @@ export class InstanceManager {
         existing.aiId = ai.id
         existing.url = ai.url
         try {
+          /**
+           * 换站点后**必须把链接拦截器重装一遍**（2026-10-08）。
+           *
+           * 为什么：`Page.addScriptToEvaluateOnNewDocument` 只对**注册之后**的导航生效，
+           * 而这里走的是 `navigate`（同一个 target 换URL），不是新建页。
+           * 用户看到的症状是"第一次能拦住、换个 AI 就又不行了"——
+           * 实际是这一格压根还没装过（见 attachCdp 那条共享会话的差分坑）。
+           *
+           * `Runtime.evaluate` 那一步能补上"当前这一页"，所以两次都做。
+           * 装不上也不该拦住换站点：CDP 是增强，不是依赖（失败只告警）。
+           */
+          if (this.opts.openExternal) {
+            const pid = existing.paneId
+            await existing.cdp.installExternalLinkHook((url) => {
+              console.log(`[instance] ${pid} 的页面里点了链接 → 交给系统浏览器：${url}`)
+              this.opts.openExternal?.(url)
+            }, this.siteHosts()).then((ok) => {
+              if (!ok) console.warn(`[instance] ${pid} 换站点后链接拦截器没装上（该格链接仍会本格跳转）`)
+            })
+          }
           await existing.cdp.navigate(ai.url)
           await existing.cdp.bringToFront()
         }
@@ -532,6 +581,25 @@ export class InstanceManager {
 
       this.syncInsets(inst)
       this.positionWindow(inst, true)
+
+      /**
+       * 认领成功后再钉一次置顶位（第二次；第一次在上面设样式时）。
+       *
+       * 为什么必须补这一下：第一次 `setTopMost` 打在窗口刚创建、Chrome 还没建完的时候，
+       * 紧接着 `waitDevToolsPort` / `attachCdp` / `syncInsets` / `positionWindow`
+       * 这一串里 Chrome 会把窗口**重建或重排**一次（写档案、恢复窗口状态、决定用哪种
+       * 窗口模式），而它重建时会连 `WS_EX_TOPMOST` 一起清掉 —— 于是刚设好的置顶位
+       * 当场失效。2026-10-08 实测到的现场就是这样：分格 `ex=0x200080`（0x8 位没了），
+       * 而面板 `ex` 里 0x8 还在，两者在不同带 → "黑框浮着、网页被 WorkBuddy 盖住"。
+       *
+       * 打在 `positionWindow` **之后**是因为：只有到这一步窗口才彻底就位，
+       * 后续的看门狗也才会接手（`windowIsTopMost` 会每 30ms 复核一次，见 ⑦）。
+       * 这一次是"钉死"，之后即便 Chrome 再清掉，看门狗也会在 30ms 内补回来。
+       */
+      if (this.panel.topMost && w32.windowIsTopMost(win.hwnd) === false) {
+        w32.setTopMost(win.hwnd, true)
+        console.log(`[instance] ${paneId} 的置顶位在认领过程中被清掉了 → 已补回`)
+      }
 
       this.emit(inst, 'ready')
       return inst
@@ -989,13 +1057,54 @@ export class InstanceManager {
     const port = inst.port
     if (!port) return
     for (let i = 0; i < 6; i++) {
-      const fresh = (await listPageTargets(port)).find((t) => !before.includes(t.id))
+      /**
+       * ⚠️ **共享会话下必须排除"别的分格已经占着的 target"**（2026-10-08 实测）。
+       *
+       * 共享会话里所有分格是同一个浏览器进程的多个 page target，而
+       * `before` 是本分格启动**之前**的快照 —— 于是"新出现的那一个"里
+       * 混着**别的分格刚建好的页**。挑错了就把链接拦截器装到别人的页面上，
+       * 自己那格反而没装（现场查到的 `window.__aiquadLinkHooked` 为 false 就是这么来的）。
+       *
+       * 所以判据收紧成两条都要满足：
+       *   ① 不在 `before` 里（确实是新出现的）；
+       *   ② **不属于任何其他分格**（`claimedTargets`）。
+       * 都拿不到时退回原判据，宁可装错也不能让这一格彻底没有拦截器。
+       */
+      const takenByOthers = new Set<string>()
+      for (const other of this.instances.values()) {
+        if (other === inst || !other.targetId) continue
+        takenByOthers.add(other.targetId)
+      }
+      const targets = await listPageTargets(port)
+      const fresh = targets.find(t => !before.includes(t.id) && !takenByOthers.has(t.id))
+        || targets.find(t => !before.includes(t.id))
       if (fresh?.webSocketDebuggerUrl) {
         try {
           const cdp = new CdpSession(fresh.webSocketDebuggerUrl)
           await cdp.connect(3000)
           inst.cdp = cdp
           inst.targetId = fresh.id
+          /**
+           * 页面里点了链接就用系统浏览器打开，别把这一格换掉（2026-10-08）。
+           *
+           * 为什么挂在这里而不是 `launch` 更早：CDP 连上之前没有任何通道能把
+           * 页面里的 URL 送回主进程，而没装钩子之前页面已经可以正常点链接了 ——
+           * 装上之后才接管，属于"事后拦一下"，不存在漏。
+           *
+           * ⚠️ 这里**必须 await**：早先写成 `.then(...)` 不等，函数就返回了，
+           * 而主进程那边 `launch` 紧接着还有一串动作；万一 CDP 那几个调用
+           * （`Runtime.enable` / `addScriptToEvaluateOnNewDocument`）稍慢一点，
+           * 用户完全可能在装好之前就把链接点了 —— 症状就是"偶尔不生效"。
+           * 装不上会降级成 false 并告警，不影响这一格正常使用。
+           */
+          if (this.opts.openExternal) {
+            const pid = inst.paneId
+            const ok = await cdp.installExternalLinkHook((url) => {
+              console.log(`[instance] ${pid} 的页面里点了链接 → 交给系统浏览器：${url}`)
+              this.opts.openExternal?.(url)
+            }, this.siteHosts())
+            if (!ok) console.warn(`[instance] ${pid} 的链接拦截器没装上（该格链接仍会本格跳转）`)
+          }
         }
         catch (e) {
           console.warn('[instance] cdp attach skipped:', e)
@@ -1328,6 +1437,7 @@ export class InstanceManager {
    *    这一层被裁掉的那一截会以死板纯色露在相邻分格上（2026-09-15 查实的那个 bug）。
    * ④ 层级——有没有自家窗口跑到面板上面去了（整轮只查一次，不是逐格）。
    * ⑤ 可见区（区域）——被外部改掉时，"被裁掉的那截浏览器外壳"就会露出来。
+   * ⑦ **置顶位**（`WS_EX_TOPMOST`）——这一格还在不在置顶带里。
    *
    * 这六样里原来只查了可见区（当时是唯一一项，也就是现在的 ⑤），①② 没人在看：
    * 只要浏览器动过窗口而不是动区域，看门狗就认为"一切正常"。现在合成一轮，
@@ -1338,6 +1448,9 @@ export class InstanceManager {
    *
    * ⚠️ 顺序有讲究：带 `continue` 的核对（现在只有 ⑤ 可见区）必须排在最末，
    * 否则它前面写什么都等于不执行。
+   *
+   * ⑦ 为什么必须排在 ⑤ **之前**：⑤ 那一段自己带 `continue`（区域正常是常态），
+   * 放它后面就永远轮不到 —— 和 ③ 当年犯过的错一模一样（见上面 ③ 的警告）。
    */
   private verifyGeometry() {
     // 滑动动画期间窗口位置由 relocateAll 逐帧对齐，这里插一脚只会打架
@@ -1500,6 +1613,52 @@ export class InstanceManager {
         this.fixBackdrop(hwnd)
       }
 
+      /**
+       * ⑦ **置顶位**（`WS_EX_TOPMOST`）—— 这一格还在不在置顶带里。
+       *
+       * ⚠️ 这一项和 ④ 是**两件不同的事**，别混：
+       *   ④ 管的是「都在置顶带里，谁排在谁上面」→ `placeBelow` 能修；
+       *   ⑦ 管的是「**还在不在置顶带里**」→ 掉了之后 `placeBelow` 一点用都没有，
+       *      因为按次序只在带内有效，一个普通层窗口无论怎么按都浮不到置顶带前面去。
+       *
+       * 实测现场（2026-10-08，`scripts/diag-topmost-band.js`）：
+       *   面板 hwnd=0x20502 `ex` 含 0x8 → 在置顶带，Z 序第 4 位；
+       *   分格 hwnd=0x106d2 `ex=0x200080` → **0x8 这位是 0**，已掉进普通层，Z 序第 14 位，
+       *   而 WorkBuddy（普通层，第 9 位）就压在它前面。
+       *   → 用户看到的正是「黑框浮在最顶，黑框下面是别的程序，而不是网页」。
+       *
+       * 为什么会掉：置顶位**只在认领那一刻设过一次**（见 launch 里的 `setTopMost`）。
+       * Chrome 之后只要重建/重排一次窗口（换 profile、崩溃恢复、切窗口模式），
+       * 就会连着 `WS_EX_TOPMOST` 一起清掉，而看门狗此前没有任何一项能发现 ——
+       * ④ 的 `windowsAbovePanel()` 从 `getTopWindow()` 往下走到面板就停，
+       * **面板之下的窗口它一眼都不看**（分格掉到面板下方，正好落在这个盲区里）。
+       *
+       * 三态处理：`null`（读不到）时**什么都不做**，宁可漏一轮也不能乱设 ——
+       * 把「读不到」当成「没置顶」去补，会在窗口正在创建/销毁时反复下发
+       * `SetWindowPos(HWND_TOPMOST)`，反而把它从面板附近抢走。
+       *
+       * 只在 `panel.topMost` 为真时才要求置顶：用户主动关了置顶的场合，
+       * 分格就该待在普通层（那是用户要的，不是 bug）。
+       * 置顶位和带内次序是两件事，所以补完置顶位还要再跑一次 `enforceZOrder` ——
+       * `SetWindowPos(HWND_TOPMOST)` 会把窗口提到**带顶**，不按回去就变成
+       * 「分格盖住面板顶栏」了。
+       */
+      if (this.panel.topMost) {
+        const isTop = w32.windowIsTopMost(hwnd)
+        if (isTop === false) {
+          if (!this.topmostWarned.has(inst.paneId)) {
+            this.topmostWarned.add(inst.paneId)
+            console.warn(`[panel] ${inst.paneId} 掉出了置顶带 → 已补回（否则任何普通程序都能盖住这一格，用户看到的是"只剩黑框"）`)
+          }
+          w32.setTopMost(hwnd, true)
+          // 提到带顶之后必须再理一次次序，否则它会压在面板顶栏上面
+          this.enforceZOrder()
+        }
+        else if (isTop === true && this.topmostWarned.delete(inst.paneId)) {
+          console.log(`[panel] ${inst.paneId} 的置顶位已恢复正常`)
+        }
+      }
+
       // ⑤ 可见区被改掉（放在最后：这一段的几个分支会 continue）
       const box = w32.windowRegionBox(hwnd)
       const w = inst.regionBox!
@@ -1568,6 +1727,15 @@ export class InstanceManager {
     // 新显示出来的窗口要提到面板正下方（同为置顶带，次序由我们维护）
     if (visible) {
       w32.raiseWindow(hwnd, this.panel.topMost)
+      /**
+       * 隐藏期间置顶位可能被清掉（Chrome 在被隐藏/恢复时重排窗口），
+       * 而 `raiseWindow` 只在 `topMost` 为真时才发 `HWND_TOPMOST` ——
+       * 用户主动关掉置顶的场合本来就该留在普通层，所以那种情况下不补。
+       * 这里补的是另一种情形：**要置顶、但此刻置顶位已经没了**。
+       * 30ms 看门狗的 ⑦ 也会兜住（见 verifyGeometry），这里是"立刻纠正"，
+       * 免得刚展开的那一两帧里网页还被别的程序压着。
+       */
+      if (this.panel.topMost && w32.windowIsTopMost(hwnd) === false) w32.setTopMost(hwnd, true)
       this.enforceZOrder()
     }
   }

@@ -931,6 +931,16 @@ async function bootstrap() {
         if (fresh && fresh.exePath !== browserInfo?.exePath) browserInfo = fresh
         return fresh
       },
+      /**
+       * 页面里点了链接 → 用系统默认浏览器打开，别把 AI 对话那一格换掉
+       * （2026-10-08）。复用现成的 `openExternalWeb`，**不另起一份白名单** ——
+       * 它已经只放行 http/https，这是唯一的入口，一份就够。
+       */
+      openExternal: (url) => {
+        openExternalWeb(url).then((ok) => {
+          if (!ok) console.warn(`[external] 页面链接被白名单拒绝：${url}`)
+        })
+      },
     })
     manager.setStatusSink(() => broadcastStatus())
   }

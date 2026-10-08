@@ -45,8 +45,49 @@ let passthrough = null
 /** 最近一次指针位置：下拉开合之后要拿它重算一次穿透（收不回来就会卡在不穿透上） */
 let pointerAt = { x: -1, y: -1 }
 
+/**
+ * 正在被拖放（OLE drag）吗 —— "往GPT 里拖附件拖不进去"的兜底闸门。
+ *
+ * ⚠️ **这已经不是根因了，别把它当主修复**。根因是下面的 `inWidget` 判定
+ * （输入栏贴网页底边 → 落进 `.ai-selector` 胶囊那条带 → 面板不穿透），
+ * 由 `syncPassthrough` 里那处改法负责。这个闸门只堵剩下的那条缝：
+ * 拖放期间鼠标被源程序独占、`mousemove` 停发（见下面的说明），一旦那一刻算错
+ * 就再没人纠正。
+ *
+ * 背景：分格是**外部 Chrome 窗口**，往网页里拖文件走的是 Windows 原生 OLE 拖放
+ * （`IDropTarget`），**不经 CDP**。而面板整窗盖在分格上，靠
+ * `setIgnoreMouseEvents(through, { forward: true })` 让指针"穿"过去。
+ * ⚠️ **`forward: true` 只转发鼠标 move 消息，拖放要的 DragEnter/DragOver/Drop
+ * 完全不在转发范围内** —— 面板那一刻要是"不穿透"，这整个拖放就被面板吃掉，
+ * 底下的 Chrome 什么都收不到，表现就是"文件拖进去没反应、附件没出现"。
+ *
+ * 为什么需要这个闸门：穿透状态由下面的 `mousemove` 驱动，
+ * 而 **OLE 拖放期间鼠标被源程序独占，`mousemove` 根本停发**；再叠上 0.4.12
+ * 改成的"只在翻转时上报"（`setPassthrough` 开头那句 `if (through === passthrough) return`），
+ * 面板就永久卡在算错的那个旧值上，之后谁来点都不会纠正。
+ *
+ * 修法：**在拖放开始时无条件切穿透，并把后续的翻转判断整个冻住**：
+ *   · `dragenter`/`dragover` 收到 → 判定拖放在面板上进行 → `setPassthrough(true)`；
+ *   · 拖放结束（`drop`/`dragend`）→ 解冻，让 `mousemove` 重新接管。
+ *
+ * ⚠️ 为什么必须"冻住"而不是"每次重算"：拖放期间指针可能正好掠过分格之间的缝隙、
+ * 顶栏、悬浮胶囊，那些位置本该"不穿透"（比如拖到顶栏想触发别的行为），
+ * 一旦放它按 `elementFromPoint` 重算，就会在拖放中途把穿透收回 OLE 手里，
+ * 拖放直接断掉——那才是真正会"偶发失败"的写法。
+ */
+let dragging = false
+
 function syncPassthrough(x, y) {
   if (x != null) pointerAt = { x, y }
+  /**
+   * 拖放期间**只认"穿透"这一个值**，其余一律不重算（理由见 dragging 的说明）。
+   * 注意这里不能 `return` 得太早：`pointerAt` 仍要更新，
+   * 否则拖放结束后第一次重算会拿着拖放开始前的旧点位。
+   */
+  if (dragging) {
+    setPassthrough(true)
+    return
+  }
   /**
    * 下拉展开期间**整块面板都必须收回鼠标**。
    *
@@ -54,6 +95,9 @@ function syncPassthrough(x, y) {
    * 收不到 click ——结果"点列表外面收起列表"这件最自然的事做不到，只能回过头去
    * 菜单开着的时候先不穿透，点在面板范围内的任何地方（包括其它分格的网页上）
    * 都由面板接住，落到下面那个 document 级监听里把菜单收起来。
+   *
+   * ⚠️ 这一段排在拖放闸门**之后**：拖放时下拉菜单本来就不该收鼠标——
+   * 文件正被拖着飞，此时把鼠标收回面板只会让拖放断掉。
    */
   if (state.menuPane) {
     setPassthrough(false)
@@ -64,6 +108,36 @@ function syncPassthrough(x, y) {
   const widget = !!(hit && hit.closest('.ai-selector, .ai-menu'))
   const through = !!(pane && pane.classList.contains('ready') && !widget)
   setPassthrough(through)
+}
+
+/** 拖放开始：强制穿透并冻住后续重算（见 dragging 的说明） */
+function onDragStart() {
+  if (dragging) return
+  dragging = true
+  setPassthrough(true)
+}
+
+/**
+ * 拖放结束：解冻。
+ *
+ * ⚠️ `dragleave` 只在**指针真的离开面板**时才解冻，不能一收到就解 ——
+ * OLE 拖放过程中 `dragleave`/`dragenter` 会成对反复触发（每掠过一块元素换一次），
+ * 一解冻就等于把闸门白装。真正可靠的两个收尾信号是：
+ *   · `drop`  —— 落在了某处，拖放确实结束了；
+ *   · `dragend` —— 由**源程序**发出，它结束的那一刻才是真的结束。
+ * 另外 `dragleave` 带上"相关目标不在面板内"这个条件作为兜底。
+ */
+function onDragEnd(e) {
+  if (!dragging) return
+  if (e && e.type === 'dragleave' && e.relatedTarget) {
+    // 只是从面板内一块元素挪到另一块 —— 仍在拖放中，不解冻
+    if (e.relatedTarget === document || e.relatedTarget === window || document.contains(e.relatedTarget)) return
+  }
+  dragging = false
+  // 不主动上报新值：交给下一次真实的 mousemove 重算。这里把缓存作废，
+  // 让 setPassthrough 不会被"值没变"短路（与 panel-shown 同一套理由）。
+  passthrough = null
+  syncPassthrough()
 }
 
 /**
@@ -81,6 +155,28 @@ function setPassthrough(through) {
 }
 
 window.addEventListener('mousemove', (e) => syncPassthrough(e.clientX, e.clientY), { passive: true })
+
+/**
+ * OLE 拖放闸门（见 dragging 的说明）。
+ *
+ * ⚠️ 必须挂在 `window` 上用**捕获阶段**：`dragenter`/`dragover` 是持续触发的，
+ * 而它们的目标是底下那个分格里正在被拖动的网页，冒泡路径可能不经过面板的 DOM。
+ * 捕获阶段是唯一能保证"拖进面板范围就一定收得到"的位置。
+ *
+ * `dragend` 同样要在 window 上听：它由**源程序**（资源管理器/桌面）发出，
+ * 不经过任何页面，但 Electron 渲染层仍会把它派发到当前文档，`preventDefault` 无害。
+ *
+ * `drop` 要 `preventDefault`：不接住的话浏览器会拿文件去导航/打开当前页，
+ * 分格里的网页会被"拖到即打开"顶掉 —— 那比拖不进去更糟。
+ */
+window.addEventListener('dragenter', onDragStart, true)
+window.addEventListener('dragover', onDragStart, true)
+window.addEventListener('drop', (e) => {
+  e.preventDefault()
+  onDragEnd(e)
+}, true)
+window.addEventListener('dragleave', onDragEnd, true)
+window.addEventListener('dragend', onDragEnd, true)
 
 /* ---------------- 工具 ---------------- */
 
