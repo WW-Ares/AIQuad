@@ -14,7 +14,7 @@
  *
  * 用法：node scripts/verify-external-link.js [分格端口] [要点的链接文字]
  */
-const { CdpSession, listPageTargets } = require('../dist/main/cdp')
+const { CdpSession, listPageTargets, EXTERNAL_LINK_HOOK_VERSION } = require('../dist/main/cdp')
 
 const PORT = Number(process.argv[2] || 60727)
 const WANT = process.argv[3] || ''
@@ -78,7 +78,7 @@ const got = []
   const ok = await cdp.installExternalLinkHook((url) => got.push(url))
   console.log(`  installExternalLinkHook → ${ok ? '成功' : '失败'}`)
   const hooked = (await cdp.send('Runtime.evaluate', {
-    expression: 'window.__aiquadLinkHooked === true',
+    expression: `window.__aiquadLinkHooked === ${EXTERNAL_LINK_HOOK_VERSION}`,
     returnByValue: true,
   }))?.result?.value
   console.log(`  页面里 __aiquadLinkHooked = ${hooked}`)

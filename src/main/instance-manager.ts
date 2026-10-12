@@ -4,7 +4,7 @@ import path from 'node:path'
 import { screen } from 'electron'
 import type { AiService, AppConfig } from './types'
 import type { BrowserInfo } from './browser-detect'
-import { CdpSession, listPageTargets, siteHostsFromUrls } from './cdp'
+import { CdpSession, listPageTargets, siteHostsFromUrls, type CdpTarget } from './cdp'
 import { buildBypassArg, buildProxyServerArg } from './proxy'
 import * as w32 from './win32'
 
@@ -26,6 +26,52 @@ const KEEP_BACKDROP = !!process.env.AIQUAD_TEST_KEEP_BACKDROP
  * 只关这一个（背板照常修）就能量出"干干净净的框线"长什么样 —— 判据的阈值就是这么定的。
  */
 const KEEP_FRAME = KEEP_BACKDROP || !!process.env.AIQUAD_TEST_KEEP_FRAME
+
+/**
+ * 链接拦截器自查间隔（见 verifyGeometry 的 ⑧ / repairLinkHook）。
+ *
+ * 为什么需要定期回读：拦截器是**挂在单次 CDP 会话上的** ——
+ * `Runtime.enable` 的事件转发与 `Page.addScriptToEvaluateOnNewDocument` 的注册
+ * 都随会话销毁。目标被替换、浏览器重建窗口、附着超时，都会让会话失效，
+ * 于是页面悄悄退化成"点了链接在本格跳转"，而且**没有任何用户可见的提示**。
+ * 现场（2026-10-12，v0.4.13）实测到的就是这种状态：主进程连着目标
+ * （`attached: true`），页面里 `window.__aiquadLinkHooked` 却是 `null`。
+ */
+const LINK_HOOK_WATCH_MS = 3000
+
+/** 从 URL 取小写 host（取不到返回空串） */
+function hostOf(url: string): string {
+  try { return new URL(url).host.toLowerCase() } catch { return '' }
+}
+
+/** 目标 URL 的 host 是否与期望一致（精确相等，不做后缀匹配，理由同 cdp.ts 的 SITE_HOSTS） */
+function hostMatch(targetUrl: string, wantHost: string): boolean {
+  if (!wantHost) return false
+  try { return new URL(targetUrl).host.toLowerCase() === wantHost } catch { return false }
+}
+
+/**
+ * 从当前 page 目标里挑"本格新出现的那个"。
+ *
+ * 优先级：新出现 且 没被别的分格占着 且 **域名对得上本格** →
+ *         新出现 且 没被别的分格占着 →
+ *         新出现 且 域名对得上 →
+ *         新出现（宁可装错也不能让这一格彻底没有拦截器，见 attachCdp 的说明）。
+ *
+ * 加"域名对得上"这一层是 2026-10-12 补的：共享档案 + 会话恢复的场景里，
+ * 新窗口出现得慢、目标列表刷新还有延迟，"新出现的那一个"可能就是
+ * 会话恢复出来的旧标签页，于是 CDP 连到了别的页上。
+ */
+function pickFreshTarget(targets: CdpTarget[], before: string[], takenByOthers: Set<string>, wantHost: string): CdpTarget | null {
+  const isNew = (t: CdpTarget) => !before.includes(t.id)
+  const free = (t: CdpTarget) => !takenByOthers.has(t.id)
+  const hostHit = (t: CdpTarget) => hostMatch(t.url, wantHost)
+  return targets.find(t => isNew(t) && free(t) && hostHit(t))
+    || targets.find(t => isNew(t) && free(t))
+    || targets.find(t => isNew(t) && hostHit(t))
+    || targets.find(isNew)
+    || null
+}
 
 /** 网页内容区相对窗口左上角的偏移与内衬（物理像素） */
 export interface InstanceInsets {
@@ -204,6 +250,10 @@ export class InstanceManager {
   private unForeground: (() => void) | null = null
   /** 上次"误认领自愈"复核的时刻（见 auditClaims） */
   private lastClaimAuditAt = 0
+  /** 上次"链接拦截器还在不在"的自查时刻（见 verifyGeometry 的 ⑧） */
+  private lastLinkHookCheckAt = 0
+  /** 正在补装链接拦截器的分格（避免看门狗两拍重入同一个自愈流程） */
+  private linkHookRepairing = new Set<string>()
 
   constructor(
     private opts: {
@@ -1052,22 +1102,34 @@ export class InstanceManager {
     }
   }
 
-  /** 接到本格对应的 CDP 目标（新出现的那一个），失败静默降级 */
+  /**
+   * 接到本格对应的 CDP 目标（新出现的那一个）。
+   *
+   * ⚠️ 失败**不再"静默降级"**（2026-10-12 改）：等不到目标就留一条告警，
+   * 并把补装交给看门狗（见 repairLinkHook）—— 否则这一格永远没有链接拦截器。
+   */
   private async attachCdp(inst: ManagedInstance, before: string[]) {
     const port = inst.port
     if (!port) return
-    for (let i = 0; i < 6; i++) {
+    const wantHost = hostOf(inst.url)
+    /**
+     * ⚠️ 重试窗口从 6×400ms（≈2.4s）放宽到 20×400ms（≈8s）（2026-10-12）。
+     *
+     * 现场是"共享档案 + 会话恢复 + 多标签"：新窗口出现得慢、目标列表刷新还有延迟，
+     * 2.4s 一到就放弃 → 这一格**永远**没有链接拦截器，症状就是"点链接在本格跳转"。
+     * 既然静默放弃是最坏结局，这里宁可多等一会儿；等不到也有看门狗兜底。
+     */
+    for (let i = 0; i < 20; i++) {
       /**
        * ⚠️ **共享会话下必须排除"别的分格已经占着的 target"**（2026-10-08 实测）。
        *
        * 共享会话里所有分格是同一个浏览器进程的多个 page target，而
        * `before` 是本分格启动**之前**的快照 —— 于是"新出现的那一个"里
        * 混着**别的分格刚建好的页**。挑错了就把链接拦截器装到别人的页面上，
-       * 自己那格反而没装（现场查到的 `window.__aiquadLinkHooked` 为 false 就是这么来的）。
+       * 自己那格反而没装（现场查到的 `window.__aiquadLinkHooked` 为 null 就是这么来的）。
        *
-       * 所以判据收紧成两条都要满足：
-       *   ① 不在 `before` 里（确实是新出现的）；
-       *   ② **不属于任何其他分格**（`claimedTargets`）。
+       * 所以判据在"不在 `before` 里"之外再加两条：**不属于任何其他分格**、
+       * **域名对得上本格**（后者是 2026-10-12 补的，见 pickFreshTarget）。
        * 都拿不到时退回原判据，宁可装错也不能让这一格彻底没有拦截器。
        */
       const takenByOthers = new Set<string>()
@@ -1076,8 +1138,7 @@ export class InstanceManager {
         takenByOthers.add(other.targetId)
       }
       const targets = await listPageTargets(port)
-      const fresh = targets.find(t => !before.includes(t.id) && !takenByOthers.has(t.id))
-        || targets.find(t => !before.includes(t.id))
+      const fresh = pickFreshTarget(targets, before, takenByOthers, wantHost)
       if (fresh?.webSocketDebuggerUrl) {
         try {
           const cdp = new CdpSession(fresh.webSocketDebuggerUrl)
@@ -1095,15 +1156,11 @@ export class InstanceManager {
            * 而主进程那边 `launch` 紧接着还有一串动作；万一 CDP 那几个调用
            * （`Runtime.enable` / `addScriptToEvaluateOnNewDocument`）稍慢一点，
            * 用户完全可能在装好之前就把链接点了 —— 症状就是"偶尔不生效"。
-           * 装不上会降级成 false 并告警，不影响这一格正常使用。
+           * 装不上会降级成 false 并告警（且由看门狗补装），不影响这一格正常使用。
            */
           if (this.opts.openExternal) {
-            const pid = inst.paneId
-            const ok = await cdp.installExternalLinkHook((url) => {
-              console.log(`[instance] ${pid} 的页面里点了链接 → 交给系统浏览器：${url}`)
-              this.opts.openExternal?.(url)
-            }, this.siteHosts())
-            if (!ok) console.warn(`[instance] ${pid} 的链接拦截器没装上（该格链接仍会本格跳转）`)
+            const ok = await this.installLinkHookOn(inst, cdp)
+            if (!ok) console.warn(`[instance] ${inst.paneId} 的链接拦截器没装上（该格链接仍会本格跳转，交给看门狗补装）`)
           }
         }
         catch (e) {
@@ -1112,6 +1169,78 @@ export class InstanceManager {
         return
       }
       await sleep(400)
+    }
+    console.warn(`[instance] ${inst.paneId} 等了 8s 也没认出新出现的页面目标，链接拦截器改由看门狗补装`)
+  }
+
+  /** 把"点外链交给系统浏览器"的拦截器装到指定 CDP 会话上（回调统一在这里拼） */
+  private async installLinkHookOn(inst: ManagedInstance, cdp: CdpSession): Promise<boolean> {
+    if (!this.opts.openExternal) return false
+    return cdp.installExternalLinkHook((url) => {
+      console.log(`[instance] ${inst.paneId} 的页面里点了链接 → 交给系统浏览器：${url}`)
+      this.opts.openExternal?.(url)
+    }, this.siteHosts())
+  }
+
+  /**
+   * 逐格回读"点外链交给系统浏览器"的拦截器还在不在，不在就补装（看门狗，见 verifyGeometry ⑧）。
+   *
+   * 读不到（`null`）时不动手 —— 与几何看门狗同一套"读不到就当没读"的约定，
+   * 绝不因为一次连接抖动去误改用户的页面。
+   */
+  private verifyLinkHooks() {
+    if (!this.opts.openExternal) return
+    for (const inst of this.instances.values()) {
+      if (inst.status !== 'ready' || !inst.port || !inst.hwnd) continue
+      if (this.linkHookRepairing.has(inst.paneId)) continue
+      this.repairLinkHook(inst).catch(() => {})
+    }
+  }
+
+  /** 单个分格的拦截器自愈：能原地重装就重装，会话断了就另挑目标重连 */
+  private async repairLinkHook(inst: ManagedInstance) {
+    this.linkHookRepairing.add(inst.paneId)
+    try {
+      const live = inst.cdp
+      if (live && !live.isClosed) {
+        const state = await live.isExternalLinkHookInstalled()
+        // true = 已装好；null = 读不到，都别乱动
+        if (state !== false) return
+        const ok = await this.installLinkHookOn(inst, live)
+        console.log(`[instance] ${inst.paneId} 链接拦截器已由看门狗补装（${ok ? '成功' : '仍失败'}）`)
+        if (ok) return
+      }
+
+      /**
+       * 走到这里说明：会话断了，或者原地补装仍然失败。重新挑一个目标接上 ——
+       * 优先沿用原来的 targetId（就是这一格的页），其次按"不是别的分格占着的 +
+       * 域名对得上本格"挑（见 pickFreshTarget）。
+       */
+      if (!inst.port) return
+      const takenByOthers = new Set<string>()
+      for (const other of this.instances.values()) {
+        if (other === inst || !other.targetId) continue
+        takenByOthers.add(other.targetId)
+      }
+      const targets = await listPageTargets(inst.port)
+      const target = (inst.targetId ? targets.find(t => t.id === inst.targetId) : undefined)
+        || pickFreshTarget(targets, [], takenByOthers, hostOf(inst.url))
+      if (!target?.webSocketDebuggerUrl) {
+        console.warn(`[instance] ${inst.paneId} 链接拦截器会话断了，但没找到可接的页面目标`)
+        return
+      }
+      const cdp = new CdpSession(target.webSocketDebuggerUrl)
+      await cdp.connect(3000)
+      inst.cdp = cdp
+      inst.targetId = target.id
+      const ok = await this.installLinkHookOn(inst, cdp)
+      console.log(`[instance] ${inst.paneId} 链接拦截器会话已重建（${ok ? '成功' : '仍失败'}）`)
+    }
+    catch (e) {
+      console.warn(`[instance] ${inst.paneId} 链接拦截器自愈失败`, e)
+    }
+    finally {
+      this.linkHookRepairing.delete(inst.paneId)
     }
   }
 
@@ -1464,6 +1593,18 @@ export class InstanceManager {
     if (now - this.lastClaimAuditAt > 30000) {
       this.lastClaimAuditAt = now
       this.auditClaims()
+    }
+
+    /**
+     * ⑧ 链接拦截器自查（2026-10-12）—— 排在 ④/⑤ 之前，因为它**不带 `continue`**。
+     *
+     * 见 verifyLinkHooks / repairLinkHook：钩子挂在单次 CDP 会话上，会话一失效，
+     * 页面就悄悄退化成"点了链接在本格跳转"。这里只负责按节拍触发，
+     * 真正的回读与重装是异步的，不阻塞这轮几何核对。
+     */
+    if (now - this.lastLinkHookCheckAt > LINK_HOOK_WATCH_MS) {
+      this.lastLinkHookCheckAt = now
+      this.verifyLinkHooks()
     }
 
     /**

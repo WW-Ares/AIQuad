@@ -284,20 +284,93 @@ export class CdpSession {
      * 不一致的话"之后导航"和"当前页"会用两套判据，行为会随时间漂移。
      */
     const source = buildExternalLinkScript(siteHosts)
+    /**
+     * ⚠️ `Page.addScriptToEvaluateOnNewDocument` 的注册是**会话级**的：
+     * 它跟着这条 CDP 连接走，连接一断，注册就被浏览器一并撤掉（2026-10-12 查实）。
+     * 所以这里把"给未来导航的那一半"和"给当前页的那一半"分开记，
+     * 装不上时告警要能说清缺的是哪一半。
+     */
+    let registeredForFuture = false
     try {
       await this.send('Page.addScriptToEvaluateOnNewDocument', { source })
+      registeredForFuture = true
     }
     catch (e) {
       console.warn('[cdp] 链接拦截器注册失败（只影响已打开的页面）', e)
     }
+    let installedNow = false
     try {
       await this.send('Runtime.evaluate', { expression: source, returnByValue: true })
-      return true
+      installedNow = true
     }
     catch (e) {
       console.warn('[cdp] 链接拦截器在当前页面安装失败', e)
+    }
+    /**
+     * ⚠️ **装完必须回读确认，不能凭"两个调用都没抛错"就报成功**（2026-10-12）。
+     *
+     * 现场（v0.4.13）：主进程明明连着这一格的目标（`attached: true`），
+     * 页面里 `window.__aiquadLinkHooked` 却是 `null` —— 链接照旧在本格跳转，
+     * 而告警只进主进程控制台、用户看不见，于是表现成"偶尔不生效"。
+     *
+     * 回读就是一次 `Runtime.evaluate`，代价可忽略；读不到（`null`）时按失败处理，
+     * 交给上层的看门狗重试，**不要在这里假装成功**。
+     */
+    const verified = await this.isExternalLinkHookInstalled()
+    if (verified !== true) {
+      console.warn('[cdp] 链接拦截器回读确认未通过（该格链接仍会本格跳转）', {
+        registeredForFuture, installedNow, verified,
+      })
       return false
     }
+    if (!registeredForFuture) {
+      // 当前页好用、但"以后导航"没注册上：刷新或换会话就会退化，必须说出来。
+      console.warn('[cdp] 链接拦截器只对当前页生效（注册未来导航失败，刷新后需重装）')
+    }
+    return true
+  }
+
+  /**
+   * 回读当前这一页里链接拦截器的版本标记。
+   *
+   * · `true`  = 已装且是本版本
+   * · `false` = 明确没装 → 可以放心重装
+   * · `null`  = 读不到（会话断了 / 页面还没就绪）→ **不要据此重装**，
+   *   与几何看门狗"读不到就当没读"是同一套约定（见 instance-manager.verifyGeometry）。
+   */
+  async isExternalLinkHookInstalled(): Promise<boolean | null> {
+    if (this.closed || !this.ws) return null
+    try {
+      const r = await this.send('Runtime.evaluate', {
+        expression: `window.__aiquadLinkHooked === ${EXTERNAL_LINK_HOOK_VERSION}`,
+        returnByValue: true,
+      }, 4000)
+      return r?.result?.value === true
+    }
+    catch {
+      return null
+    }
+  }
+
+  /** 当前页地址（自愈时用来判断"这条会话还跟没跟在本格站点上"，取不到返回 null） */
+  async currentUrl(): Promise<string | null> {
+    if (this.closed || !this.ws) return null
+    try {
+      const r = await this.send('Runtime.evaluate', {
+        expression: 'location.href',
+        returnByValue: true,
+      }, 4000)
+      const v = r?.result?.value
+      return typeof v === 'string' ? v : null
+    }
+    catch {
+      return null
+    }
+  }
+
+  /** 这条 CDP 会话是否已断开（看门狗据此决定要不要重连） */
+  get isClosed(): boolean {
+    return this.closed
   }
 
   async send<T = any>(method: string, params: Record<string, unknown> = {}, timeoutMs = 8000): Promise<T> {

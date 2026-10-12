@@ -11,6 +11,7 @@ import { isQuittingForUpdate, updater } from './updater'
 import * as w32 from './win32'
 import type { AppConfig, LayoutId, PaneRect } from './types'
 import { AUTO_CLEAN_THRESHOLD_BYTES } from './types'
+import { installFileLog } from './log'
 
 let config: ConfigStore
 let manager: InstanceManager | null = null
@@ -19,6 +20,18 @@ let settingsWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let browserInfo: BrowserInfo | null = null
 let isQuitting = false
+
+/**
+ * 把主进程日志复制一份到 <userData>/logs/main.log。
+ *
+ * 打包后的安装版**没有控制台**，主进程的 console.* 哪都不去 ——
+ * "链接拦截器没装上"这类降级路径用户与开发者都看不见。
+ * 见 log.ts 的说明；写日志失败一律静默，不影响主流程。
+ */
+try {
+  installFileLog(app.getPath('userData'))
+}
+catch {}
 
 // 最后一道防线。主进程里任何未捕获异常，Electron 都会弹一个原生错误框
 // "A JavaScript error occurred in the main process"，用户只能点"确定"——
