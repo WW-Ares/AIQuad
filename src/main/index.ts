@@ -6,6 +6,7 @@ import { ConfigStore } from './config'
 import { detectBrowsers, pickBrowser, type BrowserInfo } from './browser-detect'
 import { InstanceManager } from './instance-manager'
 import { getSystemProxy, profilesRoot, testProxy } from './proxy'
+import { waitForNetworkReady, type StartupGateTarget } from './startup-gate'
 import { clearProfileCache, clearProfileCacheSync, humanSize, scanProfileCache, type CacheCleanResult, type CacheStat } from './cache-cleaner'
 import { isQuittingForUpdate, updater } from './updater'
 import * as w32 from './win32'
@@ -20,6 +21,12 @@ let settingsWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let browserInfo: BrowserInfo | null = null
 let isQuitting = false
+
+/** 写在登录项命令行里的标记：把「开机自启」和「手动双击」区分开 */
+const AUTOSTART_ARG = '--aiquad-autostart=1'
+let startupGatePending = false
+let startupGateInterrupted = false
+let wakeStartupGate: (() => void) | null = null
 
 /**
  * 把主进程日志复制一份到 <userData>/logs/main.log。
@@ -910,21 +917,135 @@ async function syncInstances() {
 
 /* ---------------- 启动 ---------------- */
 
-async function bootstrap() {
-  config = new ConfigStore(app.getPath('userData'))
+/**
+ * Windows 的登录项（Run 键）允许带命令行参数 —— 用它把「这次是被开机自启拉起的」
+ * 和「用户手动双击图标」区分开：只有前者需要等网络，手动打开一律立刻起。
+ *
+ * ⚠️ setLoginItemSettings 传了 args 之后，getLoginItemSettings 也必须传同样的 args
+ * 才能读到正确的 openAtLogin（Electron 文档明确写了）。本项目目前只读开关状态、
+ * 不回读系统值，但两处写入统一走 setAutoStart，免得将来加回读时漏配。
+ */
+function setAutoStart(on: boolean) {
+  // 未打包的开发实例（包括全部回归脚本起的隔离实例）绝不碰用户的登录项：
+  // 它们用的是自己的 userData，config.autoStart 跟真实设置无关，一启动就会
+  // 把 Run 项删掉，或者更糟 —— 改成指向 node_modules 里的 electron.exe。
+  if (!app.isPackaged) {
+    console.log(`[startup] 开发实例不写登录项（openAtLogin=${on}）`)
+    return
+  }
+  try {
+    app.setLoginItemSettings({ openAtLogin: on, args: on ? [AUTOSTART_ARG] : [] })
+  }
+  catch (e) {
+    console.warn('[startup] 写入开机自启失败', e)
+  }
+}
 
-  // 探测系统代理，作为默认
+function launchedAtLogin(): boolean {
+  return process.argv.includes(AUTOSTART_ARG) || app.commandLine.hasSwitch('aiquad-autostart')
+}
+
+/**
+ * 读一次系统代理并落进 config。
+ *
+ * 放在门控里每轮重跑，而不是只在启动瞬间跑一次：梯子往往比 AIQuad 晚，
+ * 它会**在之后**才把 ProxyEnable / ProxyServer 写进注册表。只快照一次的话，
+ * 等它起来时我们手里的还是「没有代理」，探测与随后的 Chrome 启动参数都是错的。
+ */
+async function refreshSystemProxySnapshot(): Promise<AppConfig['proxy']> {
+  const cfg = config.get()
   try {
     const sp = await getSystemProxy()
-    const cfg = config.get()
     if (sp.enabled && sp.server) {
-      cfg.proxy.systemServer = sp.server
-      cfg.proxy.systemType = /socks/i.test(sp.server) ? 'socks5' : 'http'
-      if (!cfg.proxy.host) cfg.proxy.mode = 'system'
-      config.save()
+      const type: 'http' | 'https' | 'socks5' = /socks/i.test(sp.server) ? 'socks5' : 'http'
+      let changed = false
+      if (cfg.proxy.systemServer !== sp.server) { cfg.proxy.systemServer = sp.server; changed = true }
+      if (cfg.proxy.systemType !== type) { cfg.proxy.systemType = type; changed = true }
+      if (!cfg.proxy.host && cfg.proxy.mode !== 'system') { cfg.proxy.mode = 'system'; changed = true }
+      if (changed) config.save()
     }
   }
   catch {}
+  return cfg.proxy
+}
+
+/** 当前布局里真正会打开的那些网址（去重）——就绪门按这张清单探 */
+function startupGateTargets(): StartupGateTarget[] {
+  const cfg = config.get()
+  const n = layoutCount[cfg.layout] || 1
+  const seen = new Set<string>()
+  const out: StartupGateTarget[] = []
+  for (const pane of cfg.panes.slice(0, n)) {
+    const ai = cfg.aiList.find((a) => a.id === pane.aiId)
+    if (!ai?.url || seen.has(ai.url)) continue
+    seen.add(ai.url)
+    out.push({ url: ai.url, ai: { proxyMode: ai.proxyMode, proxy: ai.proxy } })
+  }
+  return out
+}
+
+/** 可被「用户手动启动」立刻叫醒的睡眠；等待期间不创建任何窗口 */
+function interruptibleSleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => { wakeStartupGate = null; resolve() }, ms)
+    wakeStartupGate = () => { clearTimeout(timer); wakeStartupGate = null; resolve() }
+  })
+}
+
+/**
+ * 一次性启动门：只在「开机自启」那一次启动生效，手动打开一律立刻起。
+ *
+ * 两段，互相独立、都能单独关：
+ * ① 固定延时 N 秒 —— 给网卡、DNS、梯子进程的启动留缓冲，之后才开始探测；
+ * ② 网络就绪门 —— 按当前代理把各分格网址真实探一遍，全通了才放行，
+ *    到上限仍未全通就照常启动（今天没开梯子不能让程序一直不出现）。
+ *
+ * 等待期间**不创建面板、托盘和浏览器进程**，所以用户看到的是「程序晚一点出现，
+ * 一出来页面就是好的」。运行中不做任何常驻网络监听。
+ */
+async function applyStartupGate() {
+  if (!launchedAtLogin()) return
+  const cfg = config.get()
+  const delaySec = Math.max(0, Number(cfg.startupDelaySec) || 0)
+  const gateOn = !!cfg.startupWaitNetwork && cfg.startupWaitMaxSec > 0
+  if (!delaySec && !gateOn) return
+
+  startupGatePending = true
+  startupGateInterrupted = false
+  const startedAt = Date.now()
+  try {
+    if (delaySec) {
+      console.log(`[startup] 开机自启：固定延时 ${delaySec}s`)
+      await interruptibleSleep(delaySec * 1000)
+      if (startupGateInterrupted) return
+    }
+    if (!gateOn) return
+
+    const targets = startupGateTargets()
+    console.log(`[startup] 开机自启：等待 ${targets.length} 个分格网址可达（上限 ${cfg.startupWaitMaxSec}s）`)
+    const r = await waitForNetworkReady({
+      cfg,
+      targets,
+      refreshGlobalProxy: refreshSystemProxySnapshot,
+      log: (m) => console.log(m),
+      interrupted: () => startupGateInterrupted,
+      sleep: interruptibleSleep,
+    })
+    console.log(`[startup] 放行（${r.reason}）：累计等待 ${Date.now() - startedAt}ms，探测 ${r.rounds} 轮`)
+    if (r.lastErrors.length) console.log(`[startup] 最后未通：${r.lastErrors.join(' / ')}`)
+  }
+  finally {
+    startupGatePending = false
+  }
+}
+
+async function bootstrap() {
+  config = new ConfigStore(app.getPath('userData'))
+
+  // 记一份系统代理快照；门控内部每轮还会重读
+  await refreshSystemProxySnapshot()
+  // 自启的这一次：固定延时 + 等网络/代理就绪，再建界面与浏览器进程
+  await applyStartupGate()
 
   browserInfo = await pickBrowser(config.get().browserPreference, config.get().customBrowserPath)
   if (!browserInfo) {
@@ -978,11 +1099,26 @@ async function bootstrap() {
     }, 350)
   })
 
-  // 开机自启
-  try {
-    app.setLoginItemSettings({ openAtLogin: config.get().autoStart })
-  }
-  catch {}
+  // 开机自启（登录项带标记参数，见 launchedAtLogin）
+  setAutoStart(config.get().autoStart)
+}
+
+/**
+ * 网络/梯子后来才恢复时的人工兜底：把当前布局里所有分格重新加载一遍。
+ * 只在用户点托盘菜单时跑一次，不做任何自动重试或常驻监听。
+ */
+async function reloadAllPanes() {
+  if (!manager) return
+  const ids = visiblePaneIds()
+  await Promise.all(ids.map(async (id) => {
+    try {
+      await manager?.reload(id)
+    }
+    catch (e) {
+      console.warn(`[reload] ${id} 刷新失败`, e)
+    }
+  }))
+  broadcastStatus()
 }
 
 function createTray() {
@@ -997,6 +1133,7 @@ function createTray() {
     const menu = Menu.buildFromTemplate([
       { label: '呼出面板', click: () => showPanel() },
       { label: '收起面板', click: () => hidePanel() },
+      { label: '重新加载全部网页', click: () => { void reloadAllPanes() } },
       { label: '设置', click: () => openSettings() },
       { type: 'separator' },
       {
@@ -1088,12 +1225,7 @@ function setupIpc() {
     const next = config.update(patch)
     // 快捷键保存后必须立刻重新注册，并且把"注册不上"的原因回传给设置页
     const shortcutIssues = patch.shortcuts ? registerShortcuts() : lastShortcutIssues
-    if (patch.autoStart !== undefined) {
-      try {
-        app.setLoginItemSettings({ openAtLogin: !!patch.autoStart })
-      }
-      catch {}
-    }
+    if (patch.autoStart !== undefined) setAutoStart(!!patch.autoStart)
     const alwaysOnTopChanged = before.alwaysOnTop !== next.alwaysOnTop
     if (alwaysOnTopChanged) applyAlwaysOnTop()
     if (patch.position !== undefined || patch.windowWidthRatio !== undefined || alwaysOnTopChanged) {
@@ -1308,7 +1440,18 @@ if (!gotLock) {
 else {
   // 拿到锁才算一次真正的启动尝试；能否活到 ready 由后面的 showPanel 回填
   writeStartupState(false, gpuFallback)
-  app.on('second-instance', () => showPanel())
+  app.on('second-instance', () => {
+    // 还卡在「等网络」时用户主动双击了图标：别等了，立刻放行启动。
+    // 这里不能调 showPanel() —— 那会在 bootstrap 之前就创建面板窗口，
+    // 而 did-finish-load 的监听还没挂上，窗口会出来但分格永远不加载。
+    if (startupGatePending) {
+      startupGateInterrupted = true
+      wakeStartupGate?.()
+      console.log('[startup] 用户手动启动，跳过网络等待')
+      return
+    }
+    showPanel()
+  })
 }
 
 app.whenReady().then(async () => {

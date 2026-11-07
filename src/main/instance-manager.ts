@@ -5,7 +5,7 @@ import { screen } from 'electron'
 import type { AiService, AppConfig } from './types'
 import type { BrowserInfo } from './browser-detect'
 import { CdpSession, listPageTargets, siteHostsFromUrls, type CdpTarget } from './cdp'
-import { buildBypassArg, buildProxyServerArg } from './proxy'
+import { buildBypassArg, buildProxyServerArg, proxyForAi } from './proxy'
 import * as w32 from './win32'
 
 export type InstanceStatus = 'idle' | 'starting' | 'ready' | 'failed' | 'suspended'
@@ -719,12 +719,9 @@ export class InstanceManager {
       args.push('--new-window', ai.url)
     }
 
-    // 代理：共享会话下所有分格属于同一个浏览器进程，代理是进程级设置，只能走全局配置
-    let proxy = cfg.proxy
-    if (!shared) {
-      if (ai.proxyMode === 'custom' && ai.proxy) proxy = { ...ai.proxy, mode: ai.proxy.mode }
-      else if (ai.proxyMode === 'direct') proxy = { ...cfg.proxy, mode: 'none' }
-    }
+    // 代理：共享会话下所有分格属于同一个浏览器进程，代理是进程级设置，只能走全局配置。
+    // 判据收在 proxyForAi 一处 —— 开机就绪门的探测必须用同一份，否则「探过了」却按另一套参数启动。
+    const proxy = proxyForAi(ai, cfg.proxy, shared)
 
     const server = buildProxyServerArg(proxy)
     if (server) {

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import tls from 'node:tls'
 import { promisify } from 'node:util'
-import type { ProxyConfig } from './types'
+import type { AiService, ProxyConfig } from './types'
 
 const execFileAsync = promisify(execFile)
 
@@ -404,6 +404,24 @@ export async function testProxy(proxy: ProxyConfig | null, url: string): Promise
   catch (err: any) {
     return done({ ok: false, error: describeError(err) })
   }
+}
+
+/**
+ * 这一格最终用哪份代理 —— **启动参数与开机就绪门探测共用这一份判据**。
+ *
+ * 共享会话下所有分格属于同一个浏览器进程，代理是进程级设置，分格自己的
+ * proxyMode 不生效；独立会话才按 AI 单独设。写成两份的后果是「探测说通了，
+ * 启动却按另一套参数拉 Chrome」，页面照样白屏。
+ */
+export function proxyForAi(
+  ai: Pick<AiService, 'proxyMode' | 'proxy'>,
+  globalProxy: ProxyConfig,
+  shared: boolean,
+): ProxyConfig {
+  if (shared) return globalProxy
+  if (ai.proxyMode === 'custom' && ai.proxy) return { ...ai.proxy, mode: ai.proxy.mode }
+  if (ai.proxyMode === 'direct') return { ...globalProxy, mode: 'none' }
+  return globalProxy
 }
 
 export const profilesRoot = (userData: string) => path.join(userData, 'profiles')

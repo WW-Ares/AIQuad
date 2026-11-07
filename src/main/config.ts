@@ -3,7 +3,12 @@ import path from 'node:path'
 import type { AiService, AppConfig } from './types'
 import { normalizeAccelerator } from './accelerator'
 
-const CONFIG_VERSION = 6
+/**
+ * 7 = 0.4.15：新增「开机延时 + 等网络就绪」的三个字段。
+ * 没有需要订正的旧值（老配置里根本没这两个键，merge 会自动补默认值），
+ * 升版本号只是把配置结构的变化记下来，顺带触发一次落盘。
+ */
+const CONFIG_VERSION = 7
 
 /**
  * 早期版本给"分格切换"预设了 Ctrl+Alt+1/2/4，实际会和其它软件抢键，
@@ -87,6 +92,11 @@ export function defaultConfig(): AppConfig {
     paneCleanup: true,
     paneCleanupDelayMin: 10,
     autoStart: false,
+    // 开机自启时等网络/梯子就绪再露面；60 秒是「慢启动」和「别一直不出来」的折中
+    startupWaitNetwork: true,
+    startupWaitMaxSec: 60,
+    // 固定延时 10 秒给网络栈和梯子进程先启动，之后才开始探测；0 可关
+    startupDelaySec: 10,
     browserPreference: 'auto',
     customBrowserPath: '',
     // 默认自动：缓存超过 500MB 就在下次启动时清一遍。
@@ -190,6 +200,10 @@ export class ConfigStore {
       if (norm) (this.data.shortcuts as any)[k] = norm
     }
     if (this.data.position !== 'left' && this.data.position !== 'right') this.data.position = 'right'
+    // 等待上限只认设置页给出的几档；手改坏的值一律回到 60 秒
+    if (![15, 30, 60, 120].includes(Number(this.data.startupWaitMaxSec))) this.data.startupWaitMaxSec = 60
+    if (![0, 5, 10, 20, 30, 60].includes(Number(this.data.startupDelaySec))) this.data.startupDelaySec = 10
+    if (this.data.startupWaitNetwork === undefined) this.data.startupWaitNetwork = true
     if (this.data.windowMode !== 'app' && this.data.windowMode !== 'standard') this.data.windowMode = 'standard'
     // 登录态共享默认开启：旧配置没有这个字段时按开启处理（这是 v0.4 的主行为）
     this.data.sharedSession = this.data.sharedSession !== false

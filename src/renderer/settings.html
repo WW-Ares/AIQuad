@@ -141,6 +141,48 @@
 
             <div class="st-row">
               <span class="st-row-label">
+                <label class="st-name" for="startup-delay-sec">开机延时启动</label>
+                <i class="st-info" tabindex="0" title="自启后先固定等这么久，给网卡、DNS 和梯子进程留启动时间，之后才开始探测网络。与「最长等待」相加就是程序最晚出现的时间。">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="startup-delay-sec">
+                  <option value="0">不延时</option>
+                  <option value="5">5 秒</option>
+                  <option value="10">10 秒（推荐）</option>
+                  <option value="20">20 秒</option>
+                  <option value="30">30 秒</option>
+                  <option value="60">60 秒</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="opt-startup-wait">开机先等网络就绪</label>
+                <i class="st-info" tabindex="0" title="开机自启时，先确认分格里的网站都能连上，再拉起界面和浏览器；程序会晚一点出现，但一出来页面就是好的。只对开机自启生效，手动打开不等待。">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="checkbox" id="opt-startup-wait" class="st-switch" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
+                <label class="st-name" for="startup-wait-sec">最长等待</label>
+                <i class="st-info" tabindex="0" title="到点还没全通也照常启动，免得今天没开梯子程序就一直不出现；运行中梯子出问题请用托盘的「重新加载全部网页」。">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <select id="startup-wait-sec">
+                  <option value="15">15 秒</option>
+                  <option value="30">30 秒</option>
+                  <option value="60">60 秒（推荐）</option>
+                  <option value="120">120 秒</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
                 <label class="st-name" for="opt-hibernate">后台分格休眠</label>
                 <i class="st-info" tabindex="0" title="当前布局用不到的分格挂起，省 CPU 不省内存；开着登录态共享时无效（同一进程只能有一个状态）">i</i>
               </span>

@@ -218,6 +218,9 @@ function fill() {
   $('opt-cleanup').checked = cfg.paneCleanup !== false
   $('cleanup-min').value = cfg.paneCleanupDelayMin || 10
   $('opt-autostart').checked = !!cfg.autoStart
+  $('startup-delay-sec').value = String(cfg.startupDelaySec ?? 10)
+  $('opt-startup-wait').checked = cfg.startupWaitNetwork !== false
+  $('startup-wait-sec').value = String(cfg.startupWaitMaxSec || 60)
   $('opt-hibernate').checked = !!cfg.hibernateBackground
 
   // 代理
@@ -265,6 +268,7 @@ function fill() {
   renderAiRows()
   void loadCacheStats()
   syncCleanupDep()
+  syncStartupWaitDep()
 }
 
 /**
@@ -283,6 +287,18 @@ function syncCleanupDep() {
   const active = !!on.checked
   if (sub) sub.classList.toggle('off', !active)
   if (min) min.disabled = !active
+}
+
+/** 开机自启没开时，延时 / 等网络这几项一起置灰，免得看着像能生效 */
+function syncStartupWaitDep() {
+  const autostart = document.getElementById('opt-autostart')
+  const on = document.getElementById('opt-startup-wait')
+  const sec = document.getElementById('startup-wait-sec')
+  const delay = document.getElementById('startup-delay-sec')
+  const autoOn = !!autostart?.checked
+  if (on) on.disabled = !autoOn
+  if (delay) delay.disabled = !autoOn
+  if (sec) sec.disabled = !autoOn || !on?.checked
 }
 
 /* ---------------- 面板宽度预设 ---------------- */
@@ -760,6 +776,9 @@ function collect() {
   // 面板要不要压在别的程序之上，由用户决定（早先恒为 true）
   cfg.alwaysOnTop = $('opt-ontop').checked
   cfg.autoStart = $('opt-autostart').checked
+  cfg.startupDelaySec = Number($('startup-delay-sec').value) || 0
+  cfg.startupWaitNetwork = $('opt-startup-wait').checked
+  cfg.startupWaitMaxSec = Number($('startup-wait-sec').value) || 60
   cfg.hibernateBackground = $('opt-hibernate').checked
   cfg.paneCleanup = $('opt-cleanup').checked
   cfg.paneCleanupDelayMin = Math.min(120, Math.max(1, Number($('cleanup-min').value) || 10))
@@ -935,9 +954,9 @@ async function init() {
  * 字段一改动就会触发浏览器实例重启，边打字边重启是不可接受的。
  */
 function bindAutoSave() {
-  const instant = ['proxy-mode', 'proxy-type', 'browser-pref', 'window-mode', 'opt-shared']
+  const instant = ['proxy-mode', 'proxy-type', 'browser-pref', 'window-mode', 'opt-shared', 'startup-delay-sec', 'startup-wait-sec']
   const text = ['proxy-host', 'proxy-port', 'proxy-bypass', 'browser-path', 'cleanup-min']
-  const toggles = ['opt-ontop', 'opt-autostart', 'opt-hibernate', 'opt-cleanup']
+  const toggles = ['opt-ontop', 'opt-autostart', 'opt-hibernate', 'opt-cleanup', 'opt-startup-wait']
 
   for (const id of instant) {
     document.getElementById(id)?.addEventListener('change', () => scheduleSave(0))
@@ -947,6 +966,10 @@ function bindAutoSave() {
   }
   for (const id of text) {
     document.getElementById(id)?.addEventListener('change', () => scheduleSave(150))
+  }
+  // 依赖联动要跟着勾选即时变，跟自动保存分开绑（两个 listener 互不干扰）
+  for (const id of ['opt-autostart', 'opt-startup-wait']) {
+    document.getElementById(id)?.addEventListener('change', syncStartupWaitDep)
   }
 }
 

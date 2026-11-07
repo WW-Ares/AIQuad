@@ -92,6 +92,15 @@ export interface AppConfig {
   /** 闲置多少分钟后清理未使用的分格（配合 paneCleanup） */
   paneCleanupDelayMin: number
   autoStart: boolean
+  /**
+   * 开机自启时先等网络 / 代理就绪，再拉起界面与分格。
+   * 只作用于「由登录项拉起的那一次启动」，手动打开不等待，也不做常驻监听。
+   */
+  startupWaitNetwork: boolean
+  /** 最长等待秒数；到点无论通不通都照常启动，避免没开梯子时程序一直不出现 */
+  startupWaitMaxSec: number
+  /** 自启后的固定延时秒数，先给网卡 / DNS / 梯子进程一点缓冲再开始探测（0 = 不延时） */
+  startupDelaySec: number
   browserPreference: 'chrome' | 'edge' | 'auto'
   customBrowserPath: string
   /**
