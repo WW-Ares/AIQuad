@@ -55,10 +55,38 @@ $g.Dispose(); $bmp.Dispose()
 Write-Output "saved $($vs.Width)x$($vs.Height) -> OUTPATH"
 `
 
+/**
+ * 桌面里已经有没有别的 AIQuad 在跑（用户自己开的那份）。
+ *
+ * ⚠️ 这个前置检查是事故换来的，别删（2026-11-11）：本脚本收尾走 `killBrowsersUnder`，
+ * 判据是"命令行带 `%APPDATA%\aiquad\profiles`" —— 用户自己那份实例的分格窗口**同样命中**。
+ * 那天发版前跑本脚本，把用户正开着的分格浏览器进程连锅端了：面板还在，但那一格里的网页没了，
+ * 看起来就像"新版本只有框架、没有网页"的严重 bug。日志里表现为
+ * `p1 链接拦截器会话断了，但没找到可接的页面目标` 每 3 秒刷一条。
+ * 被测实例用的是真实 userData，没法从档案路径上区分你我 —— 只能要求先退出。
+ */
+function runningAppPids() {
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `Get-Process -Name AIQuad -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id`,
+    ], { encoding: 'utf8' })
+    return String(out).split(/\r?\n/).map((s) => Number(s.trim())).filter(Boolean)
+  }
+  catch { return [] }
+}
+
 async function main() {
   if (!fs.existsSync(packagedExe)) {
     console.error('找不到打包产物:', packagedExe)
     process.exit(1)
+  }
+  const busy = runningAppPids()
+  if (busy.length) {
+    console.error(`❌ 已经有 AIQuad 在运行（pid ${busy.join(', ')}），拒绝执行。`)
+    console.error('   本脚本收尾会清掉 %APPDATA%\\aiquad\\profiles 下的所有浏览器进程,')
+    console.error('   那正是你正在用的分格窗口 —— 会表现成"面板在、网页没了"。')
+    console.error('   请先退出 AIQuad（托盘 → 退出），再重新跑本脚本。')
+    process.exit(4)
   }
   fs.mkdirSync(path.join(projectRoot, '.tmp'), { recursive: true })
 
