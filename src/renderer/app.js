@@ -549,6 +549,9 @@ async function init() {
      */
     passthrough = null
   })
+  // 主进程单方面改了穿透（顶栏带硬保险）：手上的缓存不作数了，只作废、不主动上报，
+  // 理由与下面 panel-shown 那段相同（陈旧点位会把主进程刚算对的值覆盖回去）
+  api.on('passthrough-reset', () => { passthrough = null })
   // 点在面板外面（别的窗口 / 桌面）：这条由主进程的前台窗口事件转发过来
   api.on('outside-click', () => {
     if (state.menuPane) toggleMenu(null)

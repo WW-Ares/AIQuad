@@ -141,6 +141,16 @@
 
             <div class="st-row">
               <span class="st-row-label">
+                <label class="st-name" for="opt-hide-tray">隐藏托盘图标</label>
+                <i class="st-info" tabindex="0" title="把右下角的托盘图标收起来，界面和快捷键都不受影响。代价是入口只剩呼出快捷键和面板顶栏的齿轮，托盘的「退出」也跟着没了 —— 要退出程序，先在这里把图标放回来">i</i>
+              </span>
+              <div class="st-row-ctl">
+                <input type="checkbox" id="opt-hide-tray" class="st-switch" />
+              </div>
+            </div>
+
+            <div class="st-row">
+              <span class="st-row-label">
                 <label class="st-name" for="startup-delay-sec">开机延时启动</label>
                 <i class="st-info" tabindex="0" title="自启后先固定等这么久，给网卡、DNS 和梯子进程留启动时间，之后才开始探测网络。与「最长等待」相加就是程序最晚出现的时间。">i</i>
               </span>

@@ -6,6 +6,13 @@ const PUSH_CHANNELS = [
   'instances-updated',
   'request-rects',
   'panel-shown',
+  /**
+   * 主进程单方面改了穿透值（顶栏带硬保险），渲染层的缓存本地值已经不作数 ——
+   * 收到就把它置 null，下一次 `mousemove` 会重新算并上报。
+   * 少了这一条，"网页点不动"会以另一种形式回来（见 main/index.ts 的
+   * invalidateRendererPassthrough）。
+   */
+  'passthrough-reset',
   'outside-click',
   'layout-changed',
   'update-status',

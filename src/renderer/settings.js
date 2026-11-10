@@ -218,6 +218,8 @@ function fill() {
   $('opt-cleanup').checked = cfg.paneCleanup !== false
   $('cleanup-min').value = cfg.paneCleanupDelayMin || 10
   $('opt-autostart').checked = !!cfg.autoStart
+  // 托盘默认显示（老配置没有这个键）；勾上才藏
+  $('opt-hide-tray').checked = cfg.hideTray === true
   $('startup-delay-sec').value = String(cfg.startupDelaySec ?? 10)
   $('opt-startup-wait').checked = cfg.startupWaitNetwork !== false
   $('startup-wait-sec').value = String(cfg.startupWaitMaxSec || 60)
@@ -776,6 +778,7 @@ function collect() {
   // 面板要不要压在别的程序之上，由用户决定（早先恒为 true）
   cfg.alwaysOnTop = $('opt-ontop').checked
   cfg.autoStart = $('opt-autostart').checked
+  cfg.hideTray = $('opt-hide-tray').checked
   cfg.startupDelaySec = Number($('startup-delay-sec').value) || 0
   cfg.startupWaitNetwork = $('opt-startup-wait').checked
   cfg.startupWaitMaxSec = Number($('startup-wait-sec').value) || 60
@@ -956,7 +959,7 @@ async function init() {
 function bindAutoSave() {
   const instant = ['proxy-mode', 'proxy-type', 'browser-pref', 'window-mode', 'opt-shared', 'startup-delay-sec', 'startup-wait-sec']
   const text = ['proxy-host', 'proxy-port', 'proxy-bypass', 'browser-path', 'cleanup-min']
-  const toggles = ['opt-ontop', 'opt-autostart', 'opt-hibernate', 'opt-cleanup', 'opt-startup-wait']
+  const toggles = ['opt-ontop', 'opt-autostart', 'opt-hide-tray', 'opt-hibernate', 'opt-cleanup', 'opt-startup-wait']
 
   for (const id of instant) {
     document.getElementById(id)?.addEventListener('change', () => scheduleSave(0))

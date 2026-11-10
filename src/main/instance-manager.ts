@@ -2008,6 +2008,31 @@ export class InstanceManager {
   }
 
   /**
+   * 第一行分格的上沿在面板内的 y（DIP）—— 也就是"顶栏带"的下沿。
+   *
+   * 顶栏（`.setting-header`，26px）和它上面那圈留白全都落在这条线**以上**，那里
+   * 没有任何浏览器窗口，只有面板自己的 UI（图标按钮、拖动热区、品牌区）。
+   * 所以"指针在这条线以上"＝"指针压在面板自己的 UI 上"，主进程据此做一道硬保险：
+   * 这条带子上**永远不许穿透**（见 index.ts 的 `setThrough` 与 `startChromeGuard`）。
+   *
+   * 为什么由主进程自己算、不信渲染层的判断：穿透状态是渲染层用 `elementFromPoint`
+   * 算出来的，而它对**转发鼠标消息的坐标**（`setIgnoreMouseEvents(true,{forward:true})`）
+   * 没有把握。一旦那个坐标算偏，指针明明停在顶栏上、判定却是"压在网页上"，
+   * 面板就一直保持穿透 —— 于是点顶栏按钮的点击直接落到下面那个程序的标题栏上，
+   * 表现为"点收起，把下面的窗口关了/最小化了"。这条带子是**几何事实**，
+   * 主进程用屏幕坐标自己判不会错。
+   *
+   * 返回 0 表示还没有任何分格矩形（刚启动、或全部未就位），此时不设防。
+   */
+  paneTopBand(): number {
+    let min = Infinity
+    for (const r of this.rects.values()) {
+      if (r.y < min) min = r.y
+    }
+    return Number.isFinite(min) && min > 0 ? min : 0
+  }
+
+  /**
    * 鼠标是否落在某个**已就位**的分格上（坐标取 DIP 屏幕坐标系）。
    *
    * `origin` 是"**按哪个位置算分格**"，默认用面板的当前原点。呼出动画期间必须显式传

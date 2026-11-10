@@ -25,6 +25,8 @@ async function main() {
   real.autoStart = false
   fs.mkdirSync(Q, { recursive: true })
   fs.writeFileSync(path.join(Q, 'config.json'), JSON.stringify(real, null, 2))
+  // 上一次跑留下的日志会让"托盘那行日志在不在"变成假绿 —— 每次先清掉
+  try { fs.rmSync(path.join(Q, 'logs', 'main.log'), { force: true }) } catch {}
 
   const env = { ...process.env, AIQUAD_DISABLE_GPU: '1', AIQUAD_NO_SANDBOX: '1' }
   delete env.ELECTRON_RUN_AS_NODE
@@ -85,9 +87,38 @@ async function main() {
   })()`)
   console.log(JSON.stringify(facts, null, 2))
 
+  /**
+   * 托盘开关（0.4.16 加）。
+   *
+   * 托盘图标**没有可查询的状态**（Electron 不提供 `Tray.isVisible`），所以判据只能是
+   * 主进程自己写的那行日志：勾上之后必须出现 `[tray] 已按设置隐藏托盘图标`。
+   * 这一步同时把整条链路验了一遍 —— 勾选 → collect() → save-config → applyTray()，
+   * 少任何一环这行日志都不会出现。
+   */
+  const hasTraySwitch = await ev(`!!document.getElementById('opt-hide-tray')`)
+  const flip = (on) => ev(`(() => {
+    const el = document.getElementById('opt-hide-tray')
+    if (!el) return 'missing'
+    el.checked = ${on}
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+    return 'ok'
+  })()`)
+  await flip(true)
+  await sleep(1500)
+  let trayLog = ''
+  try { trayLog = fs.readFileSync(path.join(Q, 'logs', 'main.log'), 'utf8') } catch {}
+  const trayHidden = trayLog.includes('[tray] 已按设置隐藏托盘图标')
+  // 改回去：万一后面还要接着用这个实例（也顺手验一次"放回来"这条路）
+  await flip(false)
+  await sleep(900)
+  let trayBack = false
+  try { trayBack = fs.readFileSync(path.join(Q, 'logs', 'main.log'), 'utf8').includes('[tray] 托盘图标已显示') } catch {}
+  console.log(`托盘开关：存在=${hasTraySwitch} 勾上后隐藏=${trayHidden} 取消后放回=${trayBack}`)
+
   const ok = facts.缺失id.length === 0 && facts.sc输入框 === 4 && facts.全只读
     && facts.宽度档按钮 === 4 && /^\d+%$/.test(facts.百分比读数)
     && parseFloat(facts.标题栏下框线) > 0 && !facts.横向溢出 && facts.每张卡头都完整
+    && hasTraySwitch && trayHidden && trayBack
   console.log(`\n【自检】${ok ? '✅ 全部通过' : '❌ 有断言不成立'}`)
 
   s.close(); p.close()

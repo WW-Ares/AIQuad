@@ -186,7 +186,112 @@ function easeInOutCubic(t: number) {
  */
 let lastThrough: boolean | null = null
 
+/**
+ * 指针是不是压在面板的"顶栏带"上（面板顶边 → 第一行分格的上沿）。
+ *
+ * 这条带子里只有面板自己的 UI：品牌区、图标按钮、拖动热区。**任何情况下都不许穿透**
+ * —— 面板一旦在那上面保持穿透，点"收起 / 置顶 / 设置"的点击就会直接落到下面的窗口上，
+ * 而那个位置通常正好是别的程序的 ✕ / 最大化 / 最小化按钮（面板贴着屏幕右上角，
+ * 用户的窗口往往也是最大化的），于是"点一下收起，把人家正在编辑的窗口关了"。
+ *
+ * 判据只用**几何事实**：顶栏带的坐标来自分格矩形（渲染层量出来的 DOM 矩形），
+ * 指针位置取自 `screen.getCursorScreenPoint()`。两边都是主进程手上的即时值，
+ * 不经过渲染层的 `elementFromPoint`，所以不受"转发鼠标消息坐标算偏"的影响。
+ *
+ * 返回 false 的情况（一律不设防）：面板没显示、还没收到分格矩形、拿不到指针位置。
+ * 宁可漏一次，也不要因为判据出错把网页区也锁死 —— 那是"呼出后点不动"这类老毛病。
+ */
+function cursorInChromeBand(): boolean {
+  if (!panelWindow || panelWindow.isDestroyed() || !panelWindow.isVisible()) return false
+  const band = manager?.paneTopBand() ?? 0
+  if (!band) return false
+  let pt: { x: number, y: number }
+  let b: { x: number, y: number, width: number, height: number }
+  try {
+    pt = screen.getCursorScreenPoint()
+    b = panelWindow.getBounds()
+  }
+  catch {
+    return false
+  }
+  return pt.x >= b.x && pt.x < b.x + b.width && pt.y >= b.y && pt.y < b.y + band
+}
+
+/**
+ * 顶栏带上的"永不穿透"保险巡逻（25ms）。
+ *
+ * `setThrough` 里那道判断只在**有人改穿透状态时**才生效；万一状态早就停在 `true`
+ * （指针刚才在网页上），之后渲染层再也没纠正过（转发消息丢了、坐标算偏、渲染进程忙），
+ * 面板就会一直穿透下去。这条巡逻补的就是"没人再来纠正"这一种：
+ * 只要指针进了顶栏带，就把穿透收回面板。
+ *
+ * 只做单向纠正（true → false）：反过来（在网页上强制 false）会直接撞上"点不动网页"，
+ * 那条路仍然只由渲染层的 `elementFromPoint` 决定（它还得区分悬浮胶囊和下拉菜单）。
+ */
+let chromeGuardTimer: NodeJS.Timeout | null = null
+
+/**
+ * 负向对照开关（只给回归脚本用）：关掉顶栏带的硬保险。
+ *
+ * 有它，`scripts/verify-chrome-guard.js` 才能自证"测的不是空气"——同一个点击，
+ * 关掉保险时必须穿透过去（面板不收起），开着时必须被面板收下。没有这条对照，
+ * 脚本报绿也可能只是"本来就不会穿透"。
+ * 与 `AIQUAD_TEST_KEEP_FRAME` / `AIQUAD_TEST_KEEP_BACKDROP` 同一套约定。
+ */
+const CHROME_GUARD_OFF = process.env.AIQUAD_TEST_NO_CHROME_GUARD === '1'
+
+function startChromeGuard() {
+  if (CHROME_GUARD_OFF) return
+  if (chromeGuardTimer) return
+  chromeGuardTimer = setInterval(() => {
+    // 绝大多时候面板是不穿透的，先看这个最便宜的判断，别每 25ms 去问一次系统
+    if (lastThrough !== true) return
+    if (!panelWindow || panelWindow.isDestroyed()) return
+    if (!cursorInChromeBand()) return
+    console.log('[passthrough] 指针在顶栏带上，强制收回穿透（否则点击会落到下面的窗口）')
+    setThrough(panelWindow, false)
+    // 渲染层缓存里还是 true，不让它作废的话指针走回网页时它不会再上报（见 invalidateRendererPassthrough）
+    invalidateRendererPassthrough(panelWindow)
+  }, 25)
+  chromeGuardTimer.unref?.()
+}
+
+function stopChromeGuard() {
+  if (!chromeGuardTimer) return
+  clearInterval(chromeGuardTimer)
+  chromeGuardTimer = null
+}
+
+/**
+ * 让渲染层的穿透缓存作废（它下个 `mousemove` 会重新算一遍并上报）。
+ *
+ * 为什么必须有这一步：渲染层只在**翻转**时才发 IPC（`if (through === passthrough) return`）。
+ * 主进程这边一旦不打招呼地把值改成 `false`（顶栏带保险），渲染层手上还记着 `true`，
+ * 指针走回网页时它会认为"值没变"而**一声不响**，面板于是永远保持不穿透 ——
+ * 那正好是老毛病"网页点不动"。发这一条等于告诉它"你手上的不作数了"。
+ *
+ * 与 `panel-shown` 里那句 `passthrough = null` 是同一套约定（那边也是只作废、不主动上报）。
+ */
+function invalidateRendererPassthrough(win: BrowserWindow) {
+  try {
+    win.webContents.send('passthrough-reset')
+  }
+  catch {}
+}
+
 function setThrough(win: BrowserWindow, through: boolean) {
+  /**
+   * ⚠️ 顶栏带上**永远**不穿透，这一句是硬保险，别删。
+   *
+   * 所有设置穿透的路径（渲染层 IPC、呼出动画逐帧精算、收尾校准）最后都汇到这里，
+   * 在这里判一次等于给每条路都上了锁。起因见 `cursorInChromeBand` 的说明：
+   * 渲染层算错的后果不是"按钮点不动"，而是**把点击送给下面那个程序**。
+   */
+  let overridden = false
+  if (through && !CHROME_GUARD_OFF && cursorInChromeBand()) {
+    through = false
+    overridden = true
+  }
   if (through === lastThrough) return
   lastThrough = through
   try {
@@ -195,6 +300,8 @@ function setThrough(win: BrowserWindow, through: boolean) {
   catch {
     // 窗口正在销毁时 setIgnoreMouseEvents 会抛，忽略即可
   }
+  // 被保险挡回去的那一次要通知渲染层作废缓存，否则它会以为"还是穿透"而不再上报
+  if (overridden) invalidateRendererPassthrough(win)
 }
 
 /**
@@ -400,6 +507,7 @@ function createPanelWindow() {
   // 面板被激活后把层级理一遍：置顶带里的次序会被系统重排，浏览器窗口可能压到面板上
   panelWindow.on('focus', () => manager?.raiseAll())
   panelWindow.on('closed', () => {
+    stopChromeGuard()
     panelWindow = null
   })
   // 关闭（无边框窗口没有系统关闭键，兜底）→ 收到托盘
@@ -437,6 +545,8 @@ function showPanel() {
     if (h) w32.makeToolWindow(h)
   }
   win.show()
+  // 顶栏带的"永不穿透"巡逻从这一刻开始跑（见 startChromeGuard）
+  startChromeGuard()
   // 显示这一刻 Electron 才把 WS_EX_LAYERED 补上，顺手冲掉了 TOOLWINDOW，
   // 所以可见之后还要再补一次（这次带 refresh，让系统重新套用样式）
   {
@@ -545,6 +655,8 @@ function hidePanel() {
     if (!win || win.isDestroyed()) return
     manager?.setSuppressed(true)
     win.hide()
+    // 面板都收起来了，巡逻没有对象了；下次呼出时再由 showPanel 拉起
+    stopChromeGuard()
     // 等隐藏真正生效后再回到停靠位，避免在可见状态下改变位置造成闪烁
     cancelHideSettle()
     hideSettleTimer = setTimeout(() => {
@@ -1080,7 +1192,7 @@ async function bootstrap() {
   }
 
   createPanelWindow()
-  createTray()
+  applyTray()
   registerShortcuts()
   // 点到面板外面（别的窗口 / 桌面）时通知渲染层收起 AI 列表
   watchOutsideClicks()
@@ -1165,6 +1277,33 @@ function createTray() {
 
 let trayRebuild: (() => void) | null = null
 
+/**
+ * 按配置决定托盘图标在不在（`hideTray`）。
+ *
+ * 为什么不在 createTray 里自己判断：托盘图标可以被**随时**收起来或放回去（设置页那个
+ * 开关是即时生效的），所以"建"和"撤"必须是同一件事的两个方向，由这里统一调停。
+ *
+ * ⚠️ `tray.destroy()` 而不是 `tray = null`：只把引用置空并不会把图标从通知区摘掉，
+ *    那个图标会一直留在右下角、点开还是旧菜单（`rebuild` 里虽然有 isDestroyed 守卫，
+ *    但窗口已经不在了，用户看到的仍是它）。重建时 Electron 会重新加一个图标，重复调用
+ *    本函数是安全的 —— `createTray` 里那个 updater 回调是单槽（见 updater.onChange），
+ *    不会越挂越多。
+ */
+function applyTray() {
+  const want = !config.get().hideTray
+  if (!want) {
+    if (tray && !tray.isDestroyed()) {
+      tray.destroy()
+      console.log('[tray] 已按设置隐藏托盘图标')
+    }
+    tray = null
+    return
+  }
+  if (tray && !tray.isDestroyed()) return
+  createTray()
+  console.log('[tray] 托盘图标已显示')
+}
+
 /* ---------------- IPC ---------------- */
 
 /**
@@ -1226,6 +1365,8 @@ function setupIpc() {
     // 快捷键保存后必须立刻重新注册，并且把"注册不上"的原因回传给设置页
     const shortcutIssues = patch.shortcuts ? registerShortcuts() : lastShortcutIssues
     if (patch.autoStart !== undefined) setAutoStart(!!patch.autoStart)
+    // 托盘开关是即时生效的：勾上/去掉就该立刻看到图标消失/出现，不用重启
+    if (patch.hideTray !== undefined) applyTray()
     const alwaysOnTopChanged = before.alwaysOnTop !== next.alwaysOnTop
     if (alwaysOnTopChanged) applyAlwaysOnTop()
     if (patch.position !== undefined || patch.windowWidthRatio !== undefined || alwaysOnTopChanged) {
@@ -1503,6 +1644,7 @@ app.on('will-quit', (e) => {
   if (quitFinalized) return
   quitFinalized = true
   stopAnim()
+  stopChromeGuard()
   globalShortcut.unregisterAll()
   manager?.dispose()
   // 为了装更新而退出时别插手：安装程序已经拉起来了，只等本进程结束，
