@@ -6,6 +6,7 @@
 const koffi = require('koffi')
 
 const user32 = koffi.load('user32.dll')
+const shell32 = koffi.load('shell32.dll')
 const gdi32 = koffi.load('gdi32.dll')
 const kernel32 = koffi.load('kernel32.dll')
 const ntdll = koffi.load('ntdll.dll')
@@ -135,8 +136,48 @@ export const HWND_NOTOPMOST = 0xfffffffffffffffen
 
 export const SW_HIDE = 0
 export const SW_SHOW = 5
+export const SW_SHOWNOACTIVATE = 4
 export const SW_SHOWNORMAL = 1
 export const SW_MAXIMIZE = 3
+
+/* ---------------- 调试计数器（只给 0.4.17 全屏闪烁排查用） ---------------- */
+
+export interface Win32DebugCounters {
+  placeBelow: number
+  setTopMost: number
+  raiseWindow: number
+  moveWindow: number
+  region: number
+  toolWindow: number
+  focus: number
+}
+
+/**
+ * 为什么把计数器放在 win32 层：全屏闪烁要回答的是“每秒到底向系统下发了几次
+ * SetWindowPos/SetWindowRgn”，而不是“日志里看见了几条告警”。告警有 5 秒节流，
+ * setTopMost 又吞错，只有在真正调用的地方计数才不会骗人。
+ */
+const DEBUG_ZFIGHT = process.env.AIQUAD_DEBUG_ZFIGHT === '1'
+const debugCounters: Win32DebugCounters = {
+  placeBelow: 0,
+  setTopMost: 0,
+  raiseWindow: 0,
+  moveWindow: 0,
+  region: 0,
+  toolWindow: 0,
+  focus: 0,
+}
+
+function markDebug(key: keyof Win32DebugCounters) {
+  if (DEBUG_ZFIGHT) debugCounters[key] += 1
+}
+
+/** 取走这一秒的计数并清零；env 没开时调用方会拿到全 0 */
+export function takeWin32DebugCounters(): Win32DebugCounters {
+  const out = { ...debugCounters }
+  for (const k of Object.keys(debugCounters) as Array<keyof Win32DebugCounters>) debugCounters[k] = 0
+  return out
+}
 
 const PROCESS_ALL_ACCESS = 0x001f0fff
 
@@ -174,11 +215,18 @@ export function getParent(hwnd: number | bigint): number {
  * 才补上 WS_EX_LAYERED 的，会把先前加的 TOOLWINDOW 一起冲掉——所以有些场合
  * 只能在窗口已经可见之后再补，此时必须带 `refresh` 让系统重新套用一次样式。
  */
-export function makeToolWindow(hwnd: number | bigint, refresh = false) {
+export function makeToolWindow(hwnd: number | bigint, refresh = false): boolean {
+  markDebug('toolWindow')
   try {
-    let ex = Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
-    ex = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, BigInt(ex))
+    const before = Number(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    const after = (before & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+    /**
+     * 已经是对的样式就别再碰。0.4.17 全屏修复里这条很关键：
+     * 以前每次 showPanel 都带 refresh 调一次，SWP_FRAMECHANGED 会让 DWM
+     * 按“窗口边框变了”整窗重绘；在全屏 direct flip 上这就是一次肉眼可见的闪。
+     */
+    if (after === before) return true
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, BigInt(after))
     if (refresh) {
       SetWindowPos(
         hwnd,
@@ -187,9 +235,11 @@ export function makeToolWindow(hwnd: number | bigint, refresh = false) {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
       )
     }
+    return true
   }
   catch (e) {
     console.warn('[win32] makeToolWindow failed', e)
+    return false
   }
 }
 
@@ -375,6 +425,7 @@ export function getTopWindow(): number {
  * 主动把浏览器窗口按回面板下方。
  */
 export function placeBelow(hwnd: number | bigint, insertAfter: number | bigint): boolean {
+  markDebug('placeBelow')
   try {
     return !!SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
   }
@@ -384,19 +435,43 @@ export function placeBelow(hwnd: number | bigint, insertAfter: number | bigint):
 }
 
 /** 置顶 / 取消置顶 */
-export function setTopMost(hwnd: number | bigint, on: boolean) {
+export function setTopMost(hwnd: number | bigint, on: boolean): boolean {
+  markDebug('setTopMost')
   try {
-    SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    return !!SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
   }
-  catch {}
+  catch {
+    return false
+  }
+}
+
+/**
+ * Z 序里 a 是否在 b 之上（从最顶层往下走，先遇到谁谁在上）。
+ * 只读，用来避免“已经正确还反复 SetWindowPos”的多余闪烁。
+ */
+export function windowIsAbove(a: number | bigint, b: number | bigint): boolean {
+  const A = Number(a)
+  const B = Number(b)
+  if (!A || !B || A === B) return false
+  let h = getTopWindow()
+  let guard = 0
+  while (h && guard++ < 5000) {
+    if (h === A) return true
+    if (h === B) return false
+    h = getWindow(h, GW_HWNDNEXT)
+  }
+  return false
 }
 
 /** 把窗口提到同层级窗口的最前面（不激活） */
-export function raiseWindow(hwnd: number | bigint, topMost: boolean) {
+export function raiseWindow(hwnd: number | bigint, topMost: boolean): boolean {
+  markDebug('raiseWindow')
   try {
-    SetWindowPos(hwnd, topMost ? HWND_TOPMOST : 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    return !!SetWindowPos(hwnd, topMost ? HWND_TOPMOST : 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
   }
-  catch {}
+  catch {
+    return false
+  }
 }
 
 /**
@@ -414,6 +489,7 @@ export function raiseWindow(hwnd: number | bigint, topMost: boolean) {
  *   改成同步调用后几何立即生效（代价是几毫秒阻塞），校准闭环才收敛。
  */
 export function moveWindowNoClamp(hwnd: number | bigint, x: number, y: number, w: number, h: number, async = false) {
+  markDebug('moveWindow')
   try {
     const flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | (async ? SWP_ASYNCWINDOWPOS : 0)
     const ok = SetWindowPos(
@@ -481,6 +557,7 @@ export function setWindowRegion(hwnd: number | bigint, rect: { x: number; y: num
  * （原生窗口无法与 Electron 内容做层叠，这是最接近原生的做法。）
  */
 export function setWindowRegionRects(hwnd: number | bigint, rects: Array<{ x: number; y: number; width: number; height: number }>, radius = 0) {
+  markDebug('region')
   try {
     const list = (rects || []).filter((r) => r && r.width >= 1 && r.height >= 1)
     if (!list.length) {
@@ -641,7 +718,102 @@ export function disableWindowBackdrop(hwnd: number | bigint): boolean {
   }
 }
 
+/* ---------------- 全屏 / 前台窗口判定（0.4.17） ---------------- */
+
+const GetAncestor = user32.func('GetAncestor', HWND, [HWND, UINT])
+const MonitorFromWindow = user32.func('MonitorFromWindow', HANDLE, [HWND, UINT])
+const GetMonitorInfoW = user32.func('GetMonitorInfoW', BOOL, [HANDLE, 'uint8 *'])
+const SHQueryUserNotificationState = shell32.func('SHQueryUserNotificationState', 'int32', ['uint32 *'])
+
+const GA_ROOT = 2
+const MONITOR_DEFAULTTONEAREST = 2
+/** SHQueryUserNotificationState 的返回值，见 Windows SDK 的 QUERY_USER_NOTIFICATION_STATE */
+export const QUNS_BUSY = 2
+export const QUNS_RUNNING_D3D_FULL_SCREEN = 3
+export const QUNS_PRESENTATION_MODE = 4
+
+/**
+ * 查“当前是不是有全屏程序 / 演示模式”。
+ *
+ * 为什么不能只看 QUNS：QUNS_BUSY 也会被演示模式、某些专注助手状态点亮；
+ * 所以 index.ts 还会叠加“前台窗口确实盖住整块显示器”的几何判据。
+ */
+export function queryUserNotificationState(): number | null {
+  try {
+    const out = new Uint32Array(1)
+    const hr = SHQueryUserNotificationState(out)
+    if (hr !== 0) return null
+    return Number(out[0])
+  }
+  catch {
+    return null
+  }
+}
+
+/** 前台窗口的根窗口（Chrome 的 GetForegroundWindow 有时给的是子窗口） */
+export function foregroundRootWindow(): number {
+  try {
+    const fg = foregroundWindow()
+    if (!fg) return 0
+    return Number(GetAncestor(fg, GA_ROOT)) || fg
+  }
+  catch {
+    return 0
+  }
+}
+
+/**
+ * 窗口的“可见外框”，优先用 DWM 的 extended frame bounds。
+ * GetWindowRect 在 Win11 上会把不可见的 resize border 也算进去，用来判断
+ * “是不是盖满整块显示器”会比实际大一圈，容易误判。
+ */
+export function windowExtendedFrameBounds(hwnd: number | bigint): { left: number, top: number, right: number, bottom: number } | null {
+  try {
+    if (DwmGetWindowAttribute) {
+      const buf = Buffer.alloc(16)
+      // DWMWA_EXTENDED_FRAME_BOUNDS = 9
+      if (DwmGetWindowAttribute(hwnd, 9, buf, 16) === 0) {
+        return {
+          left: buf.readInt32LE(0),
+          top: buf.readInt32LE(4),
+          right: buf.readInt32LE(8),
+          bottom: buf.readInt32LE(12),
+        }
+      }
+    }
+  }
+  catch {}
+  return getWindowRect(hwnd)
+}
+
+/** 窗口所在显示器的物理矩形（rcMonitor，不含任务栏） */
+export function monitorRectForWindow(hwnd: number | bigint): { left: number, top: number, right: number, bottom: number } | null {
+  try {
+    const mon = Number(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) || 0
+    if (!mon) return null
+    // MONITORINFO: cbSize(4) + rcMonitor(16) + rcWork(16) + dwFlags(4) = 40
+    const buf = Buffer.alloc(40)
+    buf.writeUInt32LE(40, 0)
+    if (!GetMonitorInfoW(mon, buf)) return null
+    return {
+      left: buf.readInt32LE(4),
+      top: buf.readInt32LE(8),
+      right: buf.readInt32LE(12),
+      bottom: buf.readInt32LE(16),
+    }
+  }
+  catch {
+    return null
+  }
+}
+
+/** 这个窗口有没有某个扩展样式（例如 WS_EX_TOOLWINDOW） */
+export function hasExStyle(hwnd: number | bigint, style: number): boolean {
+  return (getWindowLong(hwnd, GWL_EXSTYLE) & style) !== 0
+}
+
 export function focusWindow(hwnd: number | bigint) {
+  markDebug('focus')
   try {
     SetFocus(hwnd)
     SetForegroundWindow(hwnd)

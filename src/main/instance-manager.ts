@@ -10,6 +10,8 @@ import * as w32 from './win32'
 
 export type InstanceStatus = 'idle' | 'starting' | 'ready' | 'failed' | 'suspended'
 
+export type FullscreenMode = 'none' | 'overlay' | 'exclusive'
+
 /**
  * 负向对照开关（**只给回归脚本用**，正常运行绝不设置）。
  *
@@ -213,6 +215,19 @@ export class InstanceManager {
   private suppressed = false
   /** 面板正在滑动时为 true：冻结几何校准（见 setSliding） */
   private sliding = false
+  /**
+   * 0.4.17 全屏覆盖模式。
+   *
+   * overlay：前台是浏览器/视频/PPT 的全屏窗口。此时不再让 30ms/200ms 看门狗
+   * 周期性下发 SetWindowPos，避免每帧拆一次 DWM 合成平面；用户主动点分格时
+   * 仍由 onForeground 做一次原子纠正。
+   * exclusive：独占 D3D 全屏，Windows 本身不允许稳定叠加，只提示、不硬抢。
+   */
+  private fullscreenMode: FullscreenMode = 'none'
+  /** 呼出后的绝对静默期：连用户点击之外的后台写入都不做 */
+  private fullscreenQuietUntil = 0
+  /** ④/⑦ 的失败退避：连续失败后不再 30ms 硬掰 */
+  private zFightGuard = new Map<number, { count: number, since: number, nextAt: number }>()
   /** 共享会话的浏览器（所有分格共用） */
   private shared: SharedBrowser | null = null
   /** 已被某个分格占用的浏览器窗口，窗口差分时用来排除 */
@@ -311,6 +326,46 @@ export class InstanceManager {
     }
   }
 
+  /** 进入/退出全屏覆盖模式（由 index.ts 的 QUNS + 前台几何判定驱动） */
+  setFullscreenMode(mode: FullscreenMode) {
+    const prev = this.fullscreenMode
+    this.fullscreenMode = mode
+    if (mode === 'none') {
+      this.fullscreenQuietUntil = 0
+      this.zFightGuard.clear()
+      /**
+       * 退出覆盖模式时补一次完整几何；下次 renderer 的 2 秒上报之前，
+       * 面板与分格也已经回到正确位置。只在面板可见时做，收起状态等下次 show。
+       */
+      if (prev !== 'none' && !this.suppressed) {
+        this.fullscreenQuietUntil = Date.now() + 200
+        this.applyRects()
+      }
+    }
+    else {
+      // 上一次会话的失败退避不能带进新的全屏呼出，否则分格可能一次都不尝试落回面板下方
+      this.zFightGuard.clear()
+      this.fullscreenQuietUntil = Math.max(this.fullscreenQuietUntil, Date.now() + 800)
+    }
+  }
+
+  /** 呼出后的静默窗口：全屏下先把合成层稳住，再恢复只读核对 */
+  setFullscreenQuiet(ms: number) {
+    this.fullscreenQuietUntil = Math.max(this.fullscreenQuietUntil, Date.now() + Math.max(0, ms))
+  }
+
+  private quietWrites(): boolean {
+    return this.fullscreenMode !== 'none' || Date.now() < this.fullscreenQuietUntil
+  }
+
+  /** 这个 hwnd 是不是本应用自己的窗口（面板或任一分格） */
+  ownsWindow(hwnd: number): boolean {
+    if (!hwnd) return false
+    if (this.panel.hwnd === hwnd) return true
+    for (const inst of this.instances.values()) if (inst.hwnd === hwnd) return true
+    return false
+  }
+
   /** 绑定面板窗口：记录其屏幕位置、缩放与置顶状态，实例据此定位 */
   setPanel(bounds: { x: number, y: number }, scale: number, hwnd: number, topMost: boolean) {
     const s = scale || 1
@@ -344,14 +399,23 @@ export class InstanceManager {
          * 浏览器窗口之上（顶栏、悬浮胶囊、下拉菜单都画在面板上，靠面板那层 alpha 让
          * 分格透出网页），owner 一挂上就永远实现不了——点开网页的瞬间面板就会被盖掉。
          *
-         * 去掉 owner 的代价：面板隐藏时浏览器窗口不再自动跟着隐藏。这条已经由
-         * setSuppressed() 显式兜住了（面板收起会把每一格都 setShown(false)）。
+         * 0.4.17：只在样式真的不对时补一次。原来无条件 setTopMost 会把已经正确的窗口
+         * 也重新插到置顶带顶，再靠 enforceZOrder 按回来，等于每次 show 都制造两帧
+         * “分格压面板”的中间态。
          */
-        w32.setTopMost(inst.hwnd, topMost)
+        const isTop = w32.windowIsTopMost(inst.hwnd)
+        if (isTop === true && !topMost) w32.setTopMost(inst.hwnd, false)
+        else if (isTop === false && topMost) w32.setTopMost(inst.hwnd, true)
       }
     }
-    this.applyRects()
-    this.enforceZOrder()
+    /**
+     * 覆盖模式只更新记账：分格已经在 launch 阶段定位过，呼出时不需要再跑 applyRects。
+     * 退出覆盖模式时 setFullscreenMode('none') 会补一次完整几何。
+     */
+    if (this.fullscreenMode === 'none') {
+      this.applyRects()
+      this.enforceZOrder()
+    }
   }
 
   /**
@@ -396,7 +460,7 @@ export class InstanceManager {
    * 面板收起/展开。收起时必须先把所有原生浏览器窗口隐藏掉：
    * 它们是独立的顶级窗口，父窗口 hide 不会带走它们。
    */
-  setSuppressed(on: boolean) {
+  setSuppressed(on: boolean, deferZOrder = false) {
     if (this.suppressed === on) return
     this.suppressed = on
     if (on) {
@@ -417,7 +481,7 @@ export class InstanceManager {
     this.relocateAll()
     for (const inst of this.instances.values()) {
       if (!inst.desiredVisible) continue
-      if (inst.regionBox) this.setShown(inst, true)
+      if (inst.regionBox) this.setShown(inst, true, deferZOrder)
       else this.positionWindow(inst, true)
     }
   }
@@ -1252,7 +1316,12 @@ export class InstanceManager {
       // 存在 map 里而不是实例上：实例可能后于矩形上报才创建。
       if (r.anchor) this.anchors.set(r.paneId, r.anchor)
     }
-    this.applyRects()
+    /**
+     * renderer 每 2 秒会主动上报一次矩形。覆盖模式下只更新记账，不 applyRects：
+     * 否则视频全屏时每 2 秒一次 SetWindowPos/SetWindowRgn，正好又是一次闪。
+     * 退出覆盖模式时 setFullscreenMode('none') 会补一次完整几何。
+     */
+    if (this.fullscreenMode === 'none') this.applyRects()
   }
 
   /**
@@ -1581,6 +1650,11 @@ export class InstanceManager {
   private verifyGeometry() {
     // 滑动动画期间窗口位置由 relocateAll 逐帧对齐，这里插一脚只会打架
     if (this.sliding) return
+    /**
+     * 0.4.17：全屏覆盖模式/呼出静默期内，30ms 看门狗不再写任何窗口。
+     * 这是本次闪烁修复的核心——不是“不置顶”，而是“不再周期性下发 SetWindowPos”。
+     */
+    if (this.quietWrites()) return
 
     /**
      * 误认领自愈（见 auditClaims）：30ms 一跳没必要每轮都查，30 秒复核一次足够。
@@ -1623,7 +1697,7 @@ export class InstanceManager {
         console.warn(`[panel] ${above.length} 个分格窗口跑到了面板之上 → 已按回面板下方`)
       }
       const ph = this.panel.hwnd!
-      for (let i = above.length - 1; i >= 0; i--) w32.placeBelow(above[i], ph)
+      for (let i = above.length - 1; i >= 0; i--) this.placeBelowTracked(above[i], ph)
     }
 
     for (const inst of this.instances.values()) {
@@ -1788,9 +1862,14 @@ export class InstanceManager {
             this.topmostWarned.add(inst.paneId)
             console.warn(`[panel] ${inst.paneId} 掉出了置顶带 → 已补回（否则任何普通程序都能盖住这一格，用户看到的是"只剩黑框"）`)
           }
-          w32.setTopMost(hwnd, true)
-          // 提到带顶之后必须再理一次次序，否则它会压在面板顶栏上面
-          this.enforceZOrder()
+          /**
+           * 0.4.17：一次 SetWindowPos 同时完成“留在置顶带”和“插到面板下方”。
+           *
+           * 原来的 setTopMost(hwnd, true) + enforceZOrder() 是两次真实的 Z 序变更：
+           * 第一次先把窗口提到带顶（压在面板上），第二次才按回去。全屏 direct flip
+           * 下，这个中间帧就是一次可见闪烁。
+           */
+          this.placeBelowTracked(hwnd, this.panel.hwnd!)
         }
         else if (isTop === true && this.topmostWarned.delete(inst.paneId)) {
           console.log(`[panel] ${inst.paneId} 的置顶位已恢复正常`)
@@ -1856,25 +1935,41 @@ export class InstanceManager {
     this.unForeground = null
   }
 
-  private setShown(inst: ManagedInstance, visible: boolean) {
+  private setShown(inst: ManagedInstance, visible: boolean, deferZOrder = false) {
     const hwnd = inst.hwnd
     if (!hwnd || !w32.isWindow(hwnd)) return
     if (inst.shown === visible) return
-    w32.showWindow(hwnd, visible ? w32.SW_SHOW : w32.SW_HIDE)
+    /**
+     * 覆盖模式下必须 SW_SHOWNOACTIVATE：SW_SHOW 会激活 Chrome 窗口，
+     * 对全屏视频来说就是一次前台切换，DWM 会再拆一次合成平面。
+     */
+    const showCmd = visible
+      ? (this.fullscreenMode !== 'none' ? w32.SW_SHOWNOACTIVATE : w32.SW_SHOW)
+      : w32.SW_HIDE
+    w32.showWindow(hwnd, showCmd)
     inst.shown = visible
-    // 新显示出来的窗口要提到面板正下方（同为置顶带，次序由我们维护）
+    // 新显示出来的窗口要落到面板正下方（同为置顶带，次序由我们维护）
     if (visible) {
-      w32.raiseWindow(hwnd, this.panel.topMost)
+      // 覆盖模式呼出时先只显示，最后用一次 DeferWindowPos 批量摆位
+      if (deferZOrder) return
+      const ph = this.panel.hwnd
       /**
-       * 隐藏期间置顶位可能被清掉（Chrome 在被隐藏/恢复时重排窗口），
-       * 而 `raiseWindow` 只在 `topMost` 为真时才发 `HWND_TOPMOST` ——
-       * 用户主动关掉置顶的场合本来就该留在普通层，所以那种情况下不补。
-       * 这里补的是另一种情形：**要置顶、但此刻置顶位已经没了**。
-       * 30ms 看门狗的 ⑦ 也会兜住（见 verifyGeometry），这里是"立刻纠正"，
-       * 免得刚展开的那一两帧里网页还被别的程序压着。
+       * 0.4.17：优先用一次 placeBelow 同时拿到“置顶带 + 面板下方”。
+       * 原来的 raiseWindow(hwnd, true) 会把它先提到带顶，再靠 enforceZOrder 按回来；
+       * 全屏覆盖模式下 enforceZOrder 是静默的，若还先 raise 就会让分格停在面板上面。
        */
-      if (this.panel.topMost && w32.windowIsTopMost(hwnd) === false) w32.setTopMost(hwnd, true)
-      this.enforceZOrder()
+      if (ph && w32.isWindow(ph)) this.placeBelowTracked(hwnd, ph)
+      else w32.raiseWindow(hwnd, this.panel.topMost)
+
+      if (this.fullscreenMode === 'none') {
+        /**
+         * 隐藏期间置顶位可能被清掉（Chrome 在被隐藏/恢复时重排窗口），
+         * 这里补的是“要置顶、但此刻置顶位已经没了”。覆盖模式下 placeBelow
+         * 已经负责把它留在置顶带，不再额外 setTopMost（那会把它提到面板上面）。
+         */
+        if (this.panel.topMost && w32.windowIsTopMost(hwnd) === false) w32.setTopMost(hwnd, true)
+        this.enforceZOrder()
+      }
     }
   }
 
@@ -1887,6 +1982,63 @@ export class InstanceManager {
    */
   raiseAll() {
     this.enforceZOrder()
+  }
+
+  /**
+   * 外部全屏程序把面板压下去时，一次原子恢复：
+   * 面板先回置顶带顶，再把自家分格 placeBelow 到面板下方。
+   *
+   * 只在“前台切换到外部全屏程序”这一下调用，不做周期轮询。
+   */
+  raiseOverlay() {
+    if (this.fullscreenMode === 'none') return
+    const ph = this.panel.hwnd
+    if (!ph || !w32.isWindow(ph) || !this.panel.topMost) return
+
+    let fg = w32.foregroundRootWindow()
+    // 前台如果是自家面板/分格，不能拿它当“要压住的视频窗口”
+    if (fg && this.ownsWindow(fg)) fg = 0
+    const shown = Array.from(this.instances.values())
+      .filter((i) => i.shown && i.hwnd && w32.isWindow(i.hwnd))
+      .map((i) => i.hwnd!)
+
+    /**
+     * 先只读检查，顺序已经正确就一个字节都不写。
+     * 这一步是“呼出/前台切换不闪”的关键：以前无论对不对都抬一遍，
+     * 每次 Z 序变化都会让 DWM 重建合成层。
+     */
+    const panelTop = w32.windowIsTopMost(ph) === true
+    const panelAboveFg = !fg || fg === ph || w32.windowIsAbove(ph, fg)
+    const panesCorrect = shown.every((p) =>
+      w32.windowIsAbove(ph, p) && (!fg || fg === ph || w32.windowIsAbove(p, fg)),
+    )
+    if (panelTop && panelAboveFg && panesCorrect) return
+
+    // 这是前台事件触发的一次显式恢复，清掉旧退避，允许立刻尝试
+    this.zFightGuard.clear()
+    w32.setTopMost(ph, true)
+    /**
+     * 0.4.17 崩溃修复：不再用 DeferWindowPos 批量提交。
+     *
+     * WER 抓到的是 koffi.node 里的 c0000005；崩溃发生在这套批量调用上线之后。
+     * DeferWindowPos 的 HDWP 在跨进程 Chrome 窗口重建时可能失效，
+     * 一旦把失效句柄交给 EndDeferWindowPos 就是原生崩溃，JS try/catch 也接不住。
+     *
+     * 现在退回长期稳定的逐个 SetWindowPos，但前面已经有只读检查：
+     * 顺序正确时不会走到这里；只有真的被视频抢了才写一次。
+     */
+    this.placeAllPanesBelowPanel()
+  }
+
+  /** 把所有已显示分格按一次原子操作插回面板正下方 */
+  placeAllPanesBelowPanel() {
+    const ph = this.panel.hwnd
+    if (!ph || !w32.isWindow(ph)) return
+    const shown = Array.from(this.instances.values())
+      .filter((i) => i.shown && i.hwnd && w32.isWindow(i.hwnd))
+      .map((i) => i.hwnd!)
+    // 反向插入：最后按的离面板最近，最终次序与数组顺序一致
+    for (let i = shown.length - 1; i >= 0; i--) this.placeBelowTracked(shown[i], ph)
   }
 
   /**
@@ -1906,7 +2058,10 @@ export class InstanceManager {
    */
   private watchZOrder() {
     if (this.zTimer) return
-    const t = setInterval(() => this.enforceZOrder(), 200)
+    const t = setInterval(() => {
+      if (this.quietWrites()) return
+      this.enforceZOrder()
+    }, 200)
     ;(t as { unref?: () => void }).unref?.()
     this.zTimer = t
   }
@@ -1938,6 +2093,20 @@ export class InstanceManager {
     const mine = Array.from(this.instances.values()).filter(
       (i) => i.shown && i.hwnd && Number(i.hwnd) === hwnd,
     )
+    /**
+     * 全屏覆盖模式下，只有“用户确实点了自家分格”才做一次原子纠正。
+     * 外部全屏程序的前台事件一律不碰窗口——那正是以前把 DWM 拖进
+     * “前台变化 → enforceZOrder → 更多前台变化”循环的入口。
+     */
+    if (this.fullscreenMode !== 'none') {
+      /**
+       * 覆盖模式下只处理“用户点了自家分格”。
+       * 外部全屏程序重新拿回前台的抬升统一由 index.ts 的前台钩子调用
+       * raiseOverlay() 完成，避免两个订阅者同一事件各抬一次、反而多闪一帧。
+       */
+      if (mine.length) this.enforceZOrder(true)
+      return
+    }
     if (!mine.length) {
       // 前台跑到别处去了（可能是别的程序、也可能是面板自己）。
       // 那一刻没有谁刚爬到面板上面，只顺手把整体次序收一遍。
@@ -1971,14 +2140,46 @@ export class InstanceManager {
     }
   }
 
+  /**
+   * 带失败退避的 placeBelow。
+   *
+   * 为什么不能继续直接调：全屏/抢焦点场景里 SetWindowPos 可能被系统拒绝或立刻撤销，
+   * 30ms 看门狗会变成“每帧试一次、每帧失败”的烧 CPU + 闪烁。连续失败 3 次开始
+   * 250ms/1s/5s 退避，成功一次就清零；日志只在进入退避时打一行。
+   */
+  private placeBelowTracked(hwnd: number, ph: number): boolean {
+    const now = Date.now()
+    const prev = this.zFightGuard.get(hwnd)
+    if (prev && now < prev.nextAt) return false
+
+    const ok = w32.placeBelow(hwnd, ph)
+    if (ok) {
+      this.zFightGuard.delete(hwnd)
+      return true
+    }
+
+    const cur = !prev || now - prev.since > 5000
+      ? { count: 0, since: now, nextAt: 0 }
+      : prev
+    cur.count += 1
+    const delay = cur.count >= 10 ? 5000 : cur.count >= 5 ? 1000 : cur.count >= 3 ? 250 : 0
+    cur.nextAt = now + delay
+    this.zFightGuard.set(hwnd, cur)
+    if (cur.count === 3) {
+      console.warn('[panel] ' + hwnd + ' 的 Z 序修正连续失败 → 进入退避（不再 30ms 硬掰）')
+    }
+    return false
+  }
+
   /** 把落在面板之上的实例窗口按回面板下方 */
-  private enforceZOrder() {
+  private enforceZOrder(force = false) {
     const ph = this.panel.hwnd
     if (!ph || !w32.isWindow(ph)) return
+    if (!force && this.quietWrites()) return
     const above = this.windowsAbovePanel()
     if (!above.length) return
     // 从最靠下的开始按，最后按的离面板最近，最终次序与插入顺序一致
-    for (let i = above.length - 1; i >= 0; i--) w32.placeBelow(above[i], ph)
+    for (let i = above.length - 1; i >= 0; i--) this.placeBelowTracked(above[i], ph)
   }
 
   /**
@@ -2070,7 +2271,11 @@ export class InstanceManager {
   setTopMost(on: boolean) {
     this.panel.topMost = on
     for (const inst of this.instances.values()) {
-      if (inst.hwnd && w32.isWindow(inst.hwnd)) w32.setTopMost(inst.hwnd, on)
+      if (!inst.hwnd || !w32.isWindow(inst.hwnd)) continue
+      // 0.4.17：只在样式真的不对时补，避免退出全屏时把已经置顶的分格再抬一遍
+      const isTop = w32.windowIsTopMost(inst.hwnd)
+      if (isTop === null) continue
+      if (isTop !== on) w32.setTopMost(inst.hwnd, on)
     }
     this.enforceZOrder()
   }

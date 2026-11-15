@@ -1,10 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { app, BrowserWindow, globalShortcut, ipcMain, Menu, screen, shell, Tray } from 'electron'
+import { app, BrowserWindow, globalShortcut, ipcMain, Menu, Notification, screen, shell, Tray } from 'electron'
 import { normalizeAccelerator } from './accelerator'
 import { ConfigStore } from './config'
 import { detectBrowsers, pickBrowser, type BrowserInfo } from './browser-detect'
-import { InstanceManager } from './instance-manager'
+import { InstanceManager, type FullscreenMode } from './instance-manager'
 import { getSystemProxy, profilesRoot, testProxy } from './proxy'
 import { waitForNetworkReady, type StartupGateTarget } from './startup-gate'
 import { clearProfileCache, clearProfileCacheSync, humanSize, scanProfileCache, type CacheCleanResult, type CacheStat } from './cache-cleaner'
@@ -21,6 +21,22 @@ let settingsWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let browserInfo: BrowserInfo | null = null
 let isQuitting = false
+
+/** 0.4.17 全屏覆盖模式总开关；出问题可用 AIQUAD_FULLSCREEN_GATE=0 回到旧路径 */
+const FULLSCREEN_GATE = process.env.AIQUAD_FULLSCREEN_GATE !== '0'
+/** 全屏闪烁排查：每秒汇总一次真实的 SetWindowPos/SetWindowRgn 次数 */
+const DEBUG_ZFIGHT = process.env.AIQUAD_DEBUG_ZFIGHT === '1'
+let fullscreenMode: FullscreenMode = 'none'
+let fullscreenProbeAt = 0
+let fullscreenNoneStreak = 0
+let fullscreenProbeTimer: NodeJS.Timeout | null = null
+let zfightDebugTimer: NodeJS.Timeout | null = null
+let displayMetricsTimer: NodeJS.Timeout | null = null
+let panelSkipTaskbarApplied = false
+let unFullscreenForeground: (() => void) | null = null
+let lastOverlayRaiseHwnd = 0
+let lastOverlayRaiseAt = 0
+let lastOverlayCheckAt = 0
 
 /** 写在登录项命令行里的标记：把「开机自启」和「手动双击」区分开 */
 const AUTOSTART_ARG = '--aiquad-autostart=1'
@@ -113,6 +129,268 @@ function targetBounds() {
 /** 面板完全移出屏幕后的横向坐标 */
 function offscreenX(bounds: { x: number; width: number }) {
   return config.get().position === 'left' ? bounds.x - bounds.width : bounds.x + bounds.width
+}
+
+/* ---------------- 全屏覆盖模式（0.4.17） ---------------- */
+
+function isOwnWindow(hwnd: number): boolean {
+  if (!hwnd) return false
+  try {
+    if (panelWindow && !panelWindow.isDestroyed() && hwndOf(panelWindow) === hwnd) return true
+  }
+  catch {}
+  try {
+    if (settingsWindow && !settingsWindow.isDestroyed() && hwndOf(settingsWindow) === hwnd) return true
+  }
+  catch {}
+  return !!manager?.ownsWindow(hwnd)
+}
+
+/**
+ * 判定当前前台是不是“会跟透明置顶层打架”的全屏窗口。
+ *
+ * 只用 QUNS 不够：演示模式、专注助手也会把状态点成 BUSY；只用几何也不够：
+ * 某些无边框最大化窗口同样盖满显示器。所以两条一起用：
+ *   · QUNS=3 → 独占 D3D 全屏（Windows 不允许稳定叠加，只提示）
+ *   · QUNS=2/4 且前台窗口盖满整块显示器 → 覆盖模式
+ * 自己的窗口、桌面、任务栏一律排除。
+ */
+function detectFullscreenMode(): FullscreenMode {
+  if (!FULLSCREEN_GATE) return 'none'
+
+  /**
+   * QUNS 是“系统级”状态，不随前台窗口是不是我们而改变。
+   *
+   * 之前这里先看前台、再看几何，结果视频全屏化后：
+   *   · 前台是 MPC-HC → overlay
+   *   · 我们把面板 showInactive 出来，前台短暂变成面板 → none
+   *   · 下一秒又回到 MPC-HC → overlay
+   * 日志里就出现连续的 none → overlay → 退出 → none → overlay。
+   * 每次切换都会 applyAlwaysOnTop/恢复看门狗，正好表现为“呼出闪一下”。
+   *
+   * 所以 QUNS=2/3/4 直接采信；几何只用于 QUNS 读不到的兜底。
+   */
+  const q = w32.queryUserNotificationState()
+  if (q === w32.QUNS_RUNNING_D3D_FULL_SCREEN) return 'exclusive'
+  if (q === w32.QUNS_BUSY || q === w32.QUNS_PRESENTATION_MODE) return 'overlay'
+
+  const fg = w32.foregroundRootWindow()
+  if (!fg || isOwnWindow(fg)) return 'none'
+
+  const cls = w32.getClassName(fg)
+  if (cls === 'Shell_TrayWnd' || cls === 'Shell_SecondaryTrayWnd'
+    || cls === 'Progman' || cls === 'WorkerW') return 'none'
+
+  const r = w32.windowExtendedFrameBounds(fg)
+  const mon = w32.monitorRectForWindow(fg)
+  if (!r || !mon) return 'none'
+
+  /**
+   * QUNS 更新有延迟：播放器已经全屏了，QUNS 可能还是 5。
+   * 这时直接用几何兜底：前台窗口的 DWM 可见外框盖满整块显示器就按 overlay。
+   *
+   * 普通最大化窗口的底边会少掉任务栏那一截（实测 2560x1387 vs 2560x1440），
+   * 过不了下面的 95% 覆盖率判据，所以不会把“最大化”误判成全屏。
+   */
+  const tol = 16
+  const mw = mon.right - mon.left
+  const mh = mon.bottom - mon.top
+  const covers = Math.abs(r.left - mon.left) <= tol
+    && Math.abs(r.top - mon.top) <= tol
+    && Math.abs(r.right - mon.right) <= tol
+    && Math.abs(r.bottom - mon.bottom) <= tol
+    && (r.right - r.left) >= mw * 0.95
+    && (r.bottom - r.top) >= mh * 0.95
+  return covers ? 'overlay' : 'none'
+}
+
+function refreshFullscreenMode(force = false): FullscreenMode {
+  if (!FULLSCREEN_GATE) return 'none'
+  const now = Date.now()
+  if (!force && now - fullscreenProbeAt < 250) return fullscreenMode
+  fullscreenProbeAt = now
+
+  const next = detectFullscreenMode()
+
+  /**
+   * 退出方向加两拍迟滞：视频刚退出全屏时 QUNS 可能短暂跳回 5，
+   * 单次采样就切回 none 会让看门狗立刻恢复、再被下一次采样切回 overlay。
+   * 连续两次 none 才真正退出；进入 overlay 不需要迟滞。
+   */
+  if (next === 'none' && fullscreenMode !== 'none') {
+    fullscreenNoneStreak += 1
+    if (fullscreenNoneStreak < 3) return fullscreenMode
+  }
+  else {
+    fullscreenNoneStreak = 0
+  }
+
+  if (next !== fullscreenMode) {
+    const prev = fullscreenMode
+    fullscreenMode = next
+    manager?.setFullscreenMode(next)
+    if (next === 'none') {
+      console.log('[fullscreen] 退出全屏，恢复置顶与看门狗')
+      applyAlwaysOnTop()
+    }
+    else {
+      const fg = w32.foregroundRootWindow()
+      const cls = fg ? w32.getClassName(fg) : ''
+      const q = w32.queryUserNotificationState()
+      console.log(`[fullscreen] ${prev} → ${next}｜QUNS=${q}｜前台 0x${fg.toString(16)} ${cls}`)
+      manager?.setFullscreenQuiet(800)
+      /**
+       * 视频刚全屏化时，系统会把播放器抬到置顶带顶，面板可能已经被压下去。
+       * 这里不是等下一次 showPanel，而是当场补一次：面板回顶 → 分格 placeBelow。
+       */
+      if (panelWindow?.isVisible()) {
+        lastOverlayRaiseHwnd = w32.foregroundRootWindow()
+        lastOverlayRaiseAt = Date.now()
+        lastOverlayCheckAt = Date.now()
+        manager?.raiseOverlay()
+      }
+      if (next === 'exclusive') notifyExclusiveFullscreen()
+    }
+  }
+  return fullscreenMode
+}
+
+function notifyExclusiveFullscreen() {
+  try {
+    new Notification({
+      title: 'AIQuad',
+      body: '当前程序是独占全屏，Windows 不允许稳定叠加。请按 Alt+Enter 退出全屏后再呼出。',
+      silent: true,
+    }).show()
+  }
+  catch {}
+}
+
+function startFullscreenProbe() {
+  if (fullscreenProbeTimer) return
+  fullscreenProbeTimer = setInterval(() => {
+    if (!panelWindow || panelWindow.isDestroyed() || !panelWindow.isVisible()) return
+    refreshFullscreenMode(true)
+    // 视频播放器可能在前台事件之后又把自己抬上去；每秒做一次只读检查，必要时补一次
+    checkOverlayTop()
+  }, 250)
+  ;(fullscreenProbeTimer as { unref?: () => void }).unref?.()
+}
+
+/**
+ * 全屏覆盖模式下的低频置顶守卫。
+ *
+ * 只在前台是外部窗口时检查；raiseOverlay 内部先做只读 Z 序检查，顺序正确时
+ * 不会产生任何 SetWindowPos。这样既能在播放器再次抢置顶后恢复，
+ * 又不会像 30ms 看门狗那样周期性重排。
+ */
+function checkOverlayTop() {
+  if (fullscreenMode === 'none') return
+  if (!panelWindow || panelWindow.isDestroyed() || !panelWindow.isVisible()) return
+  const fg = w32.foregroundRootWindow()
+  if (!fg || isOwnWindow(fg)) return
+  const now = Date.now()
+  if (now - lastOverlayCheckAt < 1000) return
+  lastOverlayCheckAt = now
+  manager?.raiseOverlay()
+}
+
+function stopFullscreenProbe() {
+  if (!fullscreenProbeTimer) return
+  clearInterval(fullscreenProbeTimer)
+  fullscreenProbeTimer = null
+}
+
+/** 全屏闪烁排查（仅 AIQUAD_DEBUG_ZFIGHT=1 时启用）：每秒汇总真实写入次数 */
+function startZfightDebug() {
+  if (!DEBUG_ZFIGHT || zfightDebugTimer) return
+  zfightDebugTimer = setInterval(() => {
+    const c = w32.takeWin32DebugCounters()
+    const total = c.placeBelow + c.setTopMost + c.raiseWindow + c.moveWindow
+      + c.region + c.toolWindow + c.focus
+    if (!total && fullscreenMode === 'none') return
+    const q = w32.queryUserNotificationState()
+    const fg = w32.foregroundRootWindow()
+    const cls = fg ? w32.getClassName(fg) : ''
+    const r = fg ? w32.windowExtendedFrameBounds(fg) : null
+    const rect = r ? `${r.left},${r.top} ${r.right - r.left}x${r.bottom - r.top}` : '-'
+    console.log(`[zfight] sec=${Math.floor(process.uptime())} mode=${fullscreenMode} QUNS=${q} fg=0x${fg.toString(16)} ${cls} ${rect} placeBelow=${c.placeBelow} setTopMost=${c.setTopMost} raise=${c.raiseWindow} move=${c.moveWindow} region=${c.region} tool=${c.toolWindow} focus=${c.focus}`)
+  }, 1000)
+  ;(zfightDebugTimer as { unref?: () => void }).unref?.()
+}
+function stopZfightDebug() {
+  if (!zfightDebugTimer) return
+  clearInterval(zfightDebugTimer)
+  zfightDebugTimer = null
+}
+
+/** 分辨率 / 显示器变化：重算目标几何，不让旧坐标继续喂给看门狗 */
+function scheduleDisplayMetricsSync() {
+  if (displayMetricsTimer) clearTimeout(displayMetricsTimer)
+  displayMetricsTimer = setTimeout(() => {
+    displayMetricsTimer = null
+    if (!panelWindow || panelWindow.isDestroyed()) return
+    const b = targetBounds()
+    if (!panelWindow.isVisible()) {
+      panelWindow.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height })
+      syncPanelToManager()
+      return
+    }
+    // 可见时直接落位，不滑入；全屏下任何逐帧动画都会放大合成切换
+    panelWindow.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height })
+    manager?.setPanelPosition(b.x, b.y)
+    syncPanelToManager()
+    panelWindow.webContents.send('request-rects')
+    if (fullscreenMode !== 'none') manager?.setFullscreenQuiet(800)
+  }, 120)
+}
+
+function watchDisplayMetrics() {
+  screen.on('display-metrics-changed', () => scheduleDisplayMetricsSync())
+  screen.on('display-added', () => scheduleDisplayMetricsSync())
+  screen.on('display-removed', () => scheduleDisplayMetricsSync())
+}
+
+/**
+ * 前台窗口变化时立刻重算全屏状态。
+ *
+ * 为什么不能只靠 1 秒轮询：视频播放器一切全屏，系统会把它抬到置顶带顶，
+ * 面板在这一瞬间就被压下去了；等下一次轮询再补，用户已经看到“被盖住”。
+ * 这里只在前台事件这一下做一次原子恢复，不引入周期性重排。
+ */
+function startFullscreenForegroundHook() {
+  if (unFullscreenForeground) return
+  unFullscreenForeground = w32.watchForeground(() => {
+    if (!panelWindow || panelWindow.isDestroyed() || !panelWindow.isVisible()) return
+    const before = fullscreenMode
+    const next = refreshFullscreenMode(true)
+    if (next === 'none') {
+      /**
+       * 有些播放器是先切前台、后写 QUNS，前台事件这一下可能还读不到 2。
+       * 150ms 后再补一次；若那时进入 overlay，refreshFullscreenMode 内部会 raiseOverlay。
+       */
+      setTimeout(() => {
+        if (panelWindow && !panelWindow.isDestroyed() && panelWindow.isVisible()) refreshFullscreenMode(true)
+      }, 150)
+      return
+    }
+    // none → overlay 的抬升由 refreshFullscreenMode 内部完成；已经是 overlay 时这里补一次
+    const fg = w32.foregroundRootWindow()
+    if (before === next && !isOwnWindow(fg)) {
+      /**
+       * 同一个前台窗口 1.2 秒内只补一次。
+       * 某些播放器/Chrome 会连续投递前台事件；每次都 raiseOverlay 会让窗口
+       * 每秒重排一次，既闪又拖慢首次显示。
+       */
+      const now = Date.now()
+      if (fg !== lastOverlayRaiseHwnd || now - lastOverlayRaiseAt > 1200) {
+        lastOverlayRaiseHwnd = fg
+        lastOverlayRaiseAt = now
+        lastOverlayCheckAt = now
+        manager?.raiseOverlay()
+      }
+    }
+  })
 }
 
 /* ---------------- 滑动动画（子窗口随父窗口移动，无需额外同步） ---------------- */
@@ -384,7 +662,13 @@ function slideTo(
 
 function applyAlwaysOnTop() {
   const on = topMostWanted()
-  panelWindow?.setAlwaysOnTop(on)
+  /**
+   * 只在样式真的不对时才调 Electron 的 setAlwaysOnTop。
+   * 它内部会发 SetWindowPos(HWND_TOPMOST)；已经置顶时再发一次，就是白白多一帧
+   * 合成切换。全屏视频前面每一帧都很贵。
+   */
+  const ph = panelWindow && !panelWindow.isDestroyed() ? hwndOf(panelWindow) : 0
+  if (!ph || w32.windowIsTopMost(ph) !== on) panelWindow?.setAlwaysOnTop(on)
   if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.setAlwaysOnTop(on)
   manager?.setTopMost(on)
   manager?.raiseAll()
@@ -396,6 +680,7 @@ function createPanelWindow() {
 
   // 新窗口的初始穿透状态是"不穿透"，记账跟着归零，免得沿用上一个窗口的值而漏下发
   lastThrough = null
+  panelSkipTaskbarApplied = false
 
   panelWindow = new BrowserWindow({
     x: b.x,
@@ -505,9 +790,16 @@ function createPanelWindow() {
   panelWindow.on('move', onMove)
   panelWindow.on('moved', onMove)
   // 面板被激活后把层级理一遍：置顶带里的次序会被系统重排，浏览器窗口可能压到面板上
-  panelWindow.on('focus', () => manager?.raiseAll())
+  panelWindow.on('focus', () => {
+    // 全屏覆盖模式下，焦点变化本身就可能触发 DWM 合成切换；层级只在用户点击时纠一次
+    if (fullscreenMode === 'none') manager?.raiseAll()
+  })
   panelWindow.on('closed', () => {
     stopChromeGuard()
+    stopFullscreenProbe()
+    fullscreenMode = 'none'
+    manager?.setFullscreenMode('none')
+    panelSkipTaskbarApplied = false
     panelWindow = null
   })
   // 关闭（无边框窗口没有系统关闭键，兜底）→ 收到托盘
@@ -521,6 +813,64 @@ function createPanelWindow() {
   return panelWindow
 }
 
+
+/**
+ * 全屏覆盖模式下的呼出路径：不滑入、不抢焦点、不整窗重绘。
+ *
+ * 这条路径的目的不是“让面板盖住全屏程序”（那是 Windows 的事），而是
+ * “我们只发一次位置/层级，之后不再周期性拆 DWM 合成平面”。
+ */
+function showPanelFullscreen(win: BrowserWindow, b: { x: number, y: number, width: number, height: number }, mode: FullscreenMode) {
+  console.log(`[fullscreen] showPanelFullscreen mode=${mode}`)
+  // 直接落到最终位置；全屏下逐帧滑入会把 5 个窗口的 SetWindowPos 排成 30 帧
+  const cur = win.getBounds()
+  if (cur.x !== b.x || cur.y !== b.y || cur.width !== b.width || cur.height !== b.height) {
+    win.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height })
+  }
+
+  // 只在样式真的缺失时补；不要带 refresh，SWP_FRAMECHANGED 会整窗重绘
+  if (!win.isVisible()) {
+    const h = hwndOf(win)
+    if (h && !w32.hasExStyle(h, w32.WS_EX_TOOLWINDOW)) w32.makeToolWindow(h)
+  }
+
+  // showInactive：不抢前台，避免全屏程序的前台锁/激活切换把 DWM 再拖一遍
+  win.showInactive()
+  startChromeGuard()
+  startFullscreenProbe()
+
+  const h = hwndOf(win)
+  if (h && !w32.hasExStyle(h, w32.WS_EX_TOOLWINDOW)) w32.makeToolWindow(h)
+
+  // 先让 manager 进入覆盖模式，再 syncPanelToManager：这样 setPanel 内部不会再重排 Z 序
+  manager?.setFullscreenMode(mode)
+  manager?.setFullscreenQuiet(900)
+  syncPanelToManager()
+
+  /**
+   * 不在 showInactive 之后单独抬面板，也不单独 setAlwaysOnTop。
+   *
+   * 这两步都会各产生一次 Z 序提交；视频全屏时就是两次 DWM 合成切换。
+   * 现在统一等 32ms，让面板先完成首帧绘制，再由 raiseOverlay 先做只读检查，
+   * 只有顺序不对时才逐个 placeBelow，把最终次序补成“面板 → 分格 → 视频”。
+   */
+  setTimeout(() => {
+    if (!win || win.isDestroyed() || !win.isVisible()) return
+    manager?.setSuppressed(false, true)
+    // 只读检查 + 必要时逐个 placeBelow（不再用 DeferWindowPos）
+    manager?.raiseOverlay()
+    lastOverlayCheckAt = Date.now()
+    console.log('[fullscreen] overlay panes shown')
+    /**
+     * 覆盖模式下不 request-rects：
+     * 面板布局没变，旧矩形仍然有效；一请求就会触发 renderer 上报 → setRects →
+     * 重新摆位/重设区域，在视频全屏的合成层上正好又是一次闪。
+     */
+    applyPassthrough(win)
+    setTimeout(() => settleAfterShow(win), 16)
+  }, 32)
+}
+
 function showPanel() {
   // 可能是收起后 180ms 内又呼出：先取消那个"把面板挪回停靠位"的延迟任务
   cancelHideSettle()
@@ -528,6 +878,18 @@ function showPanel() {
   const win = panelWindow!
   const b = targetBounds()
   const offX = offscreenX(b)
+
+  /**
+   * 0.4.17：全屏程序在前台时走独立呼出路径。
+   *
+   * 注意这里不是“全屏就让位/取消置顶”，而是“显示，但只发一次位置，
+   * 不滑入、不抢焦点、不让看门狗周期性下发 SetWindowPos”。
+   */
+  const fMode = refreshFullscreenMode(true)
+  if (fMode !== 'none') {
+    showPanelFullscreen(win, b, fMode)
+    return
+  }
 
   // 先把窗口放到屏幕外，再滑入，避免出现"闪一下"
   win.setBounds({ x: offX, y: b.y, width: b.width, height: b.height })
@@ -547,6 +909,8 @@ function showPanel() {
   win.show()
   // 顶栏带的"永不穿透"巡逻从这一刻开始跑（见 startChromeGuard）
   startChromeGuard()
+  // 正常模式下也要盯全屏状态：用户可能先把 AIQuad 呼出，再切到全屏程序
+  startFullscreenProbe()
   // 显示这一刻 Electron 才把 WS_EX_LAYERED 补上，顺手冲掉了 TOOLWINDOW，
   // 所以可见之后还要再补一次（这次带 refresh，让系统重新套用样式）
   {
@@ -566,40 +930,50 @@ function showPanel() {
    * 网页和面板严丝合缝，藏起来反而成了"面板先滑进来、内容晚一拍才蹦出来"的断层。
    */
   syncPanelToManager()
-  manager?.setSuppressed(false)
-  win.webContents.send('request-rects')
 
   /**
-   * 呼出的第一帧先按"不穿透"落地 —— 此刻面板整个还在屏幕外，分格也跟着在屏幕外，
-   * "指针是不是压在分格上"这个问题此刻本来就无从谈起（主进程拿不到别的答案）。
-   * 好处是滑动期间的点击先由面板吃掉，不会穿透到下面那个无关的程序上去。
+   * 正常呼出也先让面板框架画出来，再显示原生 Chrome 分格。
    *
-   * ⚠️ 这一步必须排在 `setSuppressed(false)` 之后：`cursorOverPane()` 只统计
-   * `inst.shown === true` 的分格，而收起时 `hidePanel()` 调过 `setSuppressed(true)`
-   * 把所有格的 `shown` 都置了 false。排在前面的话，之后 `slideTo` 的逐帧精算会一路
-   * 算成"不穿透"，直到落位后收尾才纠正 —— 那 300 多毫秒就是"呼出后第一下点不动"。
-   *
-   * 真正的穿透判定交给两处：`slideTo` 逐帧精算（见 trackPassthrough），
-   * 以及落位后的收尾 `settleAfterShow`。
+   * 透明 Electron 窗口在 show() 后要多等一帧才合成；Chrome 是原生窗口，先亮。
+   * 顺序反过来就是用户看到的“网页先出来、框架后贴上来”。32ms 约两帧，足够面板先落屏。
    */
-  applyPassthrough(win)
+  setTimeout(() => {
+    if (!win || win.isDestroyed() || !win.isVisible()) return
+    manager?.setSuppressed(false)
+    win.webContents.send('request-rects')
 
-  slideTo(offX, b.x, b, 240, () => {
     /**
-     * 这里**不要**再 syncPanelToManager()。
+     * 呼出的第一帧先按"不穿透"落地 —— 此刻面板整个还在屏幕外，分格也跟着在屏幕外，
+     * "指针是不是压在分格上"这个问题此刻本来就无从谈起（主进程拿不到别的答案）。
+     * 好处是滑动期间的点击先由面板吃掉，不会穿透到下面那个无关的程序上去。
      *
-     * 它会走一遍完整落位（含重测浏览器内衬），而位置在动画里已经逐帧对齐到最终值了，
-     * 再校准一次就是"动画结束、网页又自己挪几像素"。记账（面板原点）在动画期间
-     * 每帧都由 setPanelPosition 更新，本来就是最新的。区域由 setSliding(false) 补。
+     * ⚠️ 这一步必须排在 `setSuppressed(false)` 之后：`cursorOverPane()` 只统计
+     * `inst.shown === true` 的分格，而收起时 `hidePanel()` 调过 `setSuppressed(true)`
+     * 把所有格的 `shown` 都置了 false。排在前面的话，之后 `slideTo` 的逐帧精算会一路
+     * 算成"不穿透"，直到落位后收尾才纠正 —— 那 300 多毫秒就是"呼出后第一下点不动"。
+     *
+     * 真正的穿透判定交给两处：`slideTo` 逐帧精算（见 trackPassthrough），
+     * 以及落位后的收尾 `settleAfterShow`。
      */
-    setTimeout(() => settleAfterShow(win), 40)
-  }, () => {
-    /**
-     * 呼出动画被打断（连按两下快捷键"收起→呼出"、动画没跑完就关面板）时，
-     * 收尾同样要补一次，否则面板会停在算错的穿透状态上（见 settleAfterShow）。
-     */
-    settleAfterShow(win)
-  }, true)
+    applyPassthrough(win)
+
+    slideTo(offX, b.x, b, 240, () => {
+      /**
+       * 这里**不要**再 syncPanelToManager()。
+       *
+       * 它会走一遍完整落位（含重测浏览器内衬），而位置在动画里已经逐帧对齐到最终值了，
+       * 再校准一次就是"动画结束、网页又自己挪几像素"。记账（面板原点）在动画期间
+       * 每帧都由 setPanelPosition 更新，本来就是最新的。区域由 setSliding(false) 补。
+       */
+      setTimeout(() => settleAfterShow(win), 40)
+    }, () => {
+      /**
+       * 呼出动画被打断（连按两下快捷键"收起→呼出"、动画没跑完就关面板）时，
+       * 收尾同样要补一次，否则面板会停在算错的穿透状态上（见 settleAfterShow）。
+       */
+      settleAfterShow(win)
+    }, true)
+  }, 32)
 }
 
 /**
@@ -620,7 +994,8 @@ function settleAfterShow(win: BrowserWindow) {
    * 走到"被打断"这条路时紧接着就是收起面板，此时 `focus()` 会把焦点从用户正在
    * 操作的地方抢走。但穿透校准与摘任务栏照旧执行——它们对"下次呼出"同样有效。
    */
-  if (win.isVisible()) win.focus()
+  // 全屏覆盖模式下不抢前台：SetForegroundWindow 会被系统拒绝，还可能触发额外合成切换
+  if (win.isVisible() && fullscreenMode === 'none') win.focus()
   // 落位完成后矩形已刷新，用最新值再定一次穿透（show 前那次可能矩形还没上报）
   applyPassthrough(win)
   win.webContents.send('panel-shown')
@@ -635,12 +1010,33 @@ function settleAfterShow(win: BrowserWindow) {
    *
    * 已知取舍：这种情况下面板会短暂出现在 Alt+Tab 列表里。
    */
-  win.setSkipTaskbar(true)
-  if (win.isVisible()) setTimeout(() => manager?.focusAll(), 80)
+  if (!panelSkipTaskbarApplied) {
+    win.setSkipTaskbar(true)
+    panelSkipTaskbarApplied = true
+  }
+  if (win.isVisible() && fullscreenMode === 'none') setTimeout(() => manager?.focusAll(), 80)
 }
 
 function hidePanel() {
   if (!panelWindow || panelWindow.isDestroyed() || !panelWindow.isVisible()) return
+
+  /**
+   * 全屏覆盖模式下不做 200ms 滑出：那一串逐帧 SetWindowPos 正是要避免的
+   * 合成层重建。直接藏窗口，再把模式清掉。
+   */
+  if (fullscreenMode !== 'none') {
+    const win = panelWindow
+    console.log(`[fullscreen] hidePanel → none（当前 ${fullscreenMode}）`)
+    cancelHideSettle()
+    manager?.setSuppressed(true)
+    win.hide()
+    stopChromeGuard()
+    stopFullscreenProbe()
+    fullscreenMode = 'none'
+    manager?.setFullscreenMode('none')
+    return
+  }
+
   const b = panelWindow.getBounds()
   const offX = offscreenX(b)
   /**
@@ -657,6 +1053,7 @@ function hidePanel() {
     win.hide()
     // 面板都收起来了，巡逻没有对象了；下次呼出时再由 showPanel 拉起
     stopChromeGuard()
+    stopFullscreenProbe()
     // 等隐藏真正生效后再回到停靠位，避免在可见状态下改变位置造成闪烁
     cancelHideSettle()
     hideSettleTimer = setTimeout(() => {
@@ -1597,6 +1994,11 @@ else {
 
 app.whenReady().then(async () => {
   setupIpc()
+  if (!FULLSCREEN_GATE) console.log('[fullscreen] AIQUAD_FULLSCREEN_GATE=0，已关闭全屏覆盖模式')
+  if (DEBUG_ZFIGHT) console.log('[fullscreen] AIQUAD_DEBUG_ZFIGHT=1，已开启每秒窗口写入计数')
+  startZfightDebug()
+  watchDisplayMetrics()
+  startFullscreenForegroundHook()
   await bootstrap()
   // 放最后：它自己会延时 6 秒再查，不跟启动抢资源
   updater.init()
@@ -1645,6 +2047,10 @@ app.on('will-quit', (e) => {
   quitFinalized = true
   stopAnim()
   stopChromeGuard()
+  stopFullscreenProbe()
+  stopZfightDebug()
+  try { unFullscreenForeground?.() } catch {}
+  unFullscreenForeground = null
   globalShortcut.unregisterAll()
   manager?.dispose()
   // 为了装更新而退出时别插手：安装程序已经拉起来了，只等本进程结束，

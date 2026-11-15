@@ -24,6 +24,61 @@ boilerplate 里维护）。
 取材：`node scripts/release-notes.js --since auto`（把区间内的旧条目原样倒到 `build/release-draft-<版本>.md`），
 合并写回本条目后再 `node scripts/release-notes.js <版本>` 生成发布页说明。
 
+## [0.4.17] - 2026-11-16
+
+**修“其他全屏程序占前台时 AIQuad 被压下去、空框架、闪烁与 koffi 崩溃”。**
+
+### 改了什么
+
+- 全屏覆盖模式：以 SHQueryUserNotificationState 为权威（几何只做 QUNS 读不到时的兜底）。
+  浏览器 F11 / 视频全屏 / PPT 放映进入 overlay，独占 D3D 全屏进入 exclusive 并提示退出。
+- 修全屏模式抖动：面板 showInactive 后前台可能短暂变成自己，旧逻辑会在 none/overlay 之间反复切；
+  现在 QUNS=2/3/4 直接采信，退出方向连续三拍 none 才恢复看门狗。
+- 修视频全屏层级：呼出时先抬面板、再 placeBelow 分格，保证“面板 → 分格 → 视频”；
+  覆盖模式下忽略 renderer 每 2 秒的矩形上报，不再周期性 applyRects。
+- 修呼出时序：先让 Electron 画出面板框架，32ms 后再用 SW_SHOWNOACTIVATE 显示 Chrome 分格，
+  不再出现“网页先出来、框架后贴上来”。
+- 外部全屏程序重新拿回前台时，前台钩子立刻重算模式并调用 raiseOverlay()：
+  只在前台事件这一下补一次“抬面板 + 分格 placeBelow”，不再需要关掉重开 AIQuad，
+  也不会周期性重排。全屏探针间隔从 1s 收紧到 500ms。
+- 修“只有框架置顶、网页没上来”：raiseOverlay 不再只跑 enforceZOrder，而是把所有已显示分格
+  统一 placeBelow 回面板正下方；视频不会再夹在面板和分格之间。
+- 全屏判定加几何兜底：QUNS 还是 5、但前台窗口的 DWM 可见外框已盖满整块显示器时，
+  立即按 overlay 处理，不再等 QUNS 从 5 跳到 2。普通最大化窗口底边少任务栏，不会被误判。
+- 全屏探针 500ms → 250ms；同一前台窗口 1.2 秒内只 raiseOverlay 一次，避免前台事件重复导致每秒重排。
+- 分格显示后再做一次最终 raiseOverlay，防止播放器在 32ms 窗口里又抢回去。
+- raiseOverlay 先做只读 Z 序检查：面板/分格已经正确时一个 SetWindowPos 都不发；
+  需要纠正时逐个 placeBelow（**不用 DeferWindowPos**）。WER 已抓到 koffi.node 的
+  c0000005，批量 HDWP 在跨进程 Chrome 窗口重建时会让原生层崩溃，JS 接不住。
+- 覆盖模式呼出不再单独 setAlwaysOnTop/抬面板：先 showInactive，32ms 后显示分格，
+  再由 raiseOverlay 做一次只读检查 + 必要的逐个 placeBelow；
+  普通呼出的 applyAlwaysOnTop 也只在样式真的不对时才调 Electron setAlwaysOnTop。
+- 低风险降噪：全屏退出迟滞 2 拍 → 3 拍；
+  showPanelFullscreen 先比较 bounds，相同就不 setBounds；覆盖模式 setPanel 跳过 applyRects。
+- 全屏覆盖模式加 1 秒低频置顶守卫：前台是外部窗口时做只读 Z 序检查，
+  播放器再次抢到面板上面才补一次 placeBelow；顺序正确时零写入。
+- 正常呼出也延后 32ms 再显示 Chrome 分格，先让面板框架落屏，修“网页先出、框架后贴”。
+- [zfight] 计数器只在 AIQUAD_DEBUG_ZFIGHT=1 时启用；正式版不产生常驻调试日志。
+- 全屏呼出不滑入、不抢焦点：直接落位，showInactive()，跳过 win.focus() 与 focusAll()；
+  makeToolWindow 只在样式缺失时调，不再每次带 SWP_FRAMECHANGED 整窗重绘。
+- 看门狗静默：全屏覆盖模式下 verifyGeometry() / watchZOrder() 不再周期性下发
+  SetWindowPos；用户点自家分格时仍做一次原子 Z 序纠正。
+- ④/⑦ 合并：setTopMost(hwnd,true) + enforceZOrder() 改为一次 placeBelow(hwnd, panelHwnd)；
+  placeBelow / setTopMost 返回失败会进入 250ms/1s/5s 退避，不再 30ms 硬掰。
+- 显示变化：监听 display-metrics-changed / display-added / display-removed，重算目标几何。
+- 排查开关：AIQUAD_DEBUG_ZFIGHT=1 每秒输出 placeBelow/setTopMost/move/region/tool/focus
+  的真实调用次数与 QUNS/前台窗口信息。
+- 回滚开关：AIQUAD_FULLSCREEN_GATE=0 回到 0.4.16 的旧呼出路径。
+
+### 验收重点
+
+- Chrome F11、网页视频全屏、PPT 放映：呼出后 10 秒内无持续闪烁；落位后除用户点击外
+  不再有周期性窗口写入。
+- 退出全屏后约 750ms 内恢复置顶与正常看门狗。
+- 独占全屏只提示，不对撞。
+
+---
+
 ## [0.4.16] - 2026-11-11
 
 两件事：托盘图标可以藏起来；点顶栏按钮不再误伤下面那个程序。
