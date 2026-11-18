@@ -187,7 +187,7 @@ node scripts/shot-packaged.js 45         # 打包版交付验收：截图 + 逐�
 | 贡献者 | 角色 |
 |---|---|
 | [WW-Ares](https://github.com/WW-Ares) | 项目发起、产品方向与维护 |
-| [Codex](https://github.com/codex)（OpenAI） | AI 协作开发：架构设计、代码实现、测试与发布 |
+| [Codex](https://github.com/codex)（OpenAI） | AI 协作开发：架构设计、代码实现、测试与发布；提交身份为 GitHub 官方账号 @codex |
 
 ## 许可证
 
