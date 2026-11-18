@@ -12,7 +12,7 @@
   <a href="https://github.com/WW-Ares/AIQuad/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/WW-Ares/AIQuad?label=release"></a>
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-blueviolet">
   <img alt="electron" src="https://img.shields.io/badge/Electron-desktop-47848F?logo=electron&logoColor=white">
-  <img alt="license" src="https://img.shields.io/badge/license-MIT-yellow">
+  <img alt="license" src="https://img.shields.io/badge/license-GPL--2.0-blue">
 </p>
 
 ---
@@ -93,7 +93,7 @@ AIQuad 没有使用 Electron 的 `<webview>` / BrowserView 加载网页，而是
 
 更详细的架构、0px 对齐、四个 Win32 技巧和风控实测见 [docs/how-it-works.md](docs/how-it-works.md)。
 
-> 本项目没有使用 `rtugeek/ai` 的任何源代码。它只是立项时的对照设计；本项目以 MIT 发布。
+> 本项目没有使用 `rtugeek/ai` 的任何源代码。它只是立项时的对照设计；本项目以 GPL-2.0 发布。
 
 ## 数据与配置
 
@@ -167,7 +167,7 @@ node scripts/shot-packaged.js 45         # 打包版交付验收：截图 + 逐�
 
 立项时我们拿 [`rtugeek/ai`](https://github.com/rtugeek/ai)（「桌面组件 Widgets」里的 AI 组件包）当对照对象。它用 Electron 内嵌 `<webview>` / BrowserView 加载 AI 网页，我们分析过它为什么会被 Google 判定成“应用内嵌浏览器”，最后选了相反的路线：不内嵌网页，直接驱动真实的 Chrome / Edge 进程。
 
-> **本项目没有使用 `rtugeek/ai` 的任何源代码。** 它只是被当成“要避开的设计”来参考，所以本项目不受它 GPL-2.0 许可的约束。在这里提一下，一是说明技术选型是怎么来的，二是对先行者的尊重。
+> **本项目没有使用 `rtugeek/ai` 的任何源代码。** 它只是被当成“要避开的设计”来参考；本项目同样以 GPL-2.0 发布。在这里提一下，一是说明技术选型是怎么来的，二是对先行者的尊重。
 
 ### 第三方依赖
 
@@ -191,4 +191,4 @@ node scripts/shot-packaged.js 45         # 打包版交付验收：截图 + 逐�
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 WW-Ares、Codex 与 AI 协作
+[GPL-2.0](LICENSE) © 2026 WW-Ares、Codex 与 AI 协作

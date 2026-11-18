@@ -4,7 +4,7 @@
   "description": "",
   "main": "dist/main/index.js",
   "author": "WW-Ares, Codex and AI collaborators",
-  "license": "MIT",
+  "license": "GPL-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/WW-Ares/AIQuad.git"

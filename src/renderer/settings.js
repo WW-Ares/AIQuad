@@ -251,14 +251,14 @@ function fill() {
   $('system-proxy').textContent = sp ? `已检测到：${sp}（类型 ${cfg.proxy.systemType || 'http'}）` : '未检测到系统代理'
 
   $('about').innerHTML = [
-    `AIQuad ${info?.version || '-'} · MIT License · © 2026 WW-Ares`,
+    `AIQuad ${info?.version || '-'} · GPL-2.0 License · © 2026 WW-Ares`,
     `用户数据：${info?.userData || '-'}`,
     `浏览器档案：${info?.profiles || '-'}`,
     `运行环境：Electron ${info?.electron || '-'} / Node ${info?.node || '-'} / Chromium ${info?.chrome || '-'}`,
   ].join('<br>')
 
   $('about-oss').innerHTML = [
-    '本项目以 MIT 协议开源，源码、打包脚本和回归脚本都公开，欢迎提 issue 与 PR。',
+    '本项目以 GPL-2.0 协议开源，源码、打包脚本和回归脚本都公开，欢迎提 issue 与 PR。',
     '用到的开源组件：Electron（MIT，Chromium 内核与窗口管理）、koffi（MIT，直接调用 Windows API 摆放窗口）、electron-updater（MIT，自动更新）。',
     '隐私：纯本地运行，不做数据统计、不上传任何内容；浏览器档案与登录态都在本机的用户数据目录里。',
     '商标：各 AI 的名称与图标归各自所有者，本项目只是在同一面板里打开它们的官网，既不代理账号也不转发对话内容。',
