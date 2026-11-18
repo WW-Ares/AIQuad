@@ -182,6 +182,13 @@ node scripts/shot-packaged.js 45         # 打包版交付验收：截图 + 逐�
 
 `src/renderer/assets/` 下的 AI 站点图标只用来标识跳转目标，版权和商标归各自品牌方所有（OpenAI、Google、xAI、Anthropic、Perplexity、DeepSeek、月之暗面、阿里云、字节跳动、腾讯、智谱 AI）。
 
+## 贡献者
+
+| 贡献者 | 角色 |
+|---|---|
+| [WW-Ares](https://github.com/WW-Ares) | 项目发起、产品方向与维护 |
+| Codex（OpenAI） | AI 协作开发：架构设计、代码实现、测试与发布 |
+
 ## 许可证
 
-[MIT](LICENSE) © 2026 WW-Ares 与 AI 协作
+[MIT](LICENSE) © 2026 WW-Ares、Codex 与 AI 协作

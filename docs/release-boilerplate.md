@@ -29,4 +29,4 @@
 
 ### 许可证
 
-[MIT](https://github.com/WW-Ares/AIQuad/blob/main/LICENSE) © 2026 WW-Ares 与 AI 协作
+[MIT](https://github.com/WW-Ares/AIQuad/blob/main/LICENSE) © 2026 WW-Ares、Codex 与 AI 协作
