@@ -1,140 +1,173 @@
-# AI 多开助手（AIQuad）
+<p align="center">
+  <img src="src/renderer/assets/logo.png" width="120" alt="AIQuad">
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<h1 align="center">AIQuad</h1>
 
-一个 AI 快捷调用工具：在任何地方都能快捷键呼出贴边面板，同时和 1~4 个 AI 对话，1/2/4 分格同开、多 AI 便捷切换、支持分 AI 代理分流。
+<p align="center">
+  Windows 多 AI 贴边面板 · 1/2/4 分格同开 · 共享登录态
+</p>
 
-## 为什么用它
-
-用 AI 的麻烦，多半出在两件事上：够不着，和切来切去。
-
-想问一句，得先切回桌面，在一堆浏览器标签里翻出那个页面；想换一家 AI 再问，又得另开窗口，
-或者另开一个程序；两家的答案想对着看，只能反复 `Alt+Tab`，看两眼就忘了上一句说的是什么。
-
-AIQuad 就是做这个的。
-
-- **`Alt+Space` 呼出，再按一下收起**，不用回桌面找浏览器，也不用在标签里翻。
-- **面板默认贴屏幕右侧**，占 30% 屏宽、满屏高。左边照常写代码、写文档、看资料，不用来回切窗口。
-- **位置和宽度都能调**，左停还是右停、20% 到 60% 的宽度，拖动滑块即时生效。
-- **每格底部一个 AI 切换器**，按国外 / 国内分好组，点一下换掉，不用重开窗口，也不用重新登录。
-- **四格可以同开**，同一句话分别问 ChatGPT、Gemini、Claude、DeepSeek，答案并排摆着，
-  比来回复制粘贴省事。
-- **登录一次就够**，所有分格共用一份浏览器档案，任意一格登录过，其它格切到同一站点直接就是登录态。
-
-### 几个典型场景
-
-| 场景 | 怎么用 |
-|---|---|
-| 对照选型 / 交叉求证 | 同一个问题四格同开，让不同 AI 各答一遍，别被单独一家的说法带偏 |
-| 边写代码边问 | 面板贴右侧，左边 IDE 照常写，右边直接问报错是什么意思 |
-| 长文写作分工 | 一格列提纲、一格写正文、一格挑毛病，各占一格，切换任务不用换窗口 |
-| 结论接力 | 上一格问到的结论丢进下一格，换个模型接着深化，上下文各自留在窗口里 |
-| 多账号 / 多语种 | 关掉「登录态共享」后每格是独立档案，可以同时挂两个账号，或者中英对照 |
-
-## 技术上的不同
-
-同类工具（比如 `rtugeek/ai` 这种用 Electron 内嵌 webview 的做法）是把 AI 网页塞进内嵌浏览器里跑，
-我们反过来，驱动真实的 Chrome / Edge：
-
-> 每个分格都是一个真正的浏览器窗口，登录态能持久保存，也能跨分格共享。
-> 在 2 格登录过的 Gemini，1 格切过去就是登录状态。
+<p align="center">
+  <a href="https://github.com/WW-Ares/AIQuad/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/WW-Ares/AIQuad?label=release"></a>
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-blueviolet">
+  <img alt="electron" src="https://img.shields.io/badge/Electron-desktop-47848F?logo=electron&logoColor=white">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-yellow">
+</p>
 
 ---
 
-## 界面与交互
+AIQuad 是一个面向 Windows 的 AI 快捷调用工具：按 `Alt+Space` 从任何窗口呼出贴边面板，在 1/2/4 个分格里同时使用 ChatGPT、Gemini、Claude、DeepSeek 等 AI。它不把网页塞进 webview，而是驱动真实的 Chrome / Edge 进程，再用 Win32 把浏览器窗口精确覆盖到分格区域。
 
-呼出之后，面板是贴在屏幕一侧的竖长条（默认在右侧，30% 屏宽，满屏高），
-上面一行是标题栏和按钮，下面按你选的分格方式铺开。
-
-**贴屏幕右侧的单页**——左边照常写文档、写代码，两边同时用，不用切窗口：
-
-<img src="docs/screenshot-desktop.png" alt="AIQuad 面板贴在桌面右侧，左边是文档窗口" width="830">
-
-**同一块面板，换个分格方式**。左：单页；右：2×2 四格，ChatGPT / Grok / Gemini / DeepSeek 各占一格：
-
-<p>
-<img src="docs/screenshot-1pane.png" alt="AIQuad 单页布局，底部居中的是 AI 切换器" width="400">
-<img src="docs/screenshot-4panes.png" alt="AIQuad 四格布局：ChatGPT / Grok / Gemini / DeepSeek" width="400">
-</p>
-
-- **顶栏**：单页 / 上下两格 / 四格、置顶开关、设置、收起。按住顶栏能临时把面板挪个位置。
-  面板用不用置顶由这个图钉决定，关掉之后它就是一个普通窗口。
-- **每格底部**：居中的 AI 切换器，平时半透明，鼠标移上去变清晰，点开是按国外 / 国内分组的列表。
-  列表展开之后点在列表外面（别的分格、面板空白处、面板以外的任何地方）都会收起它，`Esc` 也可以。
-- **快捷键设置**：在设置页点一下输入框，直接按下组合键就抓到了，顺序和大小写会自动规范。
-  必须带 `Ctrl` / `Alt` / `Win` 之一，`F1`–`F24` 和音量、媒体键可以单用。`Shift` + 字母不支持，
-  那会把全局打字键抢走。语法不合法、被别的程序占用、和本应用其它快捷键撞车，都会当场提示。
-- 面板是竖长条，只提供 1 / 2 / 4 三种分格。三段式在竖长面板里每格太扁，不好用。
+> 每个分格都是一个真正的浏览器窗口。登录态天然持久、可跨分格共享，中文输入法和站点风控表现都和普通浏览器一致。
 
 ## 功能
 
-| 功能 | 说明 |
-|------|------|
-| 多 AI 切换 | 内置 ChatGPT / Gemini / Grok / Claude / Perplexity / DeepSeek / Kimi / 千问 / 豆包 / 元宝 / 智谱清言，可以自己加 |
-| 1/2/4 窗口同开 | 单页 / 上下两格 / 2×2 四格，每格独立选 AI，登录态在所有分格间共享 |
-| 快捷键呼出 | 默认 `Alt+Space` 呼出和收起，带滑动动画。分格切换默认不绑键（顶栏有 1/2/4 按钮），想要就去设置页自己抓 |
-| 快捷键抓取设置 | 设置页里点一下输入框，直接按组合键自动抓取，不用手打 `Ctrl+Alt+1` 这种字符串；留空等于禁用该键 |
-| 代理设置 | 跟随系统 / 自定义（HTTP、HTTPS、SOCKS5）/ 直连。共享会话下是进程级设置，只能全局 |
-| 连通性测试 | 按当前代理真连一次目标地址，显示握手结果、耗时和失败原因。10 秒没响应就报超时，不会一直转圈 |
-| 面板位置与宽度 | 停靠屏幕左或右；宽度 20%~60% 滑块，另有 20 / 30 / 40 / 50% 四个预设，点完立刻贴过去 |
-| AI 排序与分组 | 设置页的清单按「国外 AI / 国内 AI」分块，按住名称左边的抓手上下拖就能调先后；拖到另一块标题下，这一条就当场改归那一组 |
-| AI 隐藏与删除 | 内置的也能收起来：隐藏只是从选择器里摘掉（已开着的格子不受影响），删除才真的移出清单 |
-| 缓存清理 | 设置页列出每份浏览器档案的体积，可手动清理 Cache / Code Cache 这类可再生目录，登录态保留；也能设成超阈值自动清、或退出时清 |
-| 闲置分格清理 | 只用 1 格时，其它格子闲置够久（默认 10 分钟）就真的关掉，页面不再占着约 1GB 的常驻内存；开关与时长都在设置页 |
-| 设置改动即时生效 | 没有「保存并应用」，改哪一项都会当场写进配置并返回保存状态 |
-| 自动更新 | 启动后静默查一次 GitHub Releases，下载完提示安装（安装版才有，便携版不受影响） |
-| 托盘常驻 | 关掉面板不退出，托盘菜单可以呼出、收起、进设置、退出 |
-| 登录态持久 | 所有分格共用一份浏览器档案，登录一次到处可用，关掉重开免登录 |
+- **`Alt+Space` 随时呼出**：贴边面板从屏幕边缘滑出，再按一次收起，不用回桌面找浏览器。
+- **1 / 2 / 4 分格**：单页、上下两格、2×2 四格；每格独立选 AI，布局随时切换。
+- **多 AI 切换**：内置 ChatGPT / Gemini / Grok / Claude / Perplexity / DeepSeek / Kimi / 千问 / 豆包 / 元宝 / 智谱清言，也可以自己添加站点。
+- **登录一次，全格可用**：默认所有分格共用一份浏览器档案；关掉共享后，每格是独立档案，可同时挂多个账号。
+- **位置与宽度可调**：左停 / 右停，20%–60% 宽度，滑块和预设即时生效。
+- **代理设置**：跟随系统 / HTTP / HTTPS / SOCKS5 / 直连；共享会话下为进程级全局代理，关闭登录态共享后可按 AI 分流。
+- **设置即时生效**：没有“保存并应用”，改完当场写入配置并返回保存状态。
+- **缓存与闲置清理**：按档案查看体积，手动或自动清理 Cache / Code Cache；闲置分格可自动关闭，释放内存。
+- **托盘常驻与自动更新**：关掉面板不退出；安装版启动后静默检查 GitHub Releases。
+- **外链交给系统浏览器**：分格内点外部链接不会替换当前 AI 页面，站内链接仍然原地跳转。
 
-## 原理
+## 界面截图
 
-不把网页塞进内嵌浏览器，而是驱动真实的 Chrome / Edge 进程，再用 Win32 的「顶级窗口 + 属主关系」
-把浏览器窗口精确覆在分格内容区上。登录态因此天然共享，键盘输入和中文输入法都正常，
-站点那边看到的也只是个普通浏览器窗口。
+<p align="center">
+  <img src="docs/screenshot-desktop.png" width="830" alt="AIQuad 贴边面板贴在桌面右侧">
+</p>
 
-架构图、0px 对齐是怎么做到的、四个 Win32 技巧、防站点风控的实测依据和验证数据，
-见 [docs/how-it-works.md](docs/how-it-works.md)。
+<p align="center">
+  <img src="docs/screenshot-1pane.png" width="400" alt="AIQuad 单页布局">
+  <img src="docs/screenshot-4panes.png" width="400" alt="AIQuad 2×2 四格布局">
+</p>
 
-## 运行与开发
+<p align="center">
+  <sub>贴边单页 / 1 格 / 2×2 四格</sub>
+</p>
+
+## 安装
+
+### 方式一：下载安装包
+
+从 [Releases](https://github.com/WW-Ares/AIQuad/releases/latest) 下载：
+
+- `AIQuad-Setup-*.exe`：安装版，支持自动更新。
+- `AIQuad-Portable-*.exe`：便携版，解压即用，不写安装目录，不参与自动更新。
+
+覆盖安装即可，配置和登录态保存在 `%APPDATA%\aiquad`，不会丢失。
+
+> 安装包没有做代码签名，首次运行可能触发 Windows SmartScreen。点「更多信息」→「仍要运行」即可；也可以从源码自行构建。
+
+### 方式二：源码运行
+
+要求：Windows 10/11、Node.js 20+、本机已安装 Chrome 或 Edge。
+
+```bash
+npm install
+npm run build
+npm run dev
+```
+
+## 快速使用
+
+1. 启动 AIQuad，按 `Alt+Space` 呼出面板。
+2. 顶栏选择单页 / 上下两格 / 四格。
+3. 点每格底部的 AI 切换器选择站点；第一次在某格登录后，其它格切到同一站点会直接复用登录态。
+4. 打开设置页调整快捷键、代理、停靠方向、面板宽度、共享登录态和缓存策略。
+5. 面板顶栏的图钉控制是否置顶；关掉后它就是一个普通窗口。
+
+## 工作原理
+
+AIQuad 没有使用 Electron 的 `<webview>` / BrowserView 加载网页，而是：
+
+1. 启动真实的 Chrome / Edge 进程，为每个分格分配一个 page target；
+2. 用 Win32 的顶级窗口 + 属主关系把浏览器窗口覆盖到分格矩形；
+3. 用 30ms 几何看门狗持续校正位置、裁剪和层级；
+4. 用 CDP 处理页面状态、链接拦截和自检；外部链接交给系统默认浏览器。
+
+因此，站点看到的是一个普通浏览器窗口，而不是“应用内嵌浏览器”；登录态、输入法和站点兼容性都更接近日常使用。
+
+更详细的架构、0px 对齐、四个 Win32 技巧和风控实测见 [docs/how-it-works.md](docs/how-it-works.md)。
+
+> 本项目没有使用 `rtugeek/ai` 的任何源代码。它只是立项时的对照设计；本项目以 MIT 发布。
+
+## 数据与配置
+
+配置和浏览器档案都在：
+
+```text
+%APPDATA%\aiquad\
+├─ config.json
+├─ profiles\
+├─ logs\main.log
+└─ startup-state.json
+```
+
+- `profiles/` 里是各分格的浏览器档案；共享模式下共用 `profiles/shared`，独立模式按档案名分目录。
+- `logs/main.log` 是主进程日志，排障时优先看这里。
+- 设置页可以直接打开档案目录，并按目录查看 / 清理缓存。
+
+## 从源码构建
 
 ```bash
 npm install
 npm run build     # 编译 TypeScript
-npm run dev       # 启动应用
-npm run dist      # 打包 NSIS 安装包（输出到 build/）
+npm run dev       # 启动源码版
+npm run dist      # 打包 NSIS 安装包和便携版，输出到 build/
 ```
 
-配置和浏览器档案都在 `%APPDATA%\aiquad\` 下（`config.json` 和 `profiles/`），设置页可以直接打开档案目录。
-每份档案里占地方的主要是浏览器缓存（`profiles/<名字>/Default/Cache`、`Code Cache`），
-设置页能看体积也能清，Cookie 和 Local Storage 不会被碰。
+## 目录结构
 
-容器、虚拟机这类受限环境下的 GPU 自动降级开关，以及全部自检脚本，同样见
-[docs/how-it-works.md](docs/how-it-works.md)。
+```text
+src/main/
+  index.ts            应用生命周期 / 托盘 / 快捷键 / IPC
+  instance-manager.ts 分格、浏览器实例、窗口几何、看门狗
+  cdp.ts              CDP 连接、外链拦截、页面自检
+  win32.ts            Win32 原生窗口定位
+  config.ts           配置读写
+  proxy.ts            代理参数与连通性测试
+  cache-cleaner.ts    缓存统计与清理
+src/renderer/         面板与设置页 UI
+scripts/              自检、诊断、截图脚本
+docs/                 架构说明、截图、发布说明
+```
+
+## 自检
+
+大部分脚本不需要 Electron，可直接 `node` 跑：
+
+```bash
+node scripts/verify-shared.js            # 共享会话 / 裁剪 / 对齐 / Cookie 继承
+node scripts/verify-settings.js          # 设置页端到端
+node scripts/verify-shortcut-capture.js  # 快捷键抓取
+node scripts/smoke.js                    # 浏览器探测 → 实例 → CDP → 窗口定位
+node scripts/shot-packaged.js 45         # 打包版交付验收：截图 + 逐格对齐
+```
+
+更多脚本和排障工具见 [docs/how-it-works.md#自检脚本](docs/how-it-works.md#自检脚本)。
 
 ## 已知限制
 
-- 代理是进程级设置。开启「登录态共享」时所有分格共用一个浏览器进程，只能走全局代理；
-  要按 AI 分别走代理，得在设置页关掉「登录态共享」。
+- 代理是进程级设置。开启「登录态共享」时所有分格共用一个浏览器进程，只能走全局代理；要按 AI 分别走代理，需要关闭该开关。
 - 「后台分格休眠」在共享会话下降级为隐藏窗口，因为挂起进程会把所有分格一起冻住，做不到只挂起一格。
 - 关掉「登录态共享」后，每个分格是一个独立浏览器进程，4 格全开会占用较多内存。
 - 改代理、窗口形态、共享开关需要重启浏览器实例。设置页保存时会等旧进程真正退出再重启。
-- 浏览器窗口是独立的原生窗口，没法跟 Electron 的页面做层叠。浮层（AI 下拉）只能靠"挖洞"让位，
-  而且浮层出不了一格的边界。
-- 分格宽度小于 270px 左右时，部分站点（比如 ChatGPT）自己会切到窄屏版式，这是站点行为。
+- 浏览器窗口是独立的原生窗口，没法跟 Electron 页面做层叠。浮层只能靠“挖洞”让位，而且浮层出不了一格的边界。
+- 分格宽度小于约 270px 时，部分站点（比如 ChatGPT）会自行切到窄屏版式，这是站点行为。
 - 站点自己的弹层（比如 Gemini 的模型选择器）如果超出一格的范围，会被格子边界裁掉。
-- 清理缓存时，浏览器正在占用的那部分文件删不掉，会跳过并在下次启动或退出时补上。这不影响使用。
+- 清理缓存时，浏览器正在占用的那部分文件删不掉，会跳过并在下次启动或退出时补上，不影响使用。
 
 ## 致谢与参考
 
 ### 对标项目
 
-立项时我们拿 [`rtugeek/ai`](https://github.com/rtugeek/ai)（「桌面组件 Widgets」里的 AI 组件包）
-当对照对象。它用 Electron 内嵌 `<webview>` / BrowserView 加载 AI 网页，我们分析过它为什么会被
-Google 判定成"应用内嵌浏览器"，最后选了相反的路线：不内嵌网页，直接驱动真实的 Chrome / Edge 进程。
+立项时我们拿 [`rtugeek/ai`](https://github.com/rtugeek/ai)（「桌面组件 Widgets」里的 AI 组件包）当对照对象。它用 Electron 内嵌 `<webview>` / BrowserView 加载 AI 网页，我们分析过它为什么会被 Google 判定成“应用内嵌浏览器”，最后选了相反的路线：不内嵌网页，直接驱动真实的 Chrome / Edge 进程。
 
-> **本项目没有使用 `rtugeek/ai` 的任何源代码。** 它只是被当成"要避开的设计"来参考，
-> 所以本项目不受它 GPL-2.0 许可的约束。在这里提一下，一是说明技术选型是怎么来的，
-> 二是对先行者的尊重。
+> **本项目没有使用 `rtugeek/ai` 的任何源代码。** 它只是被当成“要避开的设计”来参考，所以本项目不受它 GPL-2.0 许可的约束。在这里提一下，一是说明技术选型是怎么来的，二是对先行者的尊重。
 
 ### 第三方依赖
 
@@ -147,9 +180,7 @@ Google 判定成"应用内嵌浏览器"，最后选了相反的路线：不内�
 
 ### 图标
 
-`src/renderer/assets/` 下的 AI 站点图标只用来标识跳转目标，
-版权和商标归各自品牌方所有（OpenAI、Google、xAI、Anthropic、Perplexity、
-DeepSeek、月之暗面、阿里云、字节跳动、腾讯、智谱 AI）。
+`src/renderer/assets/` 下的 AI 站点图标只用来标识跳转目标，版权和商标归各自品牌方所有（OpenAI、Google、xAI、Anthropic、Perplexity、DeepSeek、月之暗面、阿里云、字节跳动、腾讯、智谱 AI）。
 
 ## 许可证
 
